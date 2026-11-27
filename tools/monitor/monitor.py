@@ -57,28 +57,38 @@ class Config:
         self.pidfile = args.pidfile
 
 
+# The request log's tail a starting monitor reads again: more than the records its request table
+# and rolling statistics keep (events_cap), so a restart shows the same history.
+REPLAY_BYTES = 8 << 20
+
+
 class Tail:
     """Incrementally tail a file, surviving rotation (rename) and truncation.
 
-    On first open it seeks to the end (no backfill). Each read_lines() call returns the complete
-    lines appended since the last call. If the file's inode changes (renamed away) or its size
-    shrinks below our position (truncated), it reopens at the start of the new file.
+    On first open it starts `replay` bytes before the end, at the next whole line, so the first
+    read_lines() returns the latest records already written. Each read_lines() call returns the
+    complete lines appended since the last call. If the file's inode changes (renamed away) or its
+    size shrinks below our position (truncated), it reopens at the start of the new file.
     """
 
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, replay: int = REPLAY_BYTES) -> None:
         self.path = path
         self.f = None
         self.ino = None
         self.pos = 0
         self.buf = ""
-        self._open(at_end=True)
+        self._open(replay=replay)
 
-    def _open(self, at_end: bool) -> None:
+    def _open(self, replay: int | None = None) -> None:
+        # replay None: from the start of the file.
         try:
             self.f = open(self.path, "rb")
             st = os.fstat(self.f.fileno())
             self.ino = st.st_ino
-            self.f.seek(0, 2 if at_end else 0)
+            start = 0 if replay is None else max(0, st.st_size - replay)
+            self.f.seek(start)
+            if start > 0:
+                self.f.readline()  # a partial line
             self.pos = self.f.tell()
         except OSError:
             self.f = None
@@ -89,7 +99,7 @@ class Tail:
     def read_lines(self) -> list[str]:
         lines: list[str] = []
         if self.f is None:
-            self._open(at_end=False)
+            self._open()
             if self.f is None:
                 return lines
         try:
@@ -99,7 +109,7 @@ class Tail:
             return lines
         if st.st_ino != self.ino or st.st_size < self.pos:
             # A rotation starts a new file that the server writes from its beginning.
-            self._open(at_end=False)
+            self._open()
         self.f.seek(self.pos)
         data = self.f.read()
         if not data:
@@ -164,6 +174,12 @@ def flatten_stats(stats: dict, memory: dict) -> dict:
     }
 
 
+# A request's own rates count toward the rolling percentiles only past these sizes: a few-token
+# prompt or answer is mostly fixed cost, and its rate says little about the server's speed.
+MIN_RATE_PREFILL_TOKENS = 512
+MIN_RATE_DECODE_TOKENS = 16
+
+
 class Monitor:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
@@ -194,8 +210,8 @@ class Monitor:
         self._lock = threading.Lock()
 
     def bootstrap_server_info(self) -> None:
-        # The request-log tail starts at the end, so the server_start record written before this
-        # sidecar started is found by one scan of the current file.
+        # The request-log tail replays only the file's last REPLAY_BYTES, so the server_start
+        # record written before this sidecar started is found by one scan of the current file.
         if not self.cfg.jsonl:
             return
         try:
@@ -247,6 +263,9 @@ class Monitor:
         if ttft is not None and queue is not None and 0 <= queue <= ttft:
             proc = ttft - queue
         decode = timings.get("decode") or 0
+        prefill = timings.get("prefill") or 0
+        completion = res.get("completion_tokens", 0)
+        computed = res.get("computed_prefill_tokens", 0)
         self.events.append(
             {
                 "t": ts,
@@ -264,7 +283,10 @@ class Monitor:
                 "mtp_accepted": spec.get("accepted_tokens", 0),
                 "mtp_drafted": spec.get("drafted_tokens", 0),
                 "mtp_rounds": spec.get("rounds", 0),
-                "decode_tps": (res.get("completion_tokens", 0) / decode) if decode > 0 else None,
+                "decode_tps": (completion / decode)
+                              if decode > 0 and completion >= MIN_RATE_DECODE_TOKENS else None,
+                "prefill_tps": (computed / prefill)
+                               if prefill > 0 and computed >= MIN_RATE_PREFILL_TOKENS else None,
             }
         )
         drafted = spec.get("drafted_tokens", 0)
@@ -423,17 +445,16 @@ class Monitor:
     # -- sampler tick -------------------------------------------------------
 
     def _rolling(self) -> dict:
-        # Rolling acceptance, TTFT and throughput percentiles over the latest requests and
-        # samples, so the dashboard can plot them as time series.
+        # Rolling acceptance, TTFT and per-request throughput percentiles over the latest
+        # requests, so the dashboard can plot them as time series. A request's prefill and
+        # decode rates are its own tokens over its own phase's time, past the minimum sizes.
         done = [e for e in list(self.events)[-60:] if e["kind"] == "done"]
         acc = sum(e.get("mtp_accepted", 0) for e in done)
         dr = sum(e.get("mtp_drafted", 0) for e in done)
         ttfts = sorted(e["ttft"] for e in done if e.get("ttft") is not None)
         procs = sorted(e["proc"] for e in done if e.get("proc") is not None)
-        recent = list(self.samples)[-60:]
         req_dec = sorted(e["decode_tps"] for e in done if e.get("decode_tps") is not None)
-        pre = sorted(s["rates"]["prefill_tps"] for s in recent
-                     if (s.get("rates") or {}).get("prefill_tps") is not None)
+        pre = sorted(e["prefill_tps"] for e in done if e.get("prefill_tps") is not None)
         return {
             "mtp_accept_rate": (acc / dr) if dr else None,
             "ttft_p50": self._pct(ttfts, 50),
