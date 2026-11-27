@@ -313,6 +313,19 @@ void moe_decode_down(GgmlType type, const MoeDecodeDownArgs& args, int chunk, cu
                                                   std::int64_t experts) {
     return gate_up ? pairs > 16 * experts : pairs >= 6 * experts;
 }
+// The vector kernel's time (in groups of up to eight columns) over the matrix kernel's for the
+// routed experts' product of `type` over reduction length k, at a decode call's `pairs` routed rows
+// over a layer of `experts` experts: fitted on an RTX 3090 for the decode calls of 9 to 64 tokens
+// at the GGUF MoE families' expert shapes, interpolated in k between them. 0 for a type without a
+// matrix kernel, infinity for one never measured.
+[[nodiscard]] double moe_vector_matrix_ratio(GgmlType type, int k, std::int64_t pairs,
+                                             std::int64_t experts);
+// Whether a decode call's routed experts, [gate; up] products of `gate_up` (2 x width rows over
+// hidden) and down products of `down` (hidden rows over width), take no longer with both on the
+// vector kernels than with both on the matrix kernel: the products' ratios weighted by their
+// weights' bytes.
+[[nodiscard]] bool moe_vector_call_pays(GgmlType gate_up, GgmlType down, int hidden, int width,
+                                        std::int64_t pairs, std::int64_t experts);
 void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
                         int max_active, int pairs, bool tail, const void* activation, float* out,
                         cudaStream_t stream);

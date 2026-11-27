@@ -1304,20 +1304,24 @@ struct Executor::Impl {
 
     // The most tokens one MoE call takes (a span's calls take a chunk at a time).
     [[nodiscard]] int max_moe_tokens() const {
-        return std::max<int>(int(options.prefill_chunk), gguf::kMaxVectorColumns);
+        return std::max({int(options.prefill_chunk), int(options.sequences),
+                         gguf::kMaxVectorColumns});
     }
 
     // Workspace of one rank's part of a call of up to `t` tokens (expert_part()).
     [[nodiscard]] std::size_t expert_part_bytes(int t) const {
         const std::size_t pairs = std::size_t(t) * config.top_k_experts;
-        const std::size_t vector_pairs =
-            std::size_t(gguf::kMaxVectorColumns) * config.top_k_experts;
+        // A vector call: up to 8 tokens, or a decode call of up to CpuExperts::kMaxTokens.
+        const std::size_t vector_tokens =
+            std::min<std::size_t>(std::size_t(t), std::size_t(CpuExperts::kMaxTokens));
+        const std::size_t vector_pairs = vector_tokens * config.top_k_experts;
         const std::size_t h = hidden, w = width;
         const std::size_t bytes =
             round_up(pairs * 4, kAlign) +
             round_up(gguf::moe_routing_bytes(int(config.num_experts), int(pairs)), kAlign) +
             round_up(pairs * 2 * w * 4, kAlign) + round_up(pairs * w * 2, kAlign);
         const std::size_t vector =
+            round_up(gguf::vector_activation_bytes(int(h), int(vector_tokens)), kAlign) +
             round_up(gguf::vector_activation_bytes(int(w), int(vector_pairs)), kAlign);
         const std::size_t matrix =
             round_up(std::max(gguf::moe_matrix_activation_bytes(int(h), int(pairs)),
@@ -2495,15 +2499,32 @@ struct Executor::Impl {
     // Whether a wide call of t tokens runs block p's routed experts of `type`, their gate and up
     // (`gate_up`) or their down products, on the integer matrix kernel (else the vector kernel in
     // groups of eight columns): IQ1_M's only with ExecutorOptions::iq1m_matrix and once the call
-    // routes enough rows to each expert (gguf::iq1m_moe_matrix_pays).
+    // routes enough rows to each expert (gguf::iq1m_moe_matrix_pays); another type's in a decode
+    // call once the vector kernel is the slower (gguf::moe_vector_matrix_ratio), in a prompt step
+    // always.
     [[nodiscard]] bool matrix_route(const LayerPlan& p, bool gate_up, gguf::GgmlType type,
                                     int rows, int k, int t) const {
-        if (type == gguf::GgmlType::IQ1_M &&
-            (!options.iq1m_matrix ||
-             !gguf::iq1m_moe_matrix_pays(gate_up, std::int64_t(t) * p.top_k, p.experts))) {
+        const std::int64_t pairs = std::int64_t(t) * p.top_k;
+        if (type == gguf::GgmlType::IQ1_M) {
+            if (!options.iq1m_matrix || !gguf::iq1m_moe_matrix_pays(gate_up, pairs, p.experts)) {
+                return false;
+            }
+        } else if (!prompt_pass &&
+                   gguf::moe_vector_matrix_ratio(type, k, pairs, p.experts) <= 1.0) {
             return false;
         }
         return gguf::moe_matrix_supported(type, rows, k, true);
+    }
+
+    // Whether a call of t tokens runs block p's routed experts on the vector kernels into the exact
+    // fixed-point sum, the cached experts while the missing ones arrive and the CPU's share beside
+    // them: up to 8 tokens always, a wider decode call where neither product takes the matrix
+    // kernel.
+    [[nodiscard]] bool vector_call(const LayerPlan& p, int t) const {
+        if (t <= gguf::kMaxVectorColumns) { return true; }
+        return !prompt_pass && t <= CpuExperts::kMaxTokens &&
+               !matrix_route(p, true, p.gate_up_type, 2 * width, hidden, t) &&
+               !matrix_route(p, false, p.down_type, hidden, width, t);
     }
 
     // The block's MoE: routed experts and the shared expert into y, added to the streams.
@@ -2588,7 +2609,14 @@ struct Executor::Impl {
         const int max_active = std::max(1, std::min(pairs, n));
         auto* gu             = static_cast<float*>(take(std::size_t(pairs) * 2 * w * 4));
         auto* middle         = static_cast<__nv_bfloat16*>(take(std::size_t(pairs) * w * 2));
-        if (t <= gguf::kMaxVectorColumns) {
+        if (vector_call(p, t)) {
+            // A wide call's input arrives as BF16 rows: its vector activation is quantized here,
+            // as rank 0 quantizes it.
+            if (t > gguf::kMaxVectorColumns) {
+                void* own = take(gguf::vector_activation_bytes(hidden, t));
+                gguf::quantize_vector_activation(xb, hidden, t, nullptr, own, on);
+                xq = own;
+            }
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
             void* act2      = take(gguf::vector_activation_bytes(w, pairs));
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, on));
@@ -2762,7 +2790,7 @@ struct Executor::Impl {
             kernels::moe_combine(combine, stream);
             return;
         }
-        const bool vector = t <= gguf::kMaxVectorColumns;
+        const bool vector = vector_call(p, t);
         void* xq          = nullptr; // the vector kernels' activation of x
         if (vector) {
             xq = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
@@ -2778,6 +2806,9 @@ struct Executor::Impl {
         // A decode or verification call may leave misses to the CPU, which reads the quantized
         // activation, the route weights and the guard's factors.
         const bool cpu = cpu_experts && vector && t <= CpuExperts::kMaxTokens;
+        // The shared expert reads the routed experts' activation where its own products would
+        // quantize x the same way: up to 8 tokens.
+        const void* narrow_xq = t <= gguf::kMaxVectorColumns ? xq : nullptr;
         std::optional<ExpertDelivery::Call> call;
         if (p.delivery_layer >= 0) {
             const std::array<ExpertDelivery::Input, 3> inputs{
@@ -2834,7 +2865,7 @@ struct Executor::Impl {
                     return part;
                 };
                 compute(stage(call->cached_experts));
-                shared(xq);
+                shared(narrow_xq);
                 delivery->await(stream);
                 compute(stage(call->missing_experts));
                 if (call->cpu != nullptr) {
@@ -2842,7 +2873,7 @@ struct Executor::Impl {
                 }
             } else {
                 compute(routing);
-                shared(xq);
+                shared(narrow_xq);
             }
             combine.fixed = fixed;
             kernels::moe_combine(combine, stream);

@@ -1253,7 +1253,8 @@ struct Executor::Impl {
 
     // The most tokens one MoE call takes: a prompt chunk, or a decode or verification call.
     [[nodiscard]] int max_moe_tokens() const {
-        return std::max<int>(int(options.prefill_chunk), gguf::kMaxVectorColumns);
+        return std::max({int(options.prefill_chunk), int(options.sequences),
+                         gguf::kMaxVectorColumns});
     }
 
     // The byte layout of a MoE call's packed input: the activation the experts read (up to 8
@@ -1276,14 +1277,17 @@ struct Executor::Impl {
     // Workspace of one rank's part of a call of up to `t` tokens (expert_part()).
     [[nodiscard]] std::size_t expert_part_bytes(int t) const {
         const std::size_t pairs = std::size_t(t) * config.top_k_experts;
-        const std::size_t vector_pairs =
-            std::size_t(gguf::kMaxVectorColumns) * config.top_k_experts;
+        // A vector call: up to 8 tokens, or a decode call of up to CpuExperts::kMaxTokens.
+        const std::size_t vector_tokens =
+            std::min<std::size_t>(std::size_t(t), std::size_t(CpuExperts::kMaxTokens));
+        const std::size_t vector_pairs = vector_tokens * config.top_k_experts;
         const std::size_t h = hidden, w = config.moe_intermediate_size;
         std::size_t bytes =
             round_up(pairs * 4, kAlign) +
             round_up(gguf::moe_routing_bytes(int(config.num_experts), int(pairs)), kAlign) +
             round_up(pairs * w * 2, kAlign);
         const std::size_t vector =
+            round_up(gguf::vector_activation_bytes(int(h), int(vector_tokens)), kAlign) +
             round_up(gguf::vector_activation_bytes(int(w), int(vector_pairs)), kAlign);
         const std::size_t matrix =
             round_up(gguf::moe_matrix_activation_bytes(int(h), int(pairs)), kAlign) +
@@ -1355,8 +1359,8 @@ struct Executor::Impl {
     // One rank's part of a MoE call of block `p`: the call's pairs routed to the experts the rank
     // holds (`range`), through its `tables`, weighted into the 2^-32 fixed-point sum `fixed`
     // ([T][H]). Up to 8 tokens read the call's q8_1 activation `act`, wider calls its BF16 rows
-    // `x`. Each contribution is the one a single device computes and rounds, so the parts add up to
-    // its sum exactly.
+    // `x` (a wide vector call, vector_call(), quantizes them as rank 0 does). Each contribution is
+    // the one a single device computes and rounds, so the parts add up to its sum exactly.
     void expert_part(const LayerPlan& p, const void* const* tables,
                      std::pair<std::uint32_t, std::uint32_t> range, const void* act,
                      const __nv_bfloat16* x, const std::int32_t* ids, const float* weights, int t,
@@ -1378,7 +1382,12 @@ struct Executor::Impl {
         const int max_active = std::max(1, std::min(pairs, int(range.second - range.first)));
         auto* middle =
             static_cast<__nv_bfloat16*>(space.alloc_bytes(std::size_t(pairs) * width * 2).data);
-        if (t <= gguf::kMaxVectorColumns) {
+        if (vector_call(p, t)) {
+            if (t > gguf::kMaxVectorColumns) {
+                void* own = space.alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
+                gguf::quantize_vector_activation(x, hidden, t, nullptr, own, on);
+                act = own;
+            }
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
             void* act2      = space.alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             CUDA_CHECK(cudaMemsetAsync(fixed, 0, std::size_t(t) * hidden * 8, on));
@@ -1656,6 +1665,19 @@ struct Executor::Impl {
         kernels::ffn_combine(combine, stream);
     }
 
+    // Whether a call of t tokens runs block p's routed experts on the vector kernels into the exact
+    // fixed-point sum, the cached experts while the missing ones arrive and the CPU's share beside
+    // them: up to 8 tokens always, a wider decode call where that is no slower than both products on
+    // the matrix kernel (gguf::moe_vector_call_pays).
+    [[nodiscard]] bool vector_call(const LayerPlan& p, int t) const {
+        if (t <= gguf::kMaxVectorColumns) { return true; }
+        const std::int64_t pairs   = std::int64_t(t) * config.top_k_experts;
+        const std::int64_t experts = config.num_experts;
+        return !prompt_pass && t <= CpuExperts::kMaxTokens &&
+               gguf::moe_vector_call_pays(p.gate_up_type, p.down_type, hidden, width, pairs,
+                                          experts);
+    }
+
     // The routed experts of block `p` (their output lands where `combine` reads it) and `mlp`, the
     // dense MLP, run while other ranks run their experts or missing experts are copied in.
     template <typename Mlp>
@@ -1673,8 +1695,10 @@ struct Executor::Impl {
                     (!prompt_pass || options.expert_route_bias_prompts)
                 ? delivery->route_bias(std::size_t(p.delivery_layer), options.expert_route_bias)
                 : ExpertRouteBias{};
+        const bool narrow = t <= gguf::kMaxVectorColumns;
+        const bool vector = vector_call(p, t);
         gguf::MoeRouting routing;
-        if (t <= gguf::kMaxVectorColumns) {
+        if (narrow) {
             auto* base = static_cast<std::int32_t*>(routing_space);
             routing.bounds       = base;
             routing.sorted       = base + e + 1;
@@ -1692,10 +1716,12 @@ struct Executor::Impl {
         }
         // A decode or verification call may leave misses to the CPU, which reads the quantized
         // activation and the route weights.
-        const bool cpu = cpu_experts && t <= CpuExperts::kMaxTokens && t <= gguf::kMaxVectorColumns;
+        const bool cpu = cpu_experts && t <= CpuExperts::kMaxTokens && vector;
         void* act = nullptr;
-        if (t <= gguf::kMaxVectorColumns) {
-            act = xq != nullptr ? xq->base : nullptr;
+        // A wide vector call quantizes its BF16 rows here, or under expert parallelism in
+        // expert_part on every rank.
+        if (narrow || (vector && !model.expert_parallel())) {
+            act = narrow && xq != nullptr ? xq->base : nullptr;
             if (act == nullptr) {
                 act = workspace->alloc_bytes(gguf::vector_activation_bytes(hidden, t)).data;
                 gguf::quantize_vector_activation(x, hidden, t, nullptr, act, stream);
@@ -1725,7 +1751,7 @@ struct Executor::Impl {
         const int max_active = std::min(pairs, e);
         auto* middle = static_cast<__nv_bfloat16*>(
             workspace->alloc_bytes(std::size_t(pairs) * width * 2).data);
-        if (t <= gguf::kMaxVectorColumns) {
+        if (vector) {
             const int chunk = t <= 1 ? 1 : t <= 2 ? 2 : t <= 4 ? 4 : 8;
             void* act2 = workspace->alloc_bytes(gguf::vector_activation_bytes(width, pairs)).data;
             auto* fixed = static_cast<unsigned long long*>(

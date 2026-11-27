@@ -1954,6 +1954,10 @@ int main() {
         cpu_experts_case("IQ2_S/IQ4_NL", QType::GGUF_IQ2_S, QType::GGUF_IQ4_NL, false, 4, rng);
         cpu_experts_case("IQ3_XXS/IQ4_NL", QType::GGUF_IQ3_XXS, QType::GGUF_IQ4_NL, false, 5, rng);
         cpu_experts_case("IQ3_S/Q2_0", QType::GGUF_IQ3_S, QType::GGUF_Q2_0, false, 8, rng);
+        // A wide decode call (an ordinary round of 9..64 requests) on the vector kernels.
+        cpu_experts_case("NVFP4/NVFP4", QType::GGUF_NVFP4, QType::GGUF_NVFP4, true, 64, rng);
+        cpu_experts_case("IQ4_XS/IQ4_NL", QType::GGUF_IQ4_XS, QType::GGUF_IQ4_NL, false, 17, rng);
+        cpu_experts_case("Q4_K/Q5_0", QType::GGUF_Q4_K, QType::GGUF_Q5_0, false, 33, rng);
     } catch (const std::exception& e) {
         std::cout << "FAIL " << e.what() << '\n';
         return 1;

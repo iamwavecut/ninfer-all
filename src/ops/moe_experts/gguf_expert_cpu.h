@@ -67,6 +67,9 @@ class GgufCpuActivation {
 public:
     GgufCpuActivation() = default;
     GgufCpuActivation(int token_capacity, int k);
+    // Keeps this activation where it holds `tokens` columns of k values, else replaces it with one
+    // of the next power of two of them, at least 8: the jobs of a wide call hold their own columns.
+    void fit(int tokens, int k);
     // Quantizes `tokens` BF16 columns of k values (column-major, `stride` apart) for `format`.
     void prepare_bf16(QType format, const std::uint16_t* values, std::size_t stride, int tokens);
     // The same in pieces, which threads may fill at once: reset() sets the format and the token
@@ -82,6 +85,7 @@ public:
     void load_q8_1(QType format, const std::int8_t* codes, const std::uint16_t* ds,
                    std::span<const int> columns);
     [[nodiscard]] int tokens() const noexcept { return tokens_; }
+    [[nodiscard]] int capacity() const noexcept { return capacity_; }
     [[nodiscard]] int k() const noexcept { return k_; }
     [[nodiscard]] QType format() const noexcept { return format_; }
     [[nodiscard]] const std::int8_t* codes(int token) const noexcept {

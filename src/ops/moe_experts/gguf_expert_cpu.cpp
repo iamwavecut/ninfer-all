@@ -629,6 +629,11 @@ GgufCpuActivation::GgufCpuActivation(int token_capacity, int k)
     }
 }
 
+void GgufCpuActivation::fit(int tokens, int k) {
+    if (k_ == k && capacity_ >= tokens) { return; }
+    *this = GgufCpuActivation(std::max(8, int(std::bit_ceil(unsigned(std::max(tokens, 1))))), k);
+}
+
 // ggml's quantize_q8_1 as the GPU computes it (ggml_bridge_vec.cuh decode_quantize): per 32
 // values d = amax / 127 and codes round(v / d), halves away from zero; the scale used is d in
 // binary16, and s the values' warp sum in binary16.
