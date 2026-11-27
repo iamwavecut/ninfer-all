@@ -50,6 +50,14 @@ struct Reader {
     std::optional<std::string> key() {
         if (peek(kGemmaQuote)) { return quoted(); }
         skip();
+        // The template writes keys bare; the model sometimes puts one in plain quotes.
+        if (at < text.size() && (text[at] == '"' || text[at] == '\'')) {
+            const std::size_t close = text.find(text[at], at + 1);
+            if (close == std::string_view::npos || close == at + 1) { return std::nullopt; }
+            std::string out(text.substr(at + 1, close - at - 1));
+            at = close + 1;
+            return out;
+        }
         const std::size_t end = text.find(':', at);
         if (end == std::string_view::npos) { return std::nullopt; }
         std::string_view raw = text.substr(at, end - at);

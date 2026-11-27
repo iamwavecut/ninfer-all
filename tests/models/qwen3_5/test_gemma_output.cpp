@@ -512,6 +512,16 @@ int main() {
         expect(!parse_gemma_call("get_weather{city:Paris}", call), "reject a region without call:");
     }
     {
+        // Keys the model put in plain quotes name the parameter without them.
+        ninfer::GeneratedToolCall call;
+        expect(parse_gemma_call("call:f{\"a:b\":1,'c':" + q + "x" + q + "}", call),
+               "parse quoted keys");
+        expect(nlohmann::json::parse(call.arguments_json) ==
+                   nlohmann::json({{"a:b", 1}, {"c", "x"}}),
+               "quoted keys keep no quotes: " + call.arguments_json);
+        expect(!parse_gemma_call("call:f{\"a:1}", call), "reject an unclosed quoted key");
+    }
+    {
         // Streamed with the markers split across feeds, text before the call kept as content.
         std::string streamed;
         const auto terminal = run({"Checking. <|tool", "_call>call:get_weather{city:" + q, "Paris",
