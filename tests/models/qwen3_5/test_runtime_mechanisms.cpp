@@ -310,6 +310,50 @@ void test_round_layout() {
             expect(rejected, "invalid narrowed frame width rejected");
         }
     }
+    // MTP past eight requests: speculative frames of eight rows beside an ordinary frame of every
+    // row with the MTP layer's aligning column; a block drafter stops at eight.
+    for (const std::uint32_t rows : {8U, 9U, 64U}) {
+        ninfer::LayoutBuilder wide_builder;
+        auto wide_layout = q36::begin_round_state_layout(
+            wide_builder, {.hidden         = 32,
+                           .output_rows    = 128,
+                           .batch_capacity = rows,
+                           .draft_window   = 3,
+                           .backend        = ninfer::SpeculativeBackend::Mtp});
+        q36::complete_round_state_layout(wide_builder, wide_layout);
+        const auto bytes = wide_builder.finish(256);
+        std::vector<std::byte> storage(bytes + 255);
+        auto address = reinterpret_cast<std::uintptr_t>(storage.data());
+        address      = (address + 255) & ~std::uintptr_t(255);
+        q36::RoundState wide({reinterpret_cast<void*>(address), bytes}, wide_layout);
+        const bool ordinary = rows > ninfer::kMaximumSpeculativeRows;
+        expect(wide.ordinary.has_value() == ordinary,
+               "MTP keeps an ordinary frame exactly past eight rows");
+        expect(wide.mtp_decode && wide.mtp_decode->next_drafts.ne[0] == std::min(int(rows), 8) &&
+                   wide.mtp_decode->target_hidden.ne[2] == std::min(int(rows), 8),
+               "MTP speculative frames hold at most eight rows");
+        if (ordinary) {
+            expect(wide.ordinary->hidden.ne[1] == int(rows) &&
+                       wide.ordinary->mtp_hidden.ne[0] == 32 &&
+                       wide.ordinary->mtp_hidden.ne[1] == int(rows) &&
+                       wide.ordinary->mtp_kv_table_rows.ne[0] == int(rows) &&
+                       wide.ordinary->mtp_valid_columns.ne[0] == int(rows),
+                   "the ordinary frame under MTP aligns every row's MTP column");
+        }
+    }
+    {
+        bool rejected = false;
+        try {
+            ninfer::LayoutBuilder blocked_builder;
+            (void)q36::begin_round_state_layout(
+                blocked_builder, {.hidden         = 32,
+                                  .output_rows    = 128,
+                                  .batch_capacity = 9,
+                                  .draft_window   = 4,
+                                  .backend        = ninfer::SpeculativeBackend::DFlash2});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        expect(rejected, "a block drafter's round state refuses nine rows");
+    }
     ninfer::LayoutBuilder mtp_copy_builder;
     auto mtp_copy_layout = q36::begin_round_state_layout(
         mtp_copy_builder, {.hidden         = 32,
