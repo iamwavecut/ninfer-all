@@ -9,7 +9,7 @@ UD-Q3_K_XL and UD-Q8_K_XL), IsValorum's
 [APEX-I MiniPlus](https://huggingface.co/IsValorum/Inkling-2-Mini-APEX-I-MiniPlus-V2.1-GGUF),
 ISTA-DASLab's [GSQ-RCO](https://huggingface.co/ISTA-DASLab/Inkling-2-Mini-GSQ-RCO-GGUF) IQ2_S and
 IQ3_S or another quantization of the release, with the release's vision tower (BF16 or Q8_0) and DSpark
-drafter. It is the engine's first looped
+drafter, and fine-tunes of the release such as [Tess 4.5](#tess-45). It is the engine's first looped
 transformer and its own model family: its own executor (`src/models/inkling2`) and Engine core
 (`src/runtime/engine/inkling2_core`), sharing the Qwen3.5 frontend in an Inkling dialect for
 tokenization, the chat template, output parsing and the serving protocols.
@@ -908,6 +908,41 @@ experts (100% hits) and the BF16 cache 2,341 (99.2%), and the 25-token prompt pr
   40 KB WikiText slice (`--kv-dtype bf16`, 9,718 scored tokens), against UD-IQ4_XS's 1.859871
   (-0.11%). Host, disk and DSpark runs gave the device run's 384 greedy tokens byte for byte; the
   image prompt gives the mailbox's 24 and the sun on the right.
+
+### Tess 4.5
+
+Migel Tissera's [Tess-4.5-26B-A3B](https://huggingface.co/migtissera/Tess-4.5-26B-A3B) is an
+agentic-coding fine-tune of Inkling 2 Mini. Its
+[NVFP4 GGUF](https://huggingface.co/migtissera/Tess-4.5-26B-A3B-GGUF) converts like the other
+quantizations ([converting](#converting)). The
+[published artifact](https://huggingface.co/WaveCut/Tess-4.5-26B-A3B-NVFP4-NInfer-v3) (17.6 GiB)
+keeps that GGUF byte for byte, with incoai's DFlash2 drafter of the base model and two side
+components re-quantized from the repository's BF16 files: the DSpark drafter in IQ4_NL (373 MB,
+749 in BF16), and the vision tower in IQ4_NL by block-wise GPTQ with its attention value and output
+projections in Q8_0 (212 MB, 642 in BF16). On a rented RTX 3090 (350 W, PCIe 4.0 x16), November 27,
+2026, one run each:
+
+| Prompt, greedy, up to 384 tokens | `--spec none` | DSpark (a round) | DFlash2, `--draft-min-p 0.5` | Host experts, DSpark |
+|---|---:|---:|---:|---:|
+| agentic task with tools (a tool call, 46 tokens) | 115.4 tok/s | 203.2 (3.54) | 190.7 | 191.8 |
+| Python task | 116.1 | 142.8 (2.21) | 137.5 | 135.8 |
+| explanation | 116.4 | 139.8 (2.15) | 135.0 | 132.7 |
+| question in Russian | 116.2 | 113.1 (1.67) | 112.1 | 107.1 |
+
+- **Text.** Every drafted and host-memory run wrote its `--spec none` twin's text. In Russian both
+  drafters decode about 3% slower than `--spec none`.
+- **Drafter quantization.** At 7 drafts a round over the four prompts the IQ4_NL drafter had 666 of
+  3,637 drafts accepted, the BF16 drafter 667 of 3,628, Q8_0 666 of 3,635 and Q4_K 662 of 3,663.
+- **Vision tower.** Against the BF16 tower's output rows on nine images: a mean cosine of 0.99436,
+  a first percentile of 0.964 and a relative RMS error of 9.1%; all matrices in IQ4_NL give 11.5%
+  (19.3% without GPTQ) and a Q8_0 tower 2.3%. On the five rendered images the greedy answers equal
+  the BF16 tower's.
+- **Memory.** 16.4 GiB of weights on the GPU, 16.8 GiB with DSpark; one sequence of 8,192 tokens
+  plans 18.0 and 18.4 GiB of the GPU. With `--vision --max-context 65536` the server leaves
+  2.76 GiB of the card free.
+- **Not measured.** No perplexity and no task benchmark. The GGUF was compared with the checkpoint
+  on two experts of layers 0 and 20 only: layer 0's NVFP4 values are equal, layer 20's Q8_0 differs
+  from the checkpoint's MXFP8 by 0.54-0.55% relative RMS.
 
 ### Across cards
 
