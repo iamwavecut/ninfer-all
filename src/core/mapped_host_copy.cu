@@ -40,7 +40,7 @@ struct CopySegment {
 constexpr int kCopyThreads = 256;
 // A block takes eight 16-byte words a thread of a pass over the widest segment.
 constexpr std::uint64_t kCopyBlockBytes = std::uint64_t(kCopyThreads) * 16 * 8;
-// Every launch's blocks. On an RTX 4090 (PCIe 4.0 x16) 32 blocks at the greatest priority copied
+// A launch's blocks, except a wide call's (wide_blocks). On an RTX 4090 (PCIe 4.0 x16) 32 blocks at the greatest priority copied
 // pinned host memory at 26.1-26.3 GB/s beside kernels that kept every SM busy, the copy engine's
 // rate, and slowed those kernels by at most 1%; a row of 8 blocks for each of 512 segments slowed
 // them by 191%.
@@ -147,6 +147,10 @@ SegmentCopies::SegmentCopies(cudaStream_t stream, std::size_t capacity)
     : stream_(stream), capacity_(capacity),
       segments_(std::make_unique<PinnedHostBuffer>(capacity * sizeof(CopySegment))) {
     if (capacity == 0) { throw std::invalid_argument("SegmentCopies capacity must be nonzero"); }
+    int device = 0, processors = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&processors, cudaDevAttrMultiProcessorCount, device));
+    wide_blocks_ = std::uint32_t(std::max(4, processors / 8));
     copy_segments_kernel<<<1, kCopyThreads, 0, stream_>>>(
         static_cast<const CopySegment*>(segments_->data()), 0);
     CUDA_CHECK(cudaGetLastError());
@@ -163,13 +167,14 @@ void SegmentCopies::queue(void* target, const void* source, std::uint64_t bytes)
     widest_ = std::max(widest_, bytes);
 }
 
-void SegmentCopies::launch() {
+void SegmentCopies::launch(bool wide) {
     const std::size_t count = count_ - launched_;
     if (count == 0) { return; }
+    const std::uint64_t blocks = wide ? wide_blocks_ : kCopyGridBlocks;
     // Columns for the widest segment, rows for the rest of the grid.
     const auto columns = std::clamp<std::uint64_t>(
-        (widest_ + kCopyBlockBytes - 1) / kCopyBlockBytes, 1, kCopyGridBlocks);
-    const auto rows = std::clamp<std::uint64_t>(kCopyGridBlocks / columns, 1, count);
+        (widest_ + kCopyBlockBytes - 1) / kCopyBlockBytes, 1, blocks);
+    const auto rows = std::clamp<std::uint64_t>(blocks / columns, 1, count);
     copy_segments_kernel<<<dim3(unsigned(columns), unsigned(rows)), kCopyThreads, 0, stream_>>>(
         static_cast<const CopySegment*>(segments_->data()) + launched_, unsigned(count));
     CUDA_CHECK(cudaGetLastError());

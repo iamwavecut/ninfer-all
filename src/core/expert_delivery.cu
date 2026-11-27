@@ -873,9 +873,9 @@ struct ExpertDelivery::Impl {
             CUDA_CHECK(cudaMemsetAsync(target, 0, bytes, stream));
         }
     }
-    // Starts the copies queued on `stream`.
+    // Starts the copies queued on `stream`: a wide call's on the queue's fewer wide blocks.
     void launch(cudaStream_t stream) {
-        if (auto* queue = queue_of(stream)) { queue->launch(); }
+        if (auto* queue = queue_of(stream)) { queue->launch(call_wide); }
     }
     void record(cudaEvent_t event, cudaStream_t stream) {
         launch(stream);

@@ -68,8 +68,15 @@ public:
 
     // `bytes` from `source` to `target`, or zeros without a source, in the next launch.
     void queue(void* target, const void* source, std::uint64_t bytes);
-    // Launches the segments queued since the last launch.
-    void launch();
+    // Launches the segments queued since the last launch: on 32 blocks, or for a `wide` call's
+    // copies (a prompt chunk's layer banks) on wide_blocks(), so the chunk's kernels keep most of
+    // the device.
+    void launch(bool wide = false);
+    // A wide launch's blocks: an eighth of the device's multiprocessors, at least 4. With the
+    // copies of an Inkling 2 prompt forced to the kernel on Linux, 32 blocks prefilled 14% below
+    // the copy engine on an RTX 3060 (28 SMs) and 17% below on an RTX 4090 (128 SMs); 4 and 16
+    // blocks prefilled 6.5% and 6.6% below.
+    [[nodiscard]] std::uint32_t wide_blocks() const noexcept { return wide_blocks_; }
     // Launches, then waits for the stream; the list fills from its start again.
     void drain();
     // Once the stream's work has ended (a wait of the caller's), the list fills from its start.
@@ -85,6 +92,7 @@ private:
     cudaStream_t stream_ = nullptr;
     std::size_t capacity_ = 0, count_ = 0, launched_ = 0;
     std::uint64_t widest_ = 0;
+    std::uint32_t wide_blocks_ = 4;
     std::unique_ptr<PinnedHostBuffer> segments_;
 };
 
