@@ -361,6 +361,10 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << product::format_pretty_count(outcome.bad_words.dropped_tokens) << " dropped, "
             << product::format_pretty_duration(outcome.bad_words.rewind_seconds);
     }
+    if (outcome.kv_parks != 0) {
+        out << " | parked " << product::format_pretty_count(outcome.kv_parks)
+            << (outcome.kv_parks == 1 ? " time" : " times");
+    }
     return {.severity = OperationalSeverity::Info, .message = out.str()};
 }
 

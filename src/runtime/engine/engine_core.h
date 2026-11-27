@@ -109,6 +109,7 @@ public:
           endpoint_anchors_(options.context_cache.enabled && options.context_cache.endpoint_anchors),
           recover_invariant_failures_(options.recover_invariant_failures),
           kv_lease_growth_(options.context_cache.kv_lease_growth.value_or(false)),
+          parking_(kv_lease_growth_),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -116,7 +117,8 @@ public:
           // The Program's step, which may differ from the requested chunk: pacing and the
           // charges of cut steps use the unit the service projection counts.
           prefill_chunk_(std::max<std::uint32_t>(instance.program->prefill_chunk(), 1)),
-          pacing_(options.prefill_stall_budget_ms, context_cost),
+          pacing_(options.prefill_stall_budget_ms, options.prefill_stall_round_budget.value_or(false),
+                  context_cost),
           resources_(make_resource_manager(options, std::move(context_cost))),
           suspend_options_(options.suspend) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
@@ -390,23 +392,25 @@ public:
                 }
                 options.execution.grammar = output.grammar_state();
                 // Banned words go back to where a word began by queueing the request again
-                // (requeue_bad_words_rewind), from a copy of its prompt. A branched read keeps
-                // every completing token out with its masks instead.
-                std::optional<typename Request::BadWordsRequeue> bad_words;
-                if (!options.execution.bad_words.empty() && !options.execution.branches) {
-                    bad_words.emplace(typename Request::BadWordsRequeue{
+                // (requeue_request), from a copy of its prompt, and a park queues it again where
+                // it stands (park_for_device_kv). A branched read keeps every completing token
+                // out with its masks instead, and is never parked.
+                std::optional<typename Request::Requeue> requeue;
+                const bool rewinds = !options.execution.bad_words.empty();
+                if ((rewinds || parking_) && !options.execution.branches) {
+                    requeue.emplace(typename Request::Requeue{
                         .prompt = instance_.frontend.continue_prompt(member.prompt, {}, nullptr),
                         .requested_output_tokens = options.execution.requested_output_tokens,
                         .sampling                = options.execution.sampling,
                     });
-                    output.allow_bad_words_rewind(true);
+                    if (rewinds) { output.allow_bad_words_rewind(true); }
                 }
                 requests.push_back(std::make_shared<Request>(
                     first_request_id + k, first_publication_order + k, std::move(member.prompt),
                     std::move(output), member.prompt_summary, member.prepare_seconds,
                     std::move(options), member.consumer_mode, member.observation,
                     member.pending_deadline, submitted));
-                requests.back()->bad_words = std::move(bad_words);
+                requests.back()->requeue = std::move(requeue);
                 effective_budgets.push_back(
                     requests.back()->output.thinking_stats().effective_budget);
             }
@@ -935,6 +939,9 @@ private:
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
+            snapshot.parked_requests  = static_cast<std::uint32_t>(std::count_if(
+                pending_.begin(), pending_.end(),
+                [](const std::shared_ptr<Request>& request) { return request->parked; }));
             const Clock::time_point now = Clock::now();
             for (const auto& request : pending_) {
                 if (snapshot.queue_entries == RuntimeStats::kQueueReportCap) { break; }
@@ -1281,8 +1288,8 @@ private:
         instance_.program->update_sampling(*request.sequence,
                                            *request.options.execution.post_thinking_sampling);
         request.post_thinking_applied = true;
-        if (request.bad_words) {
-            request.bad_words->post_thinking_at =
+        if (request.requeue) {
+            request.requeue->post_thinking_at =
                 static_cast<std::uint32_t>(request.generated.size());
         }
     }
@@ -1290,7 +1297,7 @@ private:
     void publish_prompt_progress(const std::shared_ptr<Request>& request) {
         // A request queued again after a banned-word rewind has reported its prompt already.
         if (!request->observation.prompt_progress ||
-            (request->bad_words && request->bad_words->requeues != 0)) {
+            (request->requeue && request->requeue->requeues != 0)) {
             return;
         }
         if (!request->admitted_begin || !request->admitted_at) {
@@ -1320,8 +1327,10 @@ private:
             throw std::logic_error("request admission published generation start twice");
         }
         request->admitted_begin = begin;
-        // A request queued again after a banned-word rewind keeps its first admission's start.
-        if (request->bad_words && request->bad_words->requeues != 0) { return; }
+        request->parked         = false;
+        // A request queued again after a banned-word rewind or a park keeps its first
+        // admission's start.
+        if (request->requeue && request->requeue->requeues != 0) { return; }
         if (request->observation.phase_timings || request->observation.live_timings ||
             request->observation.prompt_progress) {
             request->admitted_at = Clock::now();
@@ -1390,7 +1399,7 @@ private:
         request->lane.reset();
         request->budget.reset();
         request->terminal_reason.reset();
-        request->bad_words.reset();
+        request->requeue.reset();
         {
             std::lock_guard lock(request->mutex);
             if (request->response_done) { return; }
@@ -1418,7 +1427,7 @@ private:
         try { request->lane.reset(); } catch (...) {}
         try { request->budget.reset(); } catch (...) {}
         try { request->terminal_reason.reset(); } catch (...) {}
-        try { request->bad_words.reset(); } catch (...) {}
+        try { request->requeue.reset(); } catch (...) {}
         bool release_capacity = false;
         try {
             std::lock_guard lock(request->mutex);
@@ -1484,15 +1493,15 @@ private:
         result.matched_stop_string     = request->output.matched_stop_string();
         result.timings.prepare_seconds = request->prepare_seconds;
         const std::optional<BeginSummary>& begin =
-            request->bad_words && request->bad_words->begin ? request->bad_words->begin
+            request->requeue && request->requeue->begin ? request->requeue->begin
                                                             : request->begin;
         if (begin) {
             result.reused_prompt_tokens = begin->reused_prompt_tokens;
             result.prefix_reuse_path    = begin->prefix_reuse_path;
         }
-        if (request->bad_words && request->bad_words->requeues != 0) {
+        if (request->requeue && request->requeue->requeues != 0) {
             // What the sequences that banned-word rewinds ended measured, with this one.
-            auto& words = *request->bad_words;
+            auto& words = *request->requeue;
             accumulate_measurements(words.timings, request->generation_timings);
             accumulate_measurements(words.speculative, std::move(request->speculative_stats));
             request->generation_timings = words.timings;
@@ -1503,6 +1512,7 @@ private:
         result.speculative             = std::move(request->speculative_stats);
         result.thinking                = request->output.thinking_stats();
         result.bad_words               = request->output.bad_words_stats();
+        result.kv_parks                = request->requeue ? request->requeue->parks : 0U;
         result.thinking.post_thinking_sampling = request->post_thinking_applied;
         if (request->ngram_archive) {
             result.ngram_archive.bound = true;
@@ -1541,7 +1551,7 @@ private:
         request->lane.reset();
         request->budget.reset();
         request->terminal_reason.reset();
-        request->bad_words.reset();
+        request->requeue.reset();
         finish_engine_phase(completion, EngineHostPhase::CommitOutput);
         result.engine_timing = request->host_timing.public_snapshot();
         {
@@ -1554,19 +1564,29 @@ private:
         request->cv.notify_one();
     }
 
-    // A banned-word rewind on the Program, which cannot take a sequence back to an earlier state.
-    // The request's sequence has ended (settle_terminal_requests) and the request queues again at
-    // the head of the FIFO, its prompt the submitted one followed by the generated tokens the
-    // rewind keeps. The cache resumes it from the deepest state it holds, and its first draw is
-    // the rewound position, where the output session's masks now ban the dropped token. What was
-    // published stays published; the output session already stands at that position.
-    void requeue_bad_words_rewind(const std::shared_ptr<Request>& request) {
-        auto& words                = *request->bad_words;
+    // A banned-word rewind on the Program, which cannot take a sequence back to an earlier state,
+    // or a park (park_for_device_kv). The request's sequence has ended (settle_terminal_requests)
+    // and the request queues again at the head of the FIFO, its prompt the submitted one followed
+    // by the generated tokens the rewind or park keeps. The cache resumes it from the deepest state
+    // it holds, and its first draw is the position after them, where after a rewind the output
+    // session's masks now ban the dropped token. What was published stays published; the output
+    // session already stands at that position. A parked request does not expire in the queue: its
+    // client's stream has begun.
+    void requeue_request(const std::shared_ptr<Request>& request) {
+        auto& words                = *request->requeue;
         const std::uint32_t target = *words.target;
         if (target != request->generated.size() || target >= words.requested_output_tokens) {
-            throw std::logic_error("banned-word rewind lost its generated prefix");
+            throw std::logic_error("requeued request lost its generated prefix");
         }
         words.target.reset();
+        const bool park         = request->park_requested;
+        request->park_requested = false;
+        request->lease_hold     = false;
+        if (park) {
+            ++words.parks;
+            ++cumulative_stats_.kv_lease_parked_requests;
+            request->parked = true;
+        }
         accumulate_measurements(words.timings, request->generation_timings);
         accumulate_measurements(words.speculative, std::move(request->speculative_stats));
         request->generation_timings = {};
@@ -1613,7 +1633,7 @@ private:
         request->paced_prefill_tokens     = 0;
         request->retained_slot            = -1;
         request->retained_session_digest.clear();
-        request->deadline = Clock::now() + pending_timeout_;
+        request->deadline = park ? Clock::time_point::max() : Clock::now() + pending_timeout_;
         {
             std::lock_guard lock(queue_mutex_);
             pending_.push_front(request);
@@ -1723,8 +1743,8 @@ private:
             // Free the slot and publish the post-release snapshot before waking the caller so
             // runtime_stats() read after generate() returns reflects the released lane.
             remove_completed_slot(lane);
-            if (request->bad_words && request->bad_words->target) {
-                requeue_bad_words_rewind(request);
+            if (request->requeue && request->requeue->target) {
+                requeue_request(request);
                 publish_runtime_stats();
             } else {
                 publish_runtime_stats();
@@ -1918,7 +1938,7 @@ private:
         std::array<bool, kMaximumConcurrency> cancelled{};
         // A row whose tokens its request's grammar rejects ends with this error instead.
         std::array<std::exception_ptr, kMaximumConcurrency> row_errors{};
-        // The generated tokens a row's banned-word rewind keeps (requeue_bad_words_rewind).
+        // The generated tokens a row's banned-word rewind or park keeps (requeue_request).
         std::array<std::optional<std::uint32_t>, kMaximumConcurrency> rewinds{};
         bool generated_staged = false;
         std::array<std::shared_ptr<Request>, kMaximumConcurrency> terminal_requests{};
@@ -2034,13 +2054,13 @@ private:
                 if (decision.bad_words_rewind) {
                     // A banned word was completed. The request's sequence ends after this round's
                     // tokens before the rewound position, and the request queues again from there
-                    // (requeue_bad_words_rewind). When the round keeps a token, the sequence ends
+                    // (requeue_request). When the round keeps a token, the sequence ends
                     // one token short of the requeued prompt, which the cache resumes from;
                     // otherwise its end is behind the prompt's and is not kept.
                     const std::uint32_t target   = *decision.bad_words_rewind;
                     const std::uint32_t accepted = decision.accepted_tokens;
                     const std::size_t generated  = request->generated.size();
-                    if (!request->bad_words || decision.finished() || accepted >= count ||
+                    if (!request->requeue || decision.finished() || accepted >= count ||
                         target > generated + accepted ||
                         (accepted != 0 && target != generated + accepted)) {
                         throw std::logic_error(
@@ -2093,6 +2113,22 @@ private:
                 };
                 finish_reasons[row] = decision.finish_reason;
                 continuations[row]  = decision.continuation;
+                // A park (park_for_device_kv) ends the sequence after every token of the round,
+                // as a rewind that keeps them all does, at a round whose tokens the output
+                // published whole and that continues by decoding.
+                if (decode_round && request->park_requested && request->requeue &&
+                    !decision.finished() && !decision.stop_hold_after &&
+                    !decision.prefix_execution_split_after &&
+                    decision.continuation == ContinuationAction::Decode) {
+                    decisions[row] = CommitDecision{
+                        .accepted_tokens = decision.accepted_tokens,
+                        .terminal        = true,
+                        .cancelled       = false,
+                    };
+                    finish_reasons[row] = FinishReason::None;
+                    rewinds[row]        = static_cast<std::uint32_t>(request->generated.size()) +
+                                   decision.accepted_tokens;
+                }
             }
             generated_staged = true;
             for (std::size_t row = 0; row < row_count; ++row) {
@@ -2211,7 +2247,7 @@ private:
                         request->terminal_reason = finish_reasons[row];
                         if (rewinds[row]) {
                             request->generated.resize(*rewinds[row]);
-                            request->bad_words->target = *rewinds[row];
+                            request->requeue->target = *rewinds[row];
                         }
                     }
                 } else if (committed.captures[row]) {
@@ -3163,15 +3199,17 @@ private:
         program_call.finish(pending.execution_timing());
         cumulative_stats_.decode_seconds_total +=
             static_cast<double>(pending.execution_timing().elapsed_ns()) * 1e-9;
+        pacing_.round_done(pending.execution_timing().elapsed_ns());
         commit_pending(std::move(pending), membership.lane_span(), true, cancelled_at_unit_start);
         publish_runtime_stats();
     }
 
     // A sequence whose Device KV lease can no longer grow finishes at the frontier its lease
     // covers. When the pool ran out of space, retained cache is released first so the answer can
-    // continue; only a lease that still cannot take its smallest step has its remaining budget
-    // bounded, so that finish carries the request's generation limit reason instead of the
-    // sequence running past its lease and failing a launch.
+    // continue. When that is not enough a request is parked instead (park_for_device_kv), and only
+    // a lease that still cannot take its smallest step and finds no request to park has its
+    // remaining budget bounded, so that finish carries the request's generation limit reason
+    // instead of the sequence running past its lease and failing a launch.
     void apply_device_kv_lease_settlements() {
         if (!kv_lease_growth_) { return; }
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -3185,6 +3223,7 @@ private:
                 const std::uint32_t released = resources_.reclaim_device_kv_for_lease(
                     *instance_.program, shortfall->main_pages, shortfall->backend_pages);
                 if (instance_.program->resume_device_kv_lease(*request->sequence)) {
+                    request->lease_hold = false;
                     if (released != 0) {
                         ++cumulative_stats_.kv_lease_reclaimed_extensions;
                         publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
@@ -3194,6 +3233,8 @@ private:
                     }
                     continue;
                 }
+                if (park_for_device_kv(lane)) { continue; }
+                request->lease_hold = false;
                 if (!request->lease_shortfall_reported) {
                     request->lease_shortfall_reported = true;
                     ++cumulative_stats_.kv_lease_cut_requests;
@@ -3206,11 +3247,61 @@ private:
                                        shortfall->backend_pages);
                 }
             }
+            request->lease_hold = false;
             const std::uint32_t control = request->output.control_suffix_tokens();
             const std::optional<std::uint32_t> limit =
                 instance_.program->device_kv_lease_settlement_tokens(*request->sequence, control);
             if (limit) { request->budget->cap_remaining(*limit); }
         }
+    }
+
+    // Whether lane `short_lane`, whose Device KV lease the pool cannot extend, waits for a park
+    // instead of ending early. The oldest active request (by submission) is never parked, so it
+    // always reaches its end: the startup minimum of the pool, max(--max-context, the requests)
+    // pages, holds it alone. Any other short request parks itself; the oldest parks the youngest
+    // decoding request that can queue again, and sits out the rounds until the pages come back,
+    // since its settled lease keeps a single step only. A parked request's next commit ends its
+    // sequence after the round's tokens, its state goes to the cache like a finished turn's, and
+    // it queues again at the head with its generated tokens as part of its prompt
+    // (requeue_request); its client's stream stays open.
+    [[nodiscard]] bool park_for_device_kv(std::uint32_t short_lane) {
+        if (!parking_) { return false; }
+        const auto parkable = [](const std::shared_ptr<Request>& request) {
+            return request != nullptr && request->requeue && request->is_decode_ready() &&
+                   !request->capture_pending && request->sequence && request->budget;
+        };
+        std::optional<std::uint32_t> oldest;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& request = slots_[lane];
+            if (request == nullptr || request->is_waiting()) { continue; }
+            if (!oldest || request->publication_order < slots_[*oldest]->publication_order) {
+                oldest = lane;
+            }
+        }
+        const auto& request = slots_[short_lane];
+        if (oldest != short_lane) {
+            if (!parkable(request)) { return false; }
+            request->park_requested = true;
+            return true;
+        }
+        std::optional<std::uint32_t> youngest;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            const auto& candidate = slots_[lane];
+            if (lane == short_lane || !parkable(candidate)) { continue; }
+            if (candidate->park_requested) {
+                // A park already pending frees its pages at the next boundary.
+                request->lease_hold = true;
+                return true;
+            }
+            if (!youngest ||
+                candidate->publication_order > slots_[*youngest]->publication_order) {
+                youngest = lane;
+            }
+        }
+        if (!youngest) { return false; }
+        slots_[*youngest]->park_requested = true;
+        request->lease_hold               = true;
+        return true;
     }
 
     void run_control_batch(const ControlMembership& membership) {
@@ -3832,6 +3923,9 @@ private:
     const bool endpoint_anchors_;
     const bool recover_invariant_failures_;
     const bool kv_lease_growth_;
+    // Requests whose growing Device KV lease the pool cannot extend are parked (park_for_device_kv)
+    // instead of ending early.
+    const bool parking_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool context_cache_enabled_;

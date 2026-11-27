@@ -299,6 +299,13 @@ std::string ServeMetrics::render(const LoadCapacity& capacity, const LoadSample&
            "Requests whose Device KV lease could not grow, so the answer ended with "
            "finish_reason length before its max_tokens.",
            static_cast<double>(stats.kv_lease_cut_requests));
+    append(out, "ninfer:kv_lease_parked_requests_total", "counter",
+           "Requests parked because their Device KV lease could not grow: the sequence ended and "
+           "the request queued again where it stood.",
+           static_cast<double>(stats.kv_lease_parked_requests));
+    append(out, "ninfer:parked_requests", "gauge",
+           "Parked requests waiting in the queue to resume.",
+           static_cast<double>(stats.parked_requests));
     append_context_cache(out, stats);
     append_gpus(out, gpus);
     return out;

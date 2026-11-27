@@ -72,6 +72,8 @@ struct ServeOptions {
     std::uint32_t prefill_chunk        = 0; // 0: the Engine's automatic chunk
     std::uint32_t decode_rounds_per_prefill = 0;
     std::uint32_t prefill_stall_budget_ms   = 0;
+    // `--prefill-stall-budget-ms round`; unset follows the request count (EngineOptions).
+    std::optional<bool> prefill_stall_round_budget;
     bool fast_prefill_kernel           = false;
     std::filesystem::path context_cost_presets;
     std::string device_profile = "auto";

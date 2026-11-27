@@ -738,6 +738,9 @@ struct GenerationResult {
     NgramArchiveStats ngram_archive;
     ThinkingBudgetStats thinking;
     BadWordsStats bad_words;
+    // Times the request was parked because the Device KV pool could not extend its lease: its
+    // sequence ended and it queued again where it stood.
+    std::uint32_t kv_parks = 0;
     // Engine::submit_branches: one record per branch, in order; empty for every other request.
     std::vector<BranchResult> branches;
 };

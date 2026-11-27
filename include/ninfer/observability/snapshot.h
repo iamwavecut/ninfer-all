@@ -128,6 +128,10 @@ struct RuntimeStats {
     // finish_reason length before its max_tokens.
     std::uint64_t kv_lease_reclaimed_extensions = 0;
     std::uint64_t kv_lease_cut_requests         = 0;
+    // Requests parked because their lease could not grow: each one's sequence ended and it queued
+    // again where it stood (a request parked twice counts twice), and those now waiting to resume.
+    std::uint64_t kv_lease_parked_requests = 0;
+    std::uint32_t parked_requests          = 0;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;

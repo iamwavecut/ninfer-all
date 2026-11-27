@@ -307,6 +307,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.prefill_chunk            = options.prefill_chunk;
     engine_options.decode_rounds_per_prefill = options.decode_rounds_per_prefill;
     engine_options.prefill_stall_budget_ms   = options.prefill_stall_budget_ms;
+    engine_options.prefill_stall_round_budget = options.prefill_stall_round_budget;
     engine_options.fast_prefill_kernel      = options.fast_prefill_kernel;
     engine_options.kv_cache                 = options.kv_cache;
     engine_options.kv_cache_automatic       = options.kv_cache_automatic;
@@ -959,6 +960,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
     outcome.thinking            = result.thinking;
     outcome.bad_words           = result.bad_words;
+    outcome.kv_parks            = result.kv_parks;
     outcome.finish_reason       = result.finish_reason;
     outcome.matched_stop_string = std::move(result.matched_stop_string);
 

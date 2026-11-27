@@ -1087,7 +1087,9 @@ they advance during a long request rather than at its completion, and their rati
 | `ninfer:paced_prefill_steps_total` | counter | prefill steps `--prefill-stall-budget-ms` cut short while another stream generated |
 | `ninfer:paced_prefill_deferred_tokens_total` | counter | prompt tokens those steps left to later steps |
 | `ninfer:kv_lease_reclaimed_extensions_total` | counter | `--kv-lease-growth` windows extended after retained cache was released for them |
-| `ninfer:kv_lease_cut_requests_total` | counter | requests whose `--kv-lease-growth` window could not grow, so the answer ended with `finish_reason=length` before its `max_tokens` |
+| `ninfer:kv_lease_cut_requests_total` | counter | requests whose `--kv-lease-growth` window could not grow and that nothing could be parked for, so the answer ended with `finish_reason=length` before its `max_tokens` |
+| `ninfer:kv_lease_parked_requests_total` | counter | requests [parked](#parking) because a `--kv-lease-growth` window could not grow: the sequence ended and the request queued again where it stood (a request parked twice counts twice) |
+| `ninfer:parked_requests` | gauge | parked requests waiting in the queue to resume |
 | `ninfer:context_selections_total{source}` | counter | admissions by the context-cache source they started from: `root` (a miss, prefilled from token zero), `private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, `shared_stable_prefix`; the hit rate is 1 - root / all |
 | `ninfer:context_pressure_events_total{event}` | counter | what pressure planning did to inactive owners: `private_owner_evicted`, `private_owner_degraded`, `shared_owner_evicted`, `shared_owner_degraded`, `checkpoint_dropped` |
 | `ninfer:context_pressure_searches_total{result}` | counter | pressure planning searches: `started`, `budget_exhausted`, `maximal_fallback` |
@@ -2690,7 +2692,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--prefill-chunk N` | text-prefill chunk; with an `int8` or `rk*` KV cache a Qwen3.5-core model runs the nearby multiple of 128 that best fills the GPU's prompt-attention waves, up to 256 tokens more (see [device profiles](device-profiles.md)) | `1024`; `4096` for native MoE experts in host memory or files; `2048` for Qwen3.8-Flash-Next with `--tensor-parallel` when every device has room ([prompt pieces](maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next)); `2048` for DeepSeek-V4.1, which takes at most `4096` and a narrower chunk where the card lacks room ([its prompt chunks](deepseek-v41.md#prompt-spans)) |
 | `--prefill-tail exact\|full\|N` | DeepSeek-V4.1: the prompt rows that blocks 21 to 39, which keep no compressed cache, run: `exact` runs those the kept state and the last token's logits depend on, from the prompt chunk at or below them, so the output is `full`'s; `full` runs every row; `N` (at least 128) runs the last `N` rows before each kept state, a lossy mode: the output changes ([the prefill tail](deepseek-v41.md#the-prefill-tail)) | `exact` |
 | `--decode-rounds-per-prefill N` | Decode rounds that run before each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; proportionally fewer, at least one, before a shorter prefill unit, so a short prompt gets in after one round; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later. Qwen3.8-Flash-Next counts a speculative round as the tokens its requests fed on average | `0` (`--prefill-chunk` / 64) |
-| `--prefill-stall-budget-ms N` | While other requests generate, cut each prefill step to the largest multiple of 128 tokens, at least 512, that the prefill cost model predicts to take at most N ms; the model's costs are scaled by the ratio of observed to predicted step times. Every token of the other streams then waits about N ms instead of a whole chunk, and the new prompt prefills slower; a lone prompt keeps the whole chunk. Qwen3.5-family models only | `0` (off) |
+| `--prefill-stall-budget-ms N\|round` | While other requests generate, cut each prefill step to the largest multiple of 128 tokens, at least 512, that the prefill cost model predicts to take at most N ms; the model's costs are scaled by the ratio of observed to predicted step times. Every token of the other streams then waits about N ms instead of a whole chunk, and the new prompt prefills slower; a lone prompt keeps the whole chunk. `round` takes the decode rounds' measured time as the budget and cuts down to 128 tokens, so a stream waits for one decode round and one step of at least 128 prompt tokens ([measured](#execution-behavior)). Qwen3.5-family models only | `round` past `--max-concurrency 8`, else `0` (off) |
 | `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile), an `fp8` cache with its in-register dequant kernel, and, on Blackwell, an `nvfp4` cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides for the `int8`/`rk*` and `nvfp4` caches, and the built-in profiles turn the kernel on where it measured faster; the `fp8` cache never takes the fast kernel from the profile, because that key was measured on the INT8-family kernel only and the fast kernel changes the output, so a default `--kv-dtype fp8` run keeps the standard kernel and the flag (or `NINFER_PROMPT_FAST=1` for diagnosis) is the only route to it | the device profile for the `int8`/`rk*` and `nvfp4` caches; the standard kernel for `fp8` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
@@ -2828,7 +2830,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--disk-kv-directstorage` | read restores through Microsoft DirectStorage; Windows builds with `-DNINFER_DIRECTSTORAGE=ON` only, untested | mapped reads |
 | `--context-cache-policy default\|rolling` | `rolling`: within one cache session (a Responses `prompt_cache_key`), a capture that extends a resident checkpoint the request matched exactly inherits that resident's demand, so a conversation whose prompt only grows keeps rolling its frontier forward; with conversations sharing a prefix, one conversation's extension can evict the prefix the others use | `default` |
 | `--concurrent-prefill` | admit waiting requests to free lanes while other requests prefill, instead of holding admission until the staged prefill finishes; without it a staged prefill whose last chunk can share a pass with others still admits them ([Execution behavior](#execution-behavior)) | off |
-| `--kv-lease-growth` | admission reserves the prompt plus a 4096-token output window (or `--prefill-chunk` when larger) instead of the whole `max_tokens` budget and extends it at decode-round boundaries, releasing idle retained cache owners least recently used first when the pool is short; an answer whose smallest step still does not fit ends with `finish_reason=length` before `max_tokens`; `--no-kv-lease-growth` turns it off | on past `--max-concurrency 8`, else off |
+| `--kv-lease-growth` | admission reserves the prompt plus a 4096-token output window (or `--prefill-chunk` when larger) instead of the whole `max_tokens` budget and extends it at decode-round boundaries, releasing idle retained cache owners least recently used first when the pool is short, then [parking](#parking) a request; an answer whose smallest step does not fit and that nothing can be parked for ends with `finish_reason=length` before `max_tokens`; `--no-kv-lease-growth` turns it off | on past `--max-concurrency 8`, else off |
 | `--recency-eviction` | pressure ranks private conversations and shared prefixes in one least-recently-used order (latest hit or publication): a request that does not fit gives up the fewest oldest owners that make it fit and spares those it does not need, instead of clearing every owner it cannot reuse; kept owners, shared prefixes included, are demoted to Host where it has room, and the search may fully evict only inside that tail and only an owner Host cannot take. A private checkpoint that finds the state pools full reclaims the idle conversation that is oldest in this order, not the oldest publication | off |
 | `--value-aware-demote` | pressure search charges evicting a private conversation its rank by rebuild cost among the request's victims, so among otherwise equal plans it keeps the conversations most expensive to rebuild, demoted to Host, and evicts the cheapest; it only reorders a bounded search, which can then settle on a different plan | off |
 | `--thorough-admission-search` | a new request's admission searches up to 250 ms for its reuse plan at every boundary, even while other requests decode (otherwise 50 ms idle, 10 ms busy), and a request whose plan saves more earns a longer base grant; every eligible option with an uncertain forecast gets its own short discovery grant (otherwise one per search), an option already generated for a candidate is always assessed, and the gain a search may spend against is the request's own re-prefill rather than a share of it per runnable request; a running decode can then pause up to that long when a request arrives | off |
@@ -2977,7 +2979,7 @@ they do not infer request behavior from process-global counter deltas.
 | `server_start` | build version, artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities and switches, the rotation past the native window the Engine resolved (`engine.rope`: type `none` or `yarn`, factor, native window; Qwen3.8-Flash-Next reports it, the other families `null`), n-gram drafting options, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, Host State/KV capacity and occupancy, KV sizing ledger, CUDA Graph allowance and measured cost, CUDA/GPU environment, redacted argv, and `arguments`: the redacted options the server runs with, its `--config` files merged under the command line ([launch configuration files](cli.md#launch-configuration-files)) |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape, the number of distinct banned words (`bad_word_count`) |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
-| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, reasoning-loop guard firing, answer-now closes, banned-word rewinds (`bad_words_rewinds`, `bad_words_dropped_tokens`, `bad_words_rewind_seconds`), unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
+| `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, request-owned materialization cost/search diagnostics, thinking-budget application counters, reasoning-loop guard firing, answer-now closes, banned-word rewinds (`bad_words_rewinds`, `bad_words_dropped_tokens`, `bad_words_rewind_seconds`), [parks](#parking) (`kv_parks`), unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters including n-gram and draft-archive counters |
 | `request_error` | the resolved request configuration and the generation, cancellation, or pre-outcome transport terminal message |
 | `throughput` | interval token/decode/context-cache pressure counter deltas, authoritative worker Host-work deltas, current scheduler/resource gauges, and decode-round batch statistics |
 
@@ -3324,6 +3326,22 @@ times, expects to fit the budget. A deeper prefix costs more attention per token
 a generating stream paused that stream for up to 0.83 s per step without a budget, 0.35-0.36 s at
 250 ms and 0.59-0.62 s at 500 ms; the new prompt's first token came 11% and 2% later.
 
+Past `--max-concurrency 8` the budget is `round`: the decode rounds' measured time, with steps
+down to 128 tokens. A step of 128 tokens still takes several rounds, so the pause stays above two
+rounds; it is the step that bounds it. On an RTX 3090 with Ternary Bonsai 2 (`--max-concurrency 64`,
+`--kv-dtype rk8v4`), 64 clients that each send a 2,000-token conversation history and read 256
+tokens, one run each:
+
+| Prefill steps | Inter-token p50 / p99 | First token p50 | Output |
+|---|---:|---:|---:|
+| whole chunks (`--prefill-stall-budget-ms 0`) | 18.2 / 461.6 ms | 38.4 s | 204.9 tok/s |
+| `round` (the default) | 18.2 / 105.2 ms | 46.4 s | 172.9 tok/s |
+
+The paced run cut 1,017 steps. Streams that decode beside new prompts pause under a quarter as
+long at the 99th percentile; the prompts finish later and the GPU delivers 15.6% fewer tokens,
+since each cut step reads the weights again for fewer tokens. `--prefill-stall-budget-ms 0` gives
+the throughput back.
+
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
 media request retains the same cancellation and timeout deadline. Model output is bounded by the
@@ -3353,9 +3371,33 @@ With `--kv-lease-growth` admission instead reserves the prompt plus a bounded De
 the remaining output (4096 tokens, or `--prefill-chunk` when larger) and extends it at each
 decode-round boundary, so a client that asks for far more output than it generates does not hold
 the prefix cache out of the pool. When the pool cannot extend the window, idle retained cache
-owners are released least recently used first; if the smallest step still does not fit, the
-request completes at the frontier its window covers and reports `finish_reason=length` before
-reaching `max_tokens`.
+owners are released least recently used first; if that is not enough, a request is parked.
+
+### Parking
+
+A parked request's sequence ends after its current decode round, its state goes to the prefix
+cache as a finished turn's does, and the request queues again at the head of the queue with its
+generated tokens as part of its prompt. Its client's stream stays open and pauses; when the pool
+has room again the cache resumes the request from the deepest state it holds (the Device blocks
+that are left, or the Host pool `--host-cache-mib` sizes) and the stream continues where it stopped.
+A parked request does not expire in the queue (`--pending-timeout-ms`). The request whose window
+cannot grow parks itself, except the oldest active request (by arrival), which is never parked:
+the youngest decoding request parks for it, and it sits out the rounds until the pages come back.
+The pool holds at least one `--max-context` window (a page per lane where that is more), so the
+oldest request alone always reaches its end. Only when nothing can be parked (the oldest request is
+the only one decoding, or the others prefill) does the request complete at the frontier its window
+covers and report `finish_reason=length` before reaching `max_tokens`. A branched read
+(`Engine::submit_branches`) is never parked. Parks show in `/metrics`
+(`ninfer:kv_lease_parked_requests_total`, `ninfer:parked_requests`) and in the request log
+(`kv_parks`).
+
+On an RTX 3090 with Ternary Bonsai 2 (`--max-concurrency 64 --max-context 8192 --kv-capacity
+173760 --kv-dtype rk8v4 --spec none`), 64 clients that each ask for 7,000 tokens at once need
+448,000 tokens of KV, 2.6 times the pool. Without parking 38 of the 64 answers ended at 4,053 to
+5,396 tokens, 351,021 tokens in all, in 521 s. With parking 25 requests parked once each, every
+answer reached 7,000 tokens, 448,000 in all, in 691 s: 648 against 673 tok/s (-3.7%); the
+inter-token p99 was 120.8 against 121.4 ms, and the last request's first token came at 462 s
+against 235 s.
 
 ### Default output limit
 
