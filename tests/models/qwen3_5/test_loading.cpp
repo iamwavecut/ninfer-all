@@ -428,8 +428,9 @@ void bf16_head_beside_gguf_blocks() {
 }
 
 // `--embedding-residency auto` moves a table to host memory only where nothing else reads it on the
-// device: a tied table, a transcode, a Vision overlay window or host experts keep it there. Only the
-// Host answer depends on the machine (a WDDM driver, the host's pinning headroom).
+// device: a tied table, a transcode or a Vision overlay window keeps it there. Host or disk experts
+// take host memory too, so the table goes beside them only where the host holds both. Only the Host
+// answer depends on the machine (a WDDM driver, the host's pinning headroom).
 void automatic_embedding_residency() {
     ModelFixture tied;
     tied.file.write();
@@ -441,14 +442,14 @@ void automatic_embedding_residency() {
     fixture.file.root["components"]["text"]["config"]["tie_word_embeddings"] = false;
     fixture.tensor("embedding-own", {272, 128});
     fixture.file.root["bindings"]["text/token_embedding"] = {{"object", "embedding-own"}};
+    fixture.tensor("expert-0-down", {128, 64});
+    fixture.file.root["bindings"]["text/layers/0/moe/experts/0/down_proj"] = {
+        {"object", "expert-0-down"}};
     fixture.file.write();
     artifact::Reader reader(fixture.file.entry);
     const auto suits = [&](LoadOptions options) { return qwen::host_embedding_suits(reader, options); };
     require(!suits({.embedding_q4 = true}) && !suits({.embedding_q6 = true}),
             "auto moved a table that a transcode shrinks on the device to host memory");
-    require(!suits({.expert_residency = ExpertResidency::Host}) &&
-                !suits({.expert_residency = ExpertResidency::Disk}),
-            "auto moved the table to host memory beside host or disk experts");
     require(!suits({.vision = true, .vision_residency = VisionResidency::Overlay}),
             "auto took the table out of the memory a Vision overlay window borrows");
     // A margin far above the 68 KiB table keeps a host near the threshold from flaking.
@@ -456,6 +457,9 @@ void automatic_embedding_residency() {
     const bool room = available && *available >= artifact::kPinnedHeadroomBytes + (256ULL << 20);
     if (!serialized_copy_queue() && room) {
         require(suits({}), "auto kept an untied table that only the gather reads on the device");
+        require(suits({.expert_residency = ExpertResidency::Host}) &&
+                    suits({.expert_residency = ExpertResidency::Disk}),
+                "auto kept the table on the device beside host or disk experts the host holds");
     }
 }
 
