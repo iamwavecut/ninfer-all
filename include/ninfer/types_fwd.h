@@ -40,6 +40,7 @@ struct StartupObserver;
 
 // ninfer/engine_options.h
 struct KvCapacityPolicy;
+struct KvHostTier;
 struct SpeculativeOptions;
 enum class DiagnosticLevel : std::uint8_t;
 struct Diagnostic;
