@@ -53,6 +53,13 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   call the model opens before it closes its thought ends the thought and is returned as a call),
   streaming, reasoning in its own channel when thinking is on, and causal scoring
   (`ninfer-perplexity`).
+- **Tool history.** An assistant message with both text and `tool_calls` renders its text before
+  the calls, the order the model writes them in, and the model turn stays open after the tool
+  response. The release's template alone writes that text after the response and closes the turn,
+  so the next generation starts without a `<|turn>model` header and the answer opens with a stray
+  `thought` line. NInfer gives the template such a message as two messages of one turn; the
+  template itself is the release's. With `preserve_thinking`, a message with reasoning that a later
+  user message follows is left whole. Argument keys the model wraps in plain quotes lose them.
 - **Dependent launches.** On sm_90 and newer cards the decode graph launches each kernel as a
   programmatic dependent of the one before it
   ([programmatic dependent launch](maintainer/op-development.md#programmatic-dependent-launch)).
