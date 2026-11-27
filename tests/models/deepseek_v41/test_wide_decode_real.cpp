@@ -1,5 +1,6 @@
 // DeepSeek: a decode step of 9 to 16 rows on a real artifact (skipped without one), as
-// tests/models/wide_decode_check.h checks it:
+// tests/models/wide_decode_check.h checks it, its experts read from the artifact's files and no
+// Engram table (both routes run the same model):
 //   NINFER_DEEPSEEK_ARTIFACT  a .ninfer of the family
 #include "artifact/reader.h"
 #include "core/device.h"
@@ -20,7 +21,8 @@ int main() {
     DeviceContext device(0);
     device.bind_to_current_thread();
     const artifact::Reader reader(artifact_path);
-    auto model = models::deepseek_v41::load_model(reader, {.artifact = artifact_path}, device);
+    auto model = models::deepseek_v41::load_model(
+        reader, {.artifact = artifact_path, .experts = ExpertResidency::Disk}, device);
     const auto domain = std::int32_t(model->resources().public_token_count);
     constexpr std::uint32_t kSequences = 16;
     models::deepseek_v41::ExecutorOptions options;

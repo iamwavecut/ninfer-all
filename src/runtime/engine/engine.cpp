@@ -239,7 +239,10 @@ EngineOptions with_family_speculation(EngineOptions options) {
         return options;
     }
     const bool stages = options.devices.size() > 1 && !options.tensor_parallel;
-    if (flash_next && !stages && components.contains("dflash2")) {
+    // The block drafter keeps a slot for every request; past kMaximumSpeculativeRows requests MTP
+    // drafts instead.
+    if (flash_next && !stages && components.contains("dflash2") &&
+        options.max_concurrency <= kMaximumSpeculativeRows) {
         speculative.backend      = SpeculativeBackend::DFlash2;
         speculative.draft_tokens = SpeculativeOptions::kAutomaticDFlash2Tokens;
         // The round verifies through the first draft the selector is unsure of, unless
