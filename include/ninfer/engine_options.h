@@ -455,6 +455,17 @@ struct HybridExpertOptions {
     // uncached expert that all its tokens rank past this many places of their top ten, without
     // giving its router weight to the others (lossy); 0 (default) serves every miss.
     std::uint32_t tail_skip_rank = 0;
+    // Host and disk experts: 0..1 added to the routing score of each expert the device holds (its
+    // cache, lent banks or disk pools) when a decode or verification call ranks a layer's experts,
+    // the chosen experts keeping the weights of their unbiased scores (lossy: which experts a call
+    // takes, and so its results, depend on what the device holds). The score is the one each
+    // router weights its experts by: the softmax probability (Qwen3.5/3.6 MoE, Gemma 4, Flash-Next,
+    // Edge0), the sigmoid (Flint; Inkling 2 with its selection bias) or DeepSeek-V4.1's
+    // sqrt-softplus with its selection bias. 0 (default): routing as trained.
+    float route_bias = 0.0F;
+    // With route_bias, also the prompt chunks' calls (ninfer-perplexity, whose scores then carry
+    // the bias at every token).
+    bool route_bias_prompts = false;
     // GGUF host experts: device buffers a wide prefill call copies its layer's uncached experts
     // into. 2 copies the next layer's while this layer's experts run, and takes the second
     // buffer's memory from the expert cache; 1 keeps one. 0 (default) takes two with the automatic

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/expert_route_bias.h"
 #include "ops/common/math.cuh"
 #include "ops/common/warp.cuh"
 
@@ -126,15 +127,35 @@ sparse_moe_merge_ranked_runs(SparseMoeRankedValue (&run)[kSparseMoeTopK]) {
     }
 }
 
+// One warp: the top 8 of the 256 router logits `scores` (larger first, lower id on ties) and
+// their softmax renormalized over the eight (alpha), the shared expert's sigmoid gate from
+// scores[256]. With `held` (the route bias, core/expert_route_bias.h), the top 8 by softmax
+// probability plus held.bias for a held expert, weighted as without.
 __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores, int* ids,
                                                             float* alpha, float* shared_scale,
-                                                            float* selected_logits) {
+                                                            float* selected_logits,
+                                                            const ExpertRouteBias& held = {}) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     SparseMoeRankedValue local[kSparseMoeTopK];
 #pragma unroll
     for (int item = 0; item < kSparseMoeTopK; ++item) {
         const int id = lane + item * 32;
         local[item]  = {scores[id], id};
+    }
+    if (held.enabled()) {
+        float top = local[0].value;
+#pragma unroll
+        for (int item = 1; item < kSparseMoeTopK; ++item) { top = fmaxf(top, local[item].value); }
+        top       = warp_max(top);
+        float sum = 0.0f;
+#pragma unroll
+        for (int item = 0; item < kSparseMoeTopK; ++item) { sum += expf(local[item].value - top); }
+        sum = __shfl_sync(kFullWarpMask, warp_reduce_sum(sum), 0);
+#pragma unroll
+        for (int item = 0; item < kSparseMoeTopK; ++item) {
+            local[item].value =
+                expf(local[item].value - top) / sum + expert_route_bonus(held, local[item].id);
+        }
     }
     sparse_moe_sort_eight_descending(local);
     sparse_moe_merge_ranked_runs(local);
@@ -143,13 +164,19 @@ __device__ __forceinline__ void sparse_moe_select_top8_warp(const float* scores,
 #pragma unroll
         for (int rank = 0; rank < kSparseMoeTopK; ++rank) {
             ids[rank]             = local[rank].id;
-            selected_logits[rank] = local[rank].value;
+            selected_logits[rank] = held.enabled() ? scores[local[rank].id] : local[rank].value;
         }
     }
     __syncwarp();
 
+    // The largest chosen logit: the first unless a route bias reordered them.
+    float top = selected_logits[0];
+    if (held.enabled()) {
+#pragma unroll
+        for (int rank = 1; rank < kSparseMoeTopK; ++rank) { top = fmaxf(top, selected_logits[rank]); }
+    }
     float exponential = 0.0f;
-    if (lane < kSparseMoeTopK) { exponential = expf(selected_logits[lane] - selected_logits[0]); }
+    if (lane < kSparseMoeTopK) { exponential = expf(selected_logits[lane] - top); }
     float denominator = warp_reduce_sum(exponential);
     denominator       = __shfl_sync(kFullWarpMask, denominator, 0);
     if (lane < kSparseMoeTopK) { alpha[lane] = exponential / denominator; }

@@ -3,6 +3,7 @@
 // Gemma 4's own elementwise, normalization, routing and decode-attention kernels. Activations are
 // token-major: an FP32 residual h[t][i], BF16 projection inputs x[t][k] (a [K, T] Tensor).
 
+#include "core/expert_route_bias.h"
 #include "models/gemma4/kv_format.h"
 
 #include <cuda_bf16.h>
@@ -219,10 +220,11 @@ void attn_residual(const AttnResidualArgs& args, cudaStream_t stream);
 // The router of the MoE block over its input rows x (attn_residual's router_x, FP32 [T][H]):
 // logits = router . x (FP32 router [E][H]); the top_k experts by softmax, their weights
 // renormalized over the top_k and multiplied by expert_scale. ids/weights [T][top_k]; logits is
-// FP32 scratch [T][E].
+// FP32 scratch [T][E]. With `held` (core/expert_route_bias.h), the top_k by softmax probability
+// plus held.bias for a held expert, weighted as without.
 void route(const float* x, int hidden, int tokens, const float* router, const float* expert_scale,
            int experts, int top_k, float* logits, std::int32_t* ids, float* weights,
-           cudaStream_t stream);
+           cudaStream_t stream, const ExpertRouteBias& held = {});
 
 // route() for at most 8 tokens, with the pairs also grouped by expert into the arrays of a
 // gguf::MoeRouting (bounds [E + 1], sorted [T * top_k], active [E], active_count [1]), as
@@ -230,7 +232,8 @@ void route(const float* x, int hidden, int tokens, const float* router, const fl
 void route_select(const float* x, int hidden, int tokens, const float* router,
                   const float* expert_scale, int experts, int top_k, float* logits,
                   std::int32_t* ids, float* weights, std::int32_t* bounds, std::int32_t* sorted,
-                  std::int32_t* active, std::int32_t* active_count, cudaStream_t stream);
+                  std::int32_t* active, std::int32_t* active_count, cudaStream_t stream,
+                  const ExpertRouteBias& held = {});
 
 // out[p][r] = bf16(gelu_tanh(x[p][r]) * x[p][width + r]) for pairs p of [2 * width] FP32 rows.
 void geglu_rows(const float* x, int pairs, int width, __nv_bfloat16* out, cudaStream_t stream);

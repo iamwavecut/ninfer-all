@@ -1649,6 +1649,12 @@ void ExpertMisses::set_resident(std::size_t layer, const ExpertCache::Ranges& re
     RankBinding bind(impl_->device, target.rank);
     Impl::write_ranges(impl_->ranges.at(layer), resident);
 }
+ExpertRouteBias ExpertMisses::route_bias(std::size_t layer, float bias) const {
+    return {.tables = impl_->layers.at(layer).gate_table,
+            .ranges = static_cast<const std::uintptr_t*>(impl_->ranges.at(layer).p),
+            .count  = kRanges,
+            .bias   = bias};
+}
 MissStats ExpertMisses::stats() const {
     std::lock_guard lock(impl_->stats_mutex);
     return impl_->counters;

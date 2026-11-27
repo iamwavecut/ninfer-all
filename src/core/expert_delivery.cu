@@ -2233,6 +2233,15 @@ void ExpertDelivery::await(cudaStream_t stream) {
 const void* const* ExpertDelivery::tables(std::size_t layer) const {
     return static_cast<const void* const*>(impl_->layers.at(layer).tables.p);
 }
+ExpertRouteBias ExpertDelivery::route_bias(std::size_t layer, float bias) const {
+    const auto low = reinterpret_cast<std::uintptr_t>(impl_->cache.p);
+    return {.tables = tables(layer),
+            .low    = low,
+            .high   = low + impl_->cache_span,
+            .ranges = static_cast<const std::uintptr_t*>(impl_->lent_ranges.p),
+            .count  = 2,
+            .bias   = bias};
+}
 bool ExpertDelivery::alias_aligned(std::size_t layer, std::size_t alias,
                                    std::uint64_t bytes) const {
     if (bytes == 0 || bytes > 256 || (bytes & (bytes - 1)) != 0) {

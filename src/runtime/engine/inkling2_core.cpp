@@ -175,6 +175,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
         throw std::invalid_argument("expert DMA shares, CPU threads and routing profiles require "
                                     "host or disk experts (--expert-residency host|disk)");
     }
+    check_expert_route_bias(options);
     if (options.tensor_parallel ? device.size() < 2 : device.size() != 1) {
         throw std::invalid_argument("Inkling 2 runs on one device, or divides its routed experts over "
                                     "several with --tensor-parallel");
@@ -278,6 +279,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.expert_cache_bytes = options.expert_cache_bytes;
     executor.expert_dma_share   = hybrid.dma_share;
     executor.expert_cpu_threads = hybrid.cpu_threads;
+    executor.expert_route_bias  = hybrid.route_bias;
+    executor.expert_route_bias_prompts = hybrid.route_bias_prompts;
     executor.expert_disk        = {hybrid.mirror, hybrid.direct};
     // An image of `budget` cells has 2 x 2 patches each.
     executor.vision_max_patches = 4 * vision_budget;

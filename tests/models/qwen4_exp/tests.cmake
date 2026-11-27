@@ -49,6 +49,11 @@ ninfer_add_test(ninfer_expert_profile_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_profile.cpp"
   LIBRARIES ninfer_model_runtime)
 
+ninfer_add_test(ninfer_expert_route_bias_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_route_bias.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_expert_route_bias_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_divided_head_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_divided_head.cu"
   LIBRARIES ninfer_model_runtime)

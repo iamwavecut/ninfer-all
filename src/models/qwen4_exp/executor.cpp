@@ -1351,6 +1351,17 @@ struct Executor::Impl {
             (residency != ExpertResidency::Host || native_host)) {
             throw std::invalid_argument("--expert-prefill-buffers needs GGUF host experts");
         }
+        const float route_bias = options.hybrid_experts.route_bias;
+        if (!(route_bias >= 0 && route_bias <= 1)) {
+            throw std::invalid_argument("the expert route bias takes a finite value in 0..1");
+        }
+        if (route_bias > 0 && (residency == ExpertResidency::Device || native_host ||
+                               options.hybrid_experts.mapped_misses || model.tensor_parallel())) {
+            throw std::invalid_argument(
+                "--expert-route-bias needs GGUF host or disk experts with staged misses and no "
+                "--tensor-parallel (native host experts keep their cache's contents on the host, "
+                "and tensor-parallel devices would each route by their own cache)");
+        }
         plan_segments();
         allocate_ranks();
         allocate_exchange();
@@ -4313,8 +4324,16 @@ struct Executor::Impl {
         Tensor weights(rank.route_weights, DType::FP32, {top, t});
         Tensor shared(rank.route_shared, DType::FP32, {t});
         auto scope = rank.workspace->scope();
+        // The route bias toward the experts the device holds: a text layer's decode and
+        // verification calls (HybridExpertOptions::route_bias).
+        const float bias = options.hybrid_experts.route_bias;
+        const ExpertRouteBias held =
+            misses && bias > 0 && index < layers.size() &&
+                    (!prompt_pass || options.hybrid_experts.route_bias_prompts)
+                ? misses->route_bias(index, bias)
+                : ExpertRouteBias{};
         ops::moe_route(Tensor(rank.mixed, DType::BF16, {h, t}), m.router, m.shared_gate,
-                       *rank.workspace, ids, weights, shared, rank.stream, route_done(rank));
+                       *rank.workspace, ids, weights, shared, rank.stream, route_done(rank), held);
     }
 
     void run_moe(const LayerPlan& plan, RankState& rank, std::int32_t t, std::size_t index) {

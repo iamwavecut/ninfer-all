@@ -632,6 +632,22 @@ void install_device_route_profile_for(const EngineOptions& options, const Device
     }
 }
 
+void check_expert_route_bias(const EngineOptions& options) {
+    const float bias = options.hybrid_experts.route_bias;
+    if (!(bias >= 0 && bias <= 1)) {
+        throw std::invalid_argument("the expert route bias takes a finite value in 0..1");
+    }
+    if (bias == 0) { return; }
+    if (options.expert_residency == ExpertResidency::Device) {
+        throw std::invalid_argument("--expert-route-bias requires host or disk experts "
+                                    "(--expert-residency host|disk)");
+    }
+    if (options.tensor_parallel) {
+        throw std::invalid_argument("--expert-route-bias runs on one device: with "
+                                    "--tensor-parallel each device would route by its own cache");
+    }
+}
+
 bool ModelInstance::suspendable() const noexcept {
     return model->weights_suspendable() && program->device_state_suspendable();
 }
@@ -1114,6 +1130,8 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             models::qwen3_5::execution::NativeExpertCpu{options.hybrid_experts.dma_share,
                                                         options.hybrid_experts.cpu_threads},
             ExpertDiskReads{options.hybrid_experts.mirror, options.hybrid_experts.direct});
+        experts->set_route_bias(options.hybrid_experts.route_bias,
+                                options.hybrid_experts.route_bias_prompts);
         if (const std::string cpu = experts->cpu_description(); !cpu.empty()) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
                                "native experts: missing experts split between copies and %s (%s)",

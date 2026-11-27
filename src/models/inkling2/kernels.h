@@ -24,6 +24,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "core/expert_route_bias.h"
 #include "models/inkling2/kv_format.h"
 
 namespace ninfer::models::inkling2::kernels {
@@ -315,7 +316,8 @@ struct RouteSort {
 };
 
 // The router of each row x (FP32 [T][hidden]): p = sigmoid(router . x), the top_k experts by
-// p + bias (lower id first on equal values), weighted p / (sum of the chosen p + 1e-20) * scale *
+// p + bias (lower id first on equal values), plus held.bias for an expert the device holds
+// (core/expert_route_bias.h), weighted p / (sum of the chosen p + 1e-20) * scale *
 // down_scale[e] (when given); pair_scale[t * top_k + k] = gate_up_scale[e] (1 without). ids and
 // weights [T][top_k]; `logits` the router's FP32 products [T][experts] (gemm_f32).
 struct RouteArgs {
@@ -339,6 +341,7 @@ struct RouteArgs {
     // none.
     unsigned long long* zero = nullptr;
     std::int64_t zero_count  = 0;
+    ExpertRouteBias held;
 };
 inline constexpr int kSortedRouteRows    = 8;
 inline constexpr int kSortedRouteExperts = 128;

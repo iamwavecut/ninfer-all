@@ -16,20 +16,23 @@ inline constexpr std::int32_t kSparseMoeStreamPairs = 8 * kSparseMoePrefillSlice
 // Workspace of one streamed call of `tokens` columns.
 [[nodiscard]] std::size_t sparse_moe_stream_workspace_bytes(std::int32_t tokens, QType routed_gate_up,
                                                             QType routed_down);
+// `route_bias` above 0: the routers' bias toward the experts the delivery holds
+// (ExpertDelivery::route_bias, core/expert_route_bias.h).
 void sparse_moe_stream(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                        ExpertDelivery& delivery, std::size_t layer, WorkspaceArena& workspace,
-                       cudaStream_t stream);
+                       cudaStream_t stream, float route_bias = 0);
 
 void sparse_moe_stream_prefill(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
                                const SparseMoePrefillWorkspace& workspace, ExpertDelivery& delivery,
-                               std::size_t layer, cudaStream_t stream);
+                               std::size_t layer, cudaStream_t stream, float route_bias = 0);
 
 void sparse_moe_stream_route(const Tensor& x, const Weight& router,
-                              const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream);
+                              const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream,
+                              const ExpertRouteBias& held = {});
 void sparse_moe_stream_decode_route(const Tensor& x, const Weight& router,
                                      const SparseMoeSmallTWorkspace& workspace,
-                                     cudaStream_t stream);
+                                     cudaStream_t stream, const ExpertRouteBias& held = {});
 void sparse_moe_stream_experts(const Tensor& x, const SparseMoeWeights& weights,
                                 const void* const* tables, const std::int32_t* ids,
                                 const float* alpha, const float* shared_scale,

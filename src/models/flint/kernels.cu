@@ -632,16 +632,25 @@ constexpr int kTopkMaxExperts = 256;
 
 __device__ __forceinline__ float sigmoid(float x) { return 1.0f / (1.0f + expf(-x)); }
 
+// An expert's selection value: its logit, or with a route bias (core/expert_route_bias.h) its
+// sigmoid score plus held.bias when the device holds it.
+__device__ __forceinline__ float route_selection(float logit, int e, const ExpertRouteBias& held) {
+    return held.enabled() ? sigmoid(logit) + expert_route_bonus(held, e) : logit;
+}
+
 // One block per token, one thread per expert: each expert's rank among the logits (larger first,
-// lower id on ties) selects the top_k; their sigmoid scores renormalized over the top_k.
+// lower id on ties; with `held`, among route_selection()) selects the top_k; their sigmoid scores
+// renormalized over the top_k.
 __global__ void route_topk_kernel(const float* __restrict__ logits, int experts, int top_k,
-                                  std::int32_t* __restrict__ ids, float* __restrict__ weights) {
+                                  std::int32_t* __restrict__ ids, float* __restrict__ weights,
+                                  ExpertRouteBias held) {
     ninfer::pdl::arch_enter_glue();
     __shared__ float v[kTopkMaxExperts];
     __shared__ float chosen[8];
     __shared__ int chosen_id[8];
     const int t = blockIdx.x, e = threadIdx.x;
-    if (e < experts) { v[e] = ops::route_order(logits[std::int64_t(t) * experts + e]); }
+    const float logit = e < experts ? ops::route_order(logits[std::int64_t(t) * experts + e]) : 0.0f;
+    if (e < experts) { v[e] = route_selection(logit, e, held); }
     __syncthreads();
     if (e < experts) {
         const float mine = v[e];
@@ -651,7 +660,7 @@ __global__ void route_topk_kernel(const float* __restrict__ logits, int experts,
             rank += (other > mine || (other == mine && j < e)) ? 1 : 0;
         }
         if (rank < top_k) {
-            chosen[rank]    = sigmoid(mine);
+            chosen[rank]    = sigmoid(logit);
             chosen_id[rank] = e;
         }
     }
@@ -690,7 +699,8 @@ __device__ void select_routes(const float* logits, int tokens, int experts, int 
                               std::int32_t* __restrict__ ids, float* __restrict__ weights,
                               std::int32_t* __restrict__ bounds, std::int32_t* __restrict__ sorted,
                               std::int32_t* __restrict__ active,
-                              std::int32_t* __restrict__ active_count) {
+                              std::int32_t* __restrict__ active_count,
+                              const ExpertRouteBias& held) {
     __shared__ __align__(16) float v[kTopkMaxExperts];
     __shared__ float chosen[kRouteTokens * 8];
     __shared__ int chosen_id[kRouteTokens * 8];
@@ -698,14 +708,15 @@ __device__ void select_routes(const float* logits, int tokens, int experts, int 
     __shared__ int warp_total[kTopkMaxExperts / 32][2];
     const int e = threadIdx.x, lane = e & 31, warp = e >> 5;
     for (int t = 0; t < tokens; ++t) {
-        v[e] = e < experts ? ops::route_order(__ldcg(logits + std::int64_t(t) * experts + e))
-                           : -INFINITY;
+        const float logit =
+            e < experts ? ops::route_order(__ldcg(logits + std::int64_t(t) * experts + e)) : 0.0f;
+        v[e] = e < experts ? route_selection(logit, e, held) : -INFINITY;
         __syncthreads();
         if (e < experts) {
             const float mine = v[e];
             const int rank   = rank_among(v, mine, e);
             if (rank < top_k) {
-                chosen[t * top_k + rank]    = sigmoid(mine);
+                chosen[t * top_k + rank]    = sigmoid(logit);
                 chosen_id[t * top_k + rank] = e;
             }
         }
@@ -769,7 +780,7 @@ __global__ void route_decode_kernel(const float* __restrict__ x, int hidden, int
                                     std::int32_t* __restrict__ sorted,
                                     std::int32_t* __restrict__ active,
                                     std::int32_t* __restrict__ active_count,
-                                    unsigned* __restrict__ done) {
+                                    unsigned* __restrict__ done, ExpertRouteBias held) {
     ninfer::pdl::arch_enter_glue();
     __shared__ bool last;
     router_row(x, hidden, tokens, router, experts, blockIdx.x, logits);
@@ -780,7 +791,7 @@ __global__ void route_decode_kernel(const float* __restrict__ x, int hidden, int
     if (!last) { return; }
     __threadfence();
     select_routes(logits, tokens, experts, top_k, ids, weights, bounds, sorted, active,
-                  active_count);
+                  active_count, held);
     if (threadIdx.x == 0) { *done = 0; }
 }
 
@@ -1025,7 +1036,8 @@ void kv_load(const KvLoadArgs& args, cudaStream_t stream) {
 }
 
 void route(const float* x, int hidden, int tokens, const float* router, int experts, int top_k,
-           float* logits, std::int32_t* ids, float* weights, cudaStream_t stream) {
+           float* logits, std::int32_t* ids, float* weights, cudaStream_t stream,
+           const ExpertRouteBias& held) {
     if (top_k > 8 || top_k > experts || experts > kTopkMaxExperts || hidden % 4 != 0) {
         throw std::invalid_argument("flint route: at most 8 of 256 experts over whole float4s");
     }
@@ -1039,21 +1051,21 @@ void route(const float* x, int hidden, int tokens, const float* router, int expe
     }
     check_launch("route logits");
     ninfer::pdl::launch_arch(tokens, (experts + 31) / 32 * 32, 0, stream, route_topk_kernel, logits,
-                             experts, top_k, ids, weights);
+                             experts, top_k, ids, weights, held);
     check_launch("route top-k");
 }
 
 void route_select(const float* x, int hidden, int tokens, const float* router, int experts,
                   int top_k, float* logits, std::int32_t* ids, float* weights, std::int32_t* bounds,
                   std::int32_t* sorted, std::int32_t* active, std::int32_t* active_count,
-                  std::uint32_t* done, cudaStream_t stream) {
+                  std::uint32_t* done, cudaStream_t stream, const ExpertRouteBias& held) {
     if (tokens > kRouteTokens || top_k > 8 || top_k > experts || experts > kTopkMaxExperts ||
         hidden % 4 != 0) {
         throw std::invalid_argument("flint route_select: at most 8 tokens, 8 of 256 experts");
     }
     ninfer::pdl::launch_arch(experts, kTopkMaxExperts, 0, stream, route_decode_kernel, x, hidden,
                              tokens, router, experts, top_k, logits, ids, weights, bounds, sorted,
-                             active, active_count, done);
+                             active, active_count, done, held);
     check_launch("route_select");
 }
 

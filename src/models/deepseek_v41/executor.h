@@ -93,6 +93,10 @@ struct ExecutorOptions {
     // bus times. CPU threads: 0 for one per physical core.
     std::optional<float> expert_dma_share;
     std::uint32_t expert_cpu_threads = 0;
+    // Host or disk experts: the route bias toward the experts the device holds of decode and
+    // verification calls, with `prompts` also of prompt chunks (HybridExpertOptions::route_bias).
+    float expert_route_bias        = 0.0F;
+    bool expert_route_bias_prompts = false;
     // Disk experts: a drive mirror and the direct path (core/expert_disk.h).
     ExpertDiskReads expert_disk{};
     // Drafts with the model's DSpine drafter (Model::dspine(), draft_tokens of them at most). When

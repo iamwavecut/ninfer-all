@@ -372,6 +372,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--expert-dma-share F\|auto` | Host or disk experts: the GPU's share of a call's cache misses, `0..1`; the CPU computes the rest (GGUF and Qwen3.5/3.6 MoE experts: the GPU's results bit for bit); `auto` splits each such call by the copy and CPU times measured on earlier calls and copies every miss of Flash-Next native experts. Flash-Next host experts' calls of 9 to 64 tokens give the CPU only missing experts with at most eight pairs; wider Flash-Next calls, Gemma 4, Flint, DeepSeek-V4.1 and Inkling 2 calls of more than eight tokens, and Qwen3.5/3.6 calls at or past the codec's prefill frontier or that route to half the experts or more, always use the GPU ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); DeepSeek-V4.1's `auto` copies every miss of disk experts ([its CPU share](deepseek-v41.md#the-cpu-share)) | `auto` |
 | `--iq1m-experts matrix\|vector` | DeepSeek-V4.1 and Qwen3.8-Flash-Next: IQ1_M routed experts of calls past eight tokens on the integer matrix kernel once a call routes more than 16 rows to each expert on average for their gate and up products and 6 for their down products (the vector kernel below), or always on the vector kernel in groups of eight columns; the two round the sums differently, so outputs differ slightly ([IQ1_M experts](deepseek-v41.md#iq1_m-experts-in-prompt-chunks)) | `matrix` |
 | `--expert-tail-skip N` | Qwen3.8-Flash-Next only, GGUF host experts with staged misses: a decode or verification call leaves out each routed expert its device cache lacks when every token of the call ranks it past place `N` (`1..9`) of its top ten; the other experts keep their router weights, so results change | off |
+| `--expert-route-bias B` | Host or disk experts: `0..1` added to the routing score of each expert the GPU holds when a decode or verification call chooses a layer's experts, so more of them are cache hits; the chosen experts keep the weights of their unbiased scores. Lossy: which experts a call takes, and so its output, depend on what the cache holds; prompts route as trained. Not with `--tensor-parallel` or Flash-Next native host experts ([route bias](#route-bias-toward-held-experts)) | `0` (off) |
 | `--expert-prefill-buffers 1\|2` | Qwen3.8-Flash-Next only, GGUF host experts: device buffers a long prompt's uncached experts are copied into; `2` copies the next layer's while the current layer's experts run, when half the free memory holds both. With the automatic cache the buffers hold expert cache slots between prompts ([the expert cache](qwen3-8-flash-next.md#the-expert-cache)) | `2` with the automatic expert cache, else `1` |
 | `--expert-cpu-threads N` | Host or disk experts with a CPU share: `1..256` CPU threads, the calling one included, pinned one to a physical core | `min(physical cores, usable CPUs / 2)`, at least one. Usable CPUs: the process's affinity mask, bounded by a container's CPU quota; physical cores: those in the mask. A 30-CPU container quota gives 15 threads, a 16-core/32-thread desktop 16 |
 | `--expert-cache-adaptive` | Qwen3.8-Flash-Next only: replace cold cached experts between calls; changes the CPU/GPU arithmetic partition | off |
@@ -472,6 +473,70 @@ masks ([banned words](serving.md#banned-words)), and its report adds the rewinds
 dropped and the delay they added when the reply rewound.
 
 Run `./build/apps/ninfer --help` for the exact option contract.
+
+### Route bias toward held experts
+
+`--expert-route-bias B` trades exactness for decode speed when the routed experts live in host
+memory or the artifact's files (`--expert-residency host|disk`). A decode or verification call
+adds `B` to the routing score of each expert whose weights the GPU holds now (its expert cache,
+a lent prefill bank, Flash-Next's disk pools) before it picks a layer's experts, so a cached expert
+whose score lies within `B` of an uncached one takes its place and the call copies fewer experts
+across the bus or leaves fewer to the CPU. The chosen experts are weighted by their unbiased
+scores. Prompt chunks route as the model was trained, so the prompt's keys and values stay exact.
+The idea is EMBER's "Lite" tier (rb 0.1 on DeepSeek-V4.1).
+
+The score is the one each router weights its experts by, so a value means different things per
+family: the softmax probability for Qwen3.5/3.6 MoE, Gemma 4, Qwen3.8-Flash-Next and Edge0 (a
+layer's probabilities add up to one), the sigmoid for Flint and Inkling 2 (each in `0..1`;
+Inkling 2's selection bias added) and DeepSeek-V4.1's square root of softplus with its selection
+bias. Output then depends on what the cache holds, which differs between runs, prompts and cache
+sizes, so two runs of the same request can answer differently even with greedy sampling.
+`ninfer-perplexity --expert-route-bias B` applies the bias to its scored chunks too, which
+measures its cost on every token, prompt included.
+
+Measured on an RTX 4080 (16 GB, 320 W) with a Ryzen 9 9950X and host experts
+(`--expert-residency host`), greedy, 384 new tokens after a 28- to 70-token prompt, one run each;
+perplexity over the first 40 KB of `eval/corpora/perplexity-1m/data/wikitext/00.txt` at the small
+cache with the bias in every scored chunk. Flash-Next and Edge0 ran with `--no-ngram-table`.
+
+| Model | Expert cache | `B` | Decode, tok/s | Expert hits | Perplexity |
+|---|---|---:|---:|---:|---:|
+| Inkling 2 Mini UD-IQ4_XS | 2,048 MiB | 0 | 64.4 | 76.5% | 6.4160 |
+| | | 0.05 | 73.9 (+14.8%) | 82.8% | 6.4231 (+0.11%) |
+| | | 0.1 | 80.9 (+25.6%) | 86.3% | 6.4645 (+0.76%) |
+| | auto | 0 / 0.1 | 106.1 / 109.3 (+3.0%) | 98.3% / 99.1% | |
+| Flint UD-Q4_K_XL | 3,072 MiB | 0 | 98.4 | 48.4% | 19.409 |
+| | | 0.05 | 109.8 (+11.6%) | 60.7% | 19.377 (−0.16%) |
+| | | 0.1 | 117.3 (+19.2%) | 66.4% | 19.866 (+2.36%) |
+| | auto | 0 / 0.1 | 133.6 / 153.1 (+14.6%) | 80.8% / 88.8% | |
+| Gemma 4 26B-A4B QAT Q4_0 | 2,048 MiB | 0 | 128.9 | 71.8% | 2,241 |
+| | | 0.005 | 144.5 (+12.1%) | 78.5% | 2,013 (−10.2%) |
+| | | 0.02 | 165.2 (+28.2%) | 85.4% | 2,390 (+6.6%) |
+| | auto | 0 / 0.02 | 190.1 / 188.4 (−0.9%) | 99.7% / 99.8% | |
+| Qwen3.6-35B-A3B (official) | 3,072 MiB | 0 | 123.5 | 75.2% | 6.1888 |
+| | | 0.005 | 140.1 (+13.4%) | 83.2% | 6.2677 (+1.27%) |
+| | | 0.02 | 159.4 (+29.1%) | 90.5% | 7.0630 (+14.1%) |
+| | auto | 0 / 0.02 | 164.9 / 175.9 (+6.7%) | 94.9% / 98.2% | |
+| Qwen3.8-Flash-Next UD-IQ2_XS | 4,096 MiB | 0 | 56.2 | 50.9% | 5.3039 |
+| | | 0.005 | 64.7 (+15.1%) | 65.8% | 5.4792 (+3.3%) |
+| | | 0.02 | 75.0 (+33.5%) | 79.9% | 10.713 (+102%) |
+| | auto | 0 / 0.02 | 65.6 / 77.0 (+17.4%) | 67.8% / 84.8% | |
+| Edge0-120B-q3k | 4,096 MiB | 0 | 56.7 | 60.0% | 9.4346 |
+| | | 0.005 | 58.8 (+3.7%) | 71.0% | 9.4932 (+0.62%) |
+| | | 0.02 | 64.6 (+13.9%) | 82.8% | 13.380 (+41.8%) |
+| | auto | 0 / 0.02 | 59.5 / 64.8 (+8.9%) | 71.4% / 85.1% | |
+
+The cost grows faster than the gain: past the smaller value of each row, the perplexity of
+Qwen3.6-35B-A3B, Flash-Next and Edge0 rises by 14-102%, and Edge0 at 0.02 no longer started its
+answer within the 384 tokens it answered in at 0. Gemma 4's instruction-tuned checkpoint scores
+raw wikitext at a perplexity near 2,000, where a change of 10% in either direction says little
+about its answers. DeepSeek-V4.1-Flash (its artifact is 224 GiB) was checked only by the router
+test, which compares every family's biased routes with an FP64 oracle
+(`ninfer_expert_route_bias_test`).
+
+The option needs host or disk experts on one device: with `--tensor-parallel` each device would
+route by its own cache, and Flash-Next's native host experts keep their cache's contents on the
+host, where the router cannot read them. Flash-Next also refuses it with `--expert-misses mapped`.
 
 ## Launch configuration files
 

@@ -2788,6 +2788,10 @@ struct Executor::Impl {
         route.ids           = ids;
         route.weights       = weights;
         route.pair_scale    = pair_scale;
+        if (delivery && options.expert_route_bias > 0 &&
+            (!c.chunk || options.expert_route_bias_prompts)) {
+            route.held = delivery->route_bias(std::size_t(p.delivery_layer), options.expert_route_bias);
+        }
         // A short call's route kernel also groups its pairs by expert.
         void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
         const bool sorted = t <= kernels::kSortedRouteRows && e <= kernels::kSortedRouteExperts;

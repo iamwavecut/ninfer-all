@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/expert_disk.h"
+#include "core/expert_route_bias.h"
 #include "core/expert_tier.h"
 
 #include <cuda_runtime.h>
@@ -256,6 +257,9 @@ public:
     void await(cudaStream_t stream);
     // Projection-major [aliases][experts], including aliases into the same blob.
     [[nodiscard]] const void* const* tables(std::size_t layer) const;
+    // The route bias `bias` toward layer `layer`'s experts in the cache or a lent bank (alias 0 of
+    // tables(layer)). A narrow call reads a lent expert as cached; a wide one copies it again.
+    [[nodiscard]] ExpertRouteBias route_bias(std::size_t layer, float bias) const;
     // Whether every entry of alias `alias` in tables(layer) is a multiple of `bytes` (a power of
     // two up to 256). Cache slots, lent slots and layer banks start at 256-byte boundaries, so the
     // alias's offset and the bank stride of its blob decide.

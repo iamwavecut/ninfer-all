@@ -1264,7 +1264,7 @@ constexpr int kMaxTopK    = 8;
 __global__ void route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                              int experts, int top_k, float scale, std::int32_t* __restrict__ ids,
                              float* __restrict__ weights, const float* __restrict__ image_bias,
-                             const std::uint8_t* __restrict__ image) {
+                             const std::uint8_t* __restrict__ image, ExpertRouteBias held) {
     __shared__ float sel[kMaxExperts];
     __shared__ float chosen_s[kMaxTopK];
     __shared__ int chosen_id[kMaxTopK];
@@ -1275,7 +1275,7 @@ __global__ void route_kernel(const float* __restrict__ logits, const float* __re
         const float x  = logits[std::int64_t(t) * experts + e];
         const float sp = x > 20.0f ? x : log1pf(expf(x));
         s              = sqrtf(sp);
-        sel[e]         = ops::route_order(s + bias[e]);
+        sel[e]         = ops::route_order(s + bias[e] + expert_route_bonus(held, e));
     }
     __syncthreads();
     if (e < experts) {
@@ -1790,7 +1790,7 @@ void attention_output(const __nv_bfloat16* o, int tokens, int heads, int groups,
 
 void route(const float* logits, const float* bias, int tokens, int experts, int top_k, float scale,
            std::int32_t* ids, float* weights, cudaStream_t stream, const float* image_bias,
-           const std::uint8_t* image) {
+           const std::uint8_t* image, const ExpertRouteBias& held) {
     if (experts > kMaxExperts || top_k > kMaxTopK || top_k > experts) {
         throw std::invalid_argument("deepseek_v41 route: at most 8 of 512 experts");
     }
@@ -1799,7 +1799,8 @@ void route(const float* logits, const float* bias, int tokens, int experts, int 
     }
     if (tokens <= 0) { return; }
     route_kernel<<<tokens, (experts + 31) / 32 * 32, 0, stream>>>(logits, bias, experts, top_k, scale,
-                                                                  ids, weights, image_bias, image);
+                                                                  ids, weights, image_bias, image,
+                                                                  held);
     check_launch("route");
 }
 

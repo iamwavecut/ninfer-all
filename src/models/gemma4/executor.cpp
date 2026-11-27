@@ -260,6 +260,9 @@ struct Executor::Impl {
     bool vision_media = false;
     cudaEvent_t media_begin = nullptr, media_end = nullptr;
     bool media_timed = false;
+    // The blocks run a prompt chunk (forward), not a decode or verification pass, whose routers
+    // take the route bias (ExecutorOptions::expert_route_bias).
+    bool prompt_pass = false;
     std::unique_ptr<PinnedHostBuffer> h_staging;
     // Recorded after the staging copies: the next stage() rewrites the pinned buffer only once
     // the previous copies have read it (a prompt chunk that keeps no logits is not synchronized).
@@ -1617,6 +1620,11 @@ struct Executor::Impl {
         auto* weights  = static_cast<float*>(workspace->alloc_bytes(std::size_t(pairs) * 4).data);
         auto* logits   = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * e * 4).data);
         void* routing_space = workspace->alloc_bytes(gguf::moe_routing_bytes(e, pairs)).data;
+        const ExpertRouteBias held =
+            delivery && p.delivery_layer >= 0 && options.expert_route_bias > 0 &&
+                    (!prompt_pass || options.expert_route_bias_prompts)
+                ? delivery->route_bias(std::size_t(p.delivery_layer), options.expert_route_bias)
+                : ExpertRouteBias{};
         gguf::MoeRouting routing;
         if (t <= gguf::kMaxVectorColumns) {
             auto* base = static_cast<std::int32_t*>(routing_space);
@@ -1626,10 +1634,10 @@ struct Executor::Impl {
             routing.active_count = base + e + 1 + pairs + e;
             kernels::route_select(router_x, hidden, t, p.router, p.expert_scale, e, k, logits, ids,
                                   weights, base, base + e + 1, base + e + 1 + pairs,
-                                  base + e + 1 + pairs + e, stream);
+                                  base + e + 1 + pairs + e, stream, held);
         } else {
             kernels::route(router_x, hidden, t, p.router, p.expert_scale, e, k, logits, ids,
-                           weights, stream);
+                           weights, stream, held);
             if (!model.expert_parallel()) {
                 routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
             }
@@ -1869,6 +1877,7 @@ struct Executor::Impl {
             throw std::invalid_argument("gemma4 forward: context capacity exceeded");
         }
         back(sequence, first + std::uint32_t(t), true);
+        prompt_pass = true;
         std::vector<std::int32_t> pos(t);
         for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
         // A branch pass: each row rotates at its branch's position, and takes the cache slot of
@@ -2229,6 +2238,7 @@ struct Executor::Impl {
     }
 
     void decode_body(int b, bool verifying = false) {
+        prompt_pass = false;
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);
