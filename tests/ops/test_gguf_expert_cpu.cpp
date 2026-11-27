@@ -624,7 +624,8 @@ void check(const Matrix& m, int tokens, std::mt19937& rng) {
                     "the planar q8_1 activation's products differ");
         }
     }
-    for (const auto backend : {GgufCpuBackend::Scalar, GgufCpuBackend::Avx2}) {
+    for (const auto backend : {GgufCpuBackend::Scalar, GgufCpuBackend::Avx2, GgufCpuBackend::AvxVnni,
+                               GgufCpuBackend::Avx512Vnni}) {
         if (!gguf_cpu_backend_available(backend)) { continue; }
         std::vector<float> y(oracle.size()), again(oracle.size());
         // Two row ranges, as workers split them.
@@ -666,6 +667,48 @@ double gelu_u(double x) {
     return std::sqrt(2.0 / std::numbers::pi) * (x + 0.044715 * x * x * x);
 }
 double gelu64(double x) { return x / (1.0 + std::exp(-2.0 * gelu_u(x))); }
+
+// The largest dots: Q8_0 codes of -128 and IQ4_NL values of -127 against activation codes of
+// +127 or -127, so that every two adjacent products add to 32,512 or 32,258 in magnitude (the
+// limit of maddubs' int16 sums): every vector backend gives the scalar products' bits.
+void check_extreme_dots() {
+    const int k = 2560, rows = 4, tokens = 2;
+    std::vector<std::uint16_t> x(std::size_t(tokens) * k);
+    for (int i = 0; i < k; ++i) {
+        x[i]     = bf16(1.0F);
+        x[k + i] = bf16(-1.0F);
+    }
+    for (const QType format : {QType::GGUF_Q8_0, QType::GGUF_IQ4_NL}) {
+        const int block = gguf_block_shape(format).bytes;
+        const std::int64_t row_bytes = std::int64_t(k / 32) * block;
+        std::vector<std::uint8_t> bytes(std::size_t(rows) * std::size_t(row_bytes));
+        for (std::size_t b = 0; b < bytes.size() / std::size_t(block); ++b) {
+            std::uint8_t* p = bytes.data() + b * std::size_t(block);
+            p[0] = 0x00; // d = 1 in binary16
+            p[1] = 0x3C;
+            // Q8_0's code -128; IQ4_NL's index 0, the value -127.
+            std::memset(p + 2, format == QType::GGUF_Q8_0 ? 0x80 : 0x00, std::size_t(block - 2));
+        }
+        GgufCpuActivation a(16, k);
+        a.prepare_bf16(format, x.data(), k, tokens);
+        const GgufCpuMatrix w{format, bytes.data(), row_bytes, rows, k};
+        std::vector<float> scalar(std::size_t(tokens) * rows);
+        gguf_cpu_rows(w, a, 0, rows, scalar.data(), rows, GgufCpuBackend::Scalar);
+        require(scalar[0] < 0 && scalar[rows] > 0, "the extreme dots have the wrong signs");
+        for (const auto backend : {GgufCpuBackend::Avx2, GgufCpuBackend::AvxVnni,
+                                   GgufCpuBackend::Avx512Vnni}) {
+            if (!gguf_cpu_backend_available(backend)) { continue; }
+            std::vector<float> y(scalar.size());
+            gguf_cpu_rows(w, a, 0, rows, y.data(), rows, backend);
+            for (std::size_t i = 0; i < y.size(); ++i) {
+                require(std::bit_cast<std::uint32_t>(y[i]) == std::bit_cast<std::uint32_t>(scalar[i]),
+                        std::string(gguf_cpu_backend_name(backend)) + ": an extreme dot differs");
+            }
+            std::cout << gguf_cpu_backend_name(backend) << " format " << int(format)
+                      << ": extreme dots equal the scalar products\n";
+        }
+    }
+}
 
 void check_silu(std::mt19937& rng) {
     // Within four units of FP64 (the exponential's polynomial, the sum and the quotient); where
@@ -780,6 +823,7 @@ int main() {
     try {
         std::mt19937 rng(20261009);
         check_silu(rng);
+        check_extreme_dots();
         for (const QType format : {QType::GGUF_Q2_0, QType::GGUF_Q8_0, QType::GGUF_IQ4_NL}) {
             const Matrix gate = make(format, 640, 2560, rng);
             const Matrix down = make(format, 2560, 640, rng);

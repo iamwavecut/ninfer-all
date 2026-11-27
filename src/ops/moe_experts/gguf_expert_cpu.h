@@ -35,11 +35,20 @@
 
 namespace ninfer::ops {
 
-// Automatic takes AVX2 (with FMA and F16C) where the CPU has it; both give the same bits.
-enum class GgufCpuBackend { Automatic, Scalar, Avx2 };
+// AVX2 (with FMA and F16C) takes its integer dots by vpmaddubsw and vpmaddwd; AvxVnni and
+// Avx512Vnni run the same AVX2 code with one vpdpbusd per dot instead, from AVX-VNNI or from
+// AVX512-VNNI with AVX512VL on 256-bit vectors, and the middles of AVX2; the formats whose VNNI
+// rows measured no faster run AVX2's rows (gguf_cpu_rows_backend). Automatic takes the first of
+// AvxVnni, Avx512Vnni, Avx2 and Scalar that the CPU (and this build) has; all give the same bits.
+enum class GgufCpuBackend { Automatic, Scalar, Avx2, AvxVnni, Avx512Vnni };
 [[nodiscard]] bool gguf_cpu_backend_available(GgufCpuBackend backend) noexcept;
 [[nodiscard]] const char* gguf_cpu_backend_name(GgufCpuBackend backend) noexcept;
 [[nodiscard]] GgufCpuBackend gguf_cpu_backend_selected(GgufCpuBackend requested) noexcept;
+// Whether `backend`, once selected, runs the AVX2 code (AVX2 or one of its VNNI dots).
+[[nodiscard]] bool gguf_cpu_backend_avx2(GgufCpuBackend backend) noexcept;
+// The rows gguf_cpu_rows runs for `format` with `backend` selected: AVX2's in place of a VNNI
+// backend's for the formats whose VNNI rows measured no faster (gguf_expert_cpu.cpp).
+[[nodiscard]] GgufCpuBackend gguf_cpu_rows_backend(QType format, GgufCpuBackend backend) noexcept;
 // Whether `format` has a CPU product here.
 [[nodiscard]] bool gguf_cpu_supported(QType format) noexcept;
 
@@ -126,6 +135,10 @@ void geglu_scalar(const float*, const float*, std::size_t, std::uint16_t*);
 void clamped_swiglu_scalar(const float*, const float*, std::size_t, float, float, std::uint16_t*);
 #if defined(NINFER_CPU_EXPERT_X86)
 void rows_avx2(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
+#    if defined(NINFER_GGUF_CPU_AVX_VNNI_BUILT)
+void rows_avx_vnni(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
+#    endif
+void rows_avx512_vnni(const GgufCpuMatrix&, const GgufCpuActivation&, int, int, float*, std::size_t);
 void swiglu_avx2(const float*, const float*, std::size_t, std::uint16_t*);
 void geglu_avx2(const float*, const float*, std::size_t, std::uint16_t*);
 void clamped_swiglu_avx2(const float*, const float*, std::size_t, float, float, std::uint16_t*);

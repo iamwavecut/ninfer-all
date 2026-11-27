@@ -6,7 +6,7 @@
 //
 // usage: ninfer_benches ninfer_gguf_cpu_rows_bench [--formats IQ3_S,Q4_0,...] [--k 2560]
 //        [--tokens 1,2,4,8] [--threads 1,8] [--megabytes 1024] [--seconds 2]
-//        [--backend automatic|scalar|avx2]
+//        [--backend automatic|scalar|avx2|avx-vnni|avx512-vnni]
 #include "core/qtype.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 
@@ -38,6 +38,7 @@ constexpr Format kFormats[] = {
     {"Q6_K", QType::GGUF_Q6_K},       {"IQ4_NL", QType::GGUF_IQ4_NL},   {"IQ1_S", QType::GGUF_IQ1_S},
     {"IQ1_M", QType::GGUF_IQ1_M},     {"IQ2_XXS", QType::GGUF_IQ2_XXS}, {"IQ2_S", QType::GGUF_IQ2_S},
     {"IQ3_XXS", QType::GGUF_IQ3_XXS}, {"IQ3_S", QType::GGUF_IQ3_S},     {"IQ4_XS", QType::GGUF_IQ4_XS},
+    {"IQ2_XS", QType::GGUF_IQ2_XS},   {"Q3_K", QType::GGUF_Q3_K},       {"NVFP4", QType::GGUF_NVFP4},
 };
 
 std::vector<std::string> split(const std::string& text) {
@@ -83,8 +84,11 @@ std::vector<std::uint8_t> random_rows(QType format, int k, std::size_t rows, std
                 word = std::uint16_t((word & 0x0FFF) | (((d >> (4 * w)) & 0xF) << 12));
                 std::memcpy(p + 48 + 2 * w, &word, 2);
             }
+        } else if (format == QType::GGUF_NVFP4) {
+            // Four UE4M3 scales of 1 (bit 7 is not read).
+            std::memset(p, 0x38, 4);
         } else {
-            std::memcpy(p + (format == QType::GGUF_Q6_K ? 208 : 0), &d, 2);
+            std::memcpy(p + (format == QType::GGUF_Q6_K ? 208 : format == QType::GGUF_Q3_K ? 108 : 0), &d, 2);
             if (format == QType::GGUF_Q4_K || format == QType::GGUF_Q5_K) { std::memcpy(p + 2, &dmin, 2); }
         }
     }
@@ -95,6 +99,8 @@ GgufCpuBackend parse_backend(const std::string& name) {
     if (name == "automatic") { return GgufCpuBackend::Automatic; }
     if (name == "scalar") { return GgufCpuBackend::Scalar; }
     if (name == "avx2") { return GgufCpuBackend::Avx2; }
+    if (name == "avx-vnni") { return GgufCpuBackend::AvxVnni; }
+    if (name == "avx512-vnni") { return GgufCpuBackend::Avx512Vnni; }
     throw std::invalid_argument("unknown backend " + name);
 }
 
@@ -124,6 +130,9 @@ int main(int argc, char** argv) {
             else { throw std::invalid_argument("unknown argument " + arg); }
         }
         const GgufCpuBackend backend = gguf_cpu_backend_selected(parse_backend(backend_name));
+        if (!gguf_cpu_backend_available(backend)) {
+            throw std::invalid_argument("this CPU or build has no " + backend_name + " backend");
+        }
         std::cout << "backend " << gguf_cpu_backend_name(backend) << ", k " << k << ", working set "
                   << megabytes << " MB\n";
         std::printf("%-8s %6s %7s %12s %10s %9s\n", "format", "tokens", "threads", "rows/s", "GB/s",
@@ -143,6 +152,10 @@ int main(int argc, char** argv) {
             if (k % group != 0) {
                 std::cout << name << ": k " << k << " is not a multiple of " << group << '\n';
                 continue;
+            }
+            if (gguf_cpu_rows_backend(format->type, backend) != backend) {
+                std::cout << name << ": " << gguf_cpu_backend_name(gguf_cpu_rows_backend(format->type, backend))
+                          << " rows\n";
             }
             const std::int64_t row_bytes = std::int64_t(k / group) * block;
             const auto rows = std::size_t(std::max(1.0, megabytes * 1e6 / double(row_bytes)));

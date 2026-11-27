@@ -443,9 +443,29 @@ slice order, and the 32 lanes meet as in a warp's butterfly (16, 8, 4, 2, 1 apar
 Gemma 4's GELU) is `ops/common/silu.h` on both sides, built from correctly rounded operations only,
 and the middle is rounded to BF16 before it is quantized for the down product. No compiler fuses
 these steps on either side: the GPU kernels spell them with `_rn` intrinsics and the CPU sources
-build without floating-point contraction. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S,
-IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS have CPU products, in AVX2 (with FMA and F16C) where the CPU has it and
-in portable C++ elsewhere, with the same bits.
+build without floating-point contraction. Q2_0, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL,
+IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and NVFP4 have CPU products, in AVX2
+(with FMA and F16C) where the CPU has it and in portable C++ elsewhere, with the same bits. CPUs with
+AVX-VNNI (Intel 12th generation and later, AMD Zen 5) or AVX512-VNNI with AVX512VL (AMD Zen 4, Intel
+Xeon since Cascade Lake) run the AVX2 code with one `vpdpbusd` for each integer dot instead of
+`vpmaddubsw` and `vpmaddwd`: the codes are at most 128 and the activations at most 127 in magnitude,
+so the two instructions' 16-bit sums never saturate and both give the same integers. The formats
+whose `vpdpbusd` rows measured slower keep AVX2's: Q8_0 on both, IQ2_XXS and IQ2_S also on AMD's
+AVX-VNNI, and IQ1_S, IQ2_XXS, IQ2_XS, IQ2_S and IQ3_S on AVX512-VNNI. Rows of 1, 4 and 8 tokens
+against AVX2's (`ninfer_gguf_cpu_rows_bench`, the 18 formats, medians of three rounds, 2026-11-27):
+
+| CPU | Dots | One thread: median (lowest to highest) | One thread a core |
+|---|---|---|---|
+| Ryzen 9 9950X | AVX-VNNI | +3.5% (-1.0% to +20.3%) | 16 threads: +0.4% (-1.4% to +16.4%) |
+| Ryzen 7 7700X | AVX512-VNNI | +4.4% (0.0% to +22.2%) | 8 threads: 0.0% (-0.4% to +24.1%) |
+| Core i5-12600K | AVX-VNNI | +8.4% (-0.6% to +27.2%) | 8 threads: +2.6% (-0.1% to +33.6%) |
+| Xeon Gold 6244 (12 formats) | AVX512-VNNI | +6.1% (-1.1% to +48.6%) | not measured: other tenants' load |
+
+The gains are largest on one thread and with several tokens; with one thread a core, most rows of
+one token ran at AVX2's speed. Inkling 2 Mini UD-IQ4_XS with its experts in host memory and a 2 GiB
+device cache (RTX 4080 and the 9950X) decoded 62.5 tok/s with AVX2's dots and 62.9 with AVX-VNNI's
+at the measured CPU share, and 48.1 and 48.4 tok/s with the CPU computing every miss, the same text
+each time.
 
 ### The n-gram rows
 
