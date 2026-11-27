@@ -60,72 +60,73 @@ struct OrdinaryDecodeEgress {
 // Stable pinned/device transfer formats for concurrent MTP decode. The arrays use the maximum
 // product domain; RoundState binds only the configured [K,C] and [K+1,C] prefixes.
 struct MtpDecodeIngress {
-    std::array<TokenId, kMaximumConcurrency> anchors{};
-    std::array<std::int32_t, kMaximumConcurrency> base_frontiers{};
-    std::array<std::int32_t, kMaximumConcurrency> remaining_budgets{};
-    std::array<std::int32_t, kMaximumConcurrency> current_extents{};
-    std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
-    std::array<TokenId, kMaximumConcurrency * kMtpVerifyMaximumDrafts> current_drafts{};
-    std::array<std::int32_t, kMaximumConcurrency * kMtpVerifyMaximumWidth> target_rope_positions{};
-    std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> rope_deltas{};
-    std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    std::array<TokenId, kMaximumSpeculativeRows> anchors{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> base_frontiers{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> remaining_budgets{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> current_extents{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> target_valid_columns{};
+    std::array<TokenId, kMaximumSpeculativeRows * kMtpVerifyMaximumDrafts> current_drafts{};
+    std::array<std::int32_t, kMaximumSpeculativeRows * kMtpVerifyMaximumWidth>
+        target_rope_positions{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> text_kv_table_rows{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> mtp_kv_table_rows{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> state_source_slots{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> state_destination_slots{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> rope_deltas{};
+    std::array<ops::SamplingConfig, kMaximumSpeculativeRows> sampling{};
     // Each row's proposal sampler (runtime::draft_sampling of its request's).
-    std::array<ops::SamplingConfig, kMaximumConcurrency> draft_sampling{};
+    std::array<ops::SamplingConfig, kMaximumSpeculativeRows> draft_sampling{};
 };
 
 struct MtpDecodeEgress {
-    std::array<TokenId, kMaximumConcurrency * kMtpVerifyMaximumWidth> licensed_tokens{};
-    std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
-    std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    std::array<TokenId, kMaximumSpeculativeRows * kMtpVerifyMaximumWidth> licensed_tokens{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> licensed_counts{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> accepted_drafts{};
     // Step-major: all B rows for proposal step 0, followed by all B rows for step 1, etc.
-    std::array<TokenId, kMaximumConcurrency * kMtpDecodeMaximumDrafts> next_drafts{};
-    std::array<std::int32_t, kMaximumConcurrency> next_extents{};
+    std::array<TokenId, kMaximumSpeculativeRows * kMtpDecodeMaximumDrafts> next_drafts{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> next_extents{};
 };
 
 // Stable pinned/device transfer formats for one exact-B DFlash transaction. The proposal is
 // produced and verified in the same round, so no draft state crosses the round boundary.
 struct DFlashDecodeIngress {
-    std::array<TokenId, kMaximumConcurrency> anchors{};
-    std::array<std::int32_t, kMaximumConcurrency> execution_frontiers{};
-    std::array<std::int32_t, kMaximumConcurrency> context_frontiers{};
-    std::array<std::int32_t, kMaximumConcurrency> proposal_extents{};
-    std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
-    std::array<std::int32_t, kMaximumConcurrency> proposal_valid_columns{};
+    std::array<TokenId, kMaximumSpeculativeRows> anchors{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> execution_frontiers{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> context_frontiers{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> proposal_extents{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> target_valid_columns{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> proposal_valid_columns{};
     // DFlash uses logical positions for its own attention. Target verification carries a separate
     // continuation RoPE position so multimodal rows retain their per-sequence rope_delta.
-    std::array<std::int32_t, kMaximumConcurrency * kDFlashVerifyMaximumWidth>
+    std::array<std::int32_t, kMaximumSpeculativeRows * kDFlashVerifyMaximumWidth>
         target_rope_positions{};
-    std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> dflash_kv_table_rows{};
-    std::array<std::int32_t, kMaximumConcurrency> active_lanes{};
-    std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
-    std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
-    std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> text_kv_table_rows{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> dflash_kv_table_rows{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> active_lanes{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> state_source_slots{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> state_destination_slots{};
+    std::array<ops::SamplingConfig, kMaximumSpeculativeRows> sampling{};
     // Rows whose proposal is the ngram copy payload below; other rows keep the neural drafter's
     // proposal. Read on the device, so one captured ngram-family graph serves every mixture.
-    std::array<std::int32_t, kMaximumConcurrency> copy_rows{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> copy_rows{};
     // Neural rounds copy only the prefix before ngram_tokens. Keep all controls above it;
     // proposal-only payloads below it preserve the existing vector-aligned offsets. The arrays
     // are column-major per row (row stride = the round's draft width k, <= verify maximum):
     //   ngram_tokens[row * k + step];
     //   candidates/q[row * k * slots + step * slots + slot].
-    std::array<TokenId, kMaximumConcurrency * kDFlashVerifyMaximumDrafts> ngram_tokens{};
-    std::array<TokenId,
-               kMaximumConcurrency * ops::kSparseSpeculativeCandidates * kDFlashVerifyMaximumDrafts>
+    std::array<TokenId, kMaximumSpeculativeRows * kDFlashVerifyMaximumDrafts> ngram_tokens{};
+    std::array<TokenId, kMaximumSpeculativeRows * ops::kSparseSpeculativeCandidates *
+                            kDFlashVerifyMaximumDrafts>
         ngram_candidates{};
-    std::array<float,
-               kMaximumConcurrency * ops::kSparseSpeculativeCandidates * kDFlashVerifyMaximumDrafts>
+    std::array<float, kMaximumSpeculativeRows * ops::kSparseSpeculativeCandidates *
+                          kDFlashVerifyMaximumDrafts>
         ngram_q{};
 };
 
 struct DFlashDecodeEgress {
-    std::array<TokenId, kMaximumConcurrency * kDFlashVerifyMaximumWidth> licensed_tokens{};
-    std::array<std::int32_t, kMaximumConcurrency> licensed_counts{};
-    std::array<std::int32_t, kMaximumConcurrency> accepted_drafts{};
+    std::array<TokenId, kMaximumSpeculativeRows * kDFlashVerifyMaximumWidth> licensed_tokens{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> licensed_counts{};
+    std::array<std::int32_t, kMaximumSpeculativeRows> accepted_drafts{};
 };
 
 struct OrdinaryDecodeStateLayout {

@@ -147,14 +147,15 @@ struct LoadOptions {
     return backend == SpeculativeBackend::DFlash2 || backend == SpeculativeBackend::DSpine;
 }
 
-// Device state images a Qwen3.5-core Program with the context catalog keeps beside the catalog's,
-// one for each concurrent request: the state at the token where a stop string's match began,
-// which a turn that ends at that stop string returns to. The hybrid prefix cache keeps that state
-// in a snapshot slot.
+// Device state images a Qwen3.5-core Program with the context catalog keeps beside the catalog's:
+// the state at the token where a stop string's match began, which a turn that ends at that stop
+// string returns to. One for each concurrent request up to kDefaultCheckpointImages; past that the
+// requests share them, and a request that finds none free resumes such a turn from its prompt.
+// The hybrid prefix cache keeps that state in a snapshot slot.
 [[nodiscard]] inline std::uint32_t stop_hold_slots(const ContextCacheOptions& cache,
                                                    std::uint32_t concurrency) noexcept {
     return cache.enabled && cache.mode == ContextCacheMode::Legacy && cache.stop_hold_images
-               ? concurrency
+               ? std::min(concurrency, kDefaultCheckpointImages)
                : 0U;
 }
 

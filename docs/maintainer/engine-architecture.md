@@ -23,7 +23,8 @@ Generation purpose 的 NInfer Engine 固定运行：
 
 - 一张 GPU，或 Linux 上按层切成最多八个 pipeline stage 的多张 GPU（见第 8 节）；
 - 一个常驻模型实例；
-- 启动时确定的 `max_concurrency=1..8`；
+- 启动时确定的 `max_concurrency=1..64`（`auto` 在权重加载后取能放下的最大值；speculative 后端与
+  自带 Engine core 的家族为 `1..8`）；
 - 一个有界 FIFO 等待队列（等待中的单 token 读取请求之间按剩余工作量交换位置，见 5.2）；
 - 不抢占已经激活的请求；
 - 每个 decode round 将全部 decode-ready 请求组成一个紧凑批次。
@@ -633,7 +634,8 @@ launch 队列已满而停在 kernel launch 中的线程，以及 pageable 内存
 - Program 在启动时建立固定数量的 control/state/table resources；
 - growing KV 由共享 paged pools 支持，active request 持有完整增长 reservation；
 - 一个 GPU execution unit 内 State/KV mapping 保持稳定；
-- CUDA Graph 按合法 exact-`B` topology 建立，request identity 和 page IDs 是稳定输入数据，不是 graph key；
+- CUDA Graph 按合法 exact-`B` topology 建立（`B<=8`；更宽的 ordinary decode round 直接 launch kernels），
+  request identity 和 page IDs 是稳定输入数据，不是 graph key；
 - ordinary decode 不运行 catalog scan、pressure search 或后台 replica scan；
 - workspace 是 Program 启动时统一规划的 backing，Vision、Text 和 speculative schedule 按互斥 lifetime
   使用其内部区域；

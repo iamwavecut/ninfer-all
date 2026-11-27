@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_plan.h"
 
+#include "ninfer/ops/batch_rows.h"
 #include "ops/gdn_input_proj/q8/q8_gdn_input_kernels.h"
 
 #include <array>
@@ -82,7 +83,7 @@ Q8GdnInputPlan q8_gdn_input_resolve_plan(const Q8GdnInputProblem& problem) {
 
 Q8GdnInputConvPlan q8_gdn_input_conv_resolve_plan(const Q8GdnInputProblem& problem,
                                                   std::int32_t batch_size) {
-    if (!q8_gdn_input_admits(problem) || batch_size <= 0 || batch_size > 8) {
+    if (!q8_gdn_input_admits(problem) || !batch_rows_admitted(problem.cols, batch_size)) {
         throw std::invalid_argument(
             "Q8 GDN input conv: exact problem or column count is not admitted");
     }

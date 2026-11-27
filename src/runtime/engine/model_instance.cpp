@@ -28,6 +28,7 @@
 #include "runtime/contract/rope_scaling.h"
 
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <cmath>
 #include <filesystem>
@@ -94,7 +95,8 @@ void validate_options(const EngineOptions& options) {
         }
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+        throw std::invalid_argument("Engine max_concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "]");
     }
     if (options.max_pending_requests == 0 || options.pending_timeout_ms == 0) {
         throw std::invalid_argument("Engine pending request capacity and timeout must be nonzero");
@@ -301,6 +303,30 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
     return scoped;
 }
 
+// Past this many requests a request's Device KV lease is by default a bounded window of its output
+// (ContextCacheOptions::kv_lease_growth).
+constexpr std::uint32_t kLeaseGrowthDefaultConcurrency = 8;
+
+// The options of `options` at `concurrency` requests: the counts its normalization derived from
+// the request count follow it (the hybrid cache's lanes and its default snapshot slots, and a
+// default KV lease). The catalog keeps the capacities it was normalized with, which cover fewer
+// requests too.
+void adopt_concurrency(EngineOptions& options, std::uint32_t concurrency) {
+    options.max_concurrency    = concurrency;
+    ContextCacheOptions& cache = options.context_cache;
+    if (cache.enabled && !cache.kv_lease_growth) {
+        cache.kv_lease_growth = concurrency > kLeaseGrowthDefaultConcurrency;
+    }
+    if (!cache.enabled || cache.mode == ContextCacheMode::Hybrid) {
+        cache.max_private_continuations = concurrency;
+    }
+    if (cache.enabled && cache.mode == ContextCacheMode::Hybrid &&
+        cache.hybrid.fit_device_snapshot_slots) {
+        cache.hybrid.device_snapshot_slots = std::min(concurrency, kDefaultCheckpointImages) + 2U;
+        cache.device_state_slots           = cache.hybrid.device_snapshot_slots;
+    }
+}
+
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
@@ -312,6 +338,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             throw std::invalid_argument("a CausalScoring Engine takes no prompt grafts");
         }
         options.max_concurrency      = 1;
+        options.max_concurrency_auto = false;
         options.max_pending_requests = 1;
         options.prefill_chunk        = 1024;
         options.kv_capacity          = KvCapacityPolicy::explicit_capacity(options.max_context);
@@ -324,7 +351,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine purpose is invalid");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("Engine max_concurrency must be in [1,8]");
+        throw std::invalid_argument("Engine max_concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "]");
+    }
+    // An automatic count with a drafter looks no further than a speculative round's rows.
+    if (options.max_concurrency_auto && options.speculative.backend != SpeculativeBackend::None) {
+        options.max_concurrency = std::min(options.max_concurrency, kMaximumSpeculativeRows);
     }
     ContextCacheOptions& cache = options.context_cache;
     if (options.speculative.ngram_archive_bytes != 0 &&
@@ -344,6 +376,11 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("ngram draft widths above 15 require engine concurrency one");
     }
     const std::uint32_t concurrency = options.max_concurrency;
+    // An automatic count resolves its default lease with the count (adopt_concurrency).
+    if (cache.enabled && !options.max_concurrency_auto) {
+        cache.kv_lease_growth =
+            cache.kv_lease_growth.value_or(concurrency > kLeaseGrowthDefaultConcurrency);
+    }
     // Injected grafts stay resident for the life of the Engine, each in a StateImage and a
     // shared-prefix slot of its own, so the pools grow by that many beyond what requests use.
     const std::uint32_t direct_grafts = models::qwen3_5::count_direct_grafts(options.grafts);
@@ -394,15 +431,18 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         }
         const bool host_tier = cache.host_cache_auto || *cache.host_cache_budget_bytes != 0;
         HybridPrefixCacheOptions& hybrid = cache.hybrid;
-        // One resident snapshot per request lane keeps every live conversation's latest
-        // endpoint restorable without PCIe traffic; one more slot stages taps and endpoints while
-        // their Host copies are written, and one more keeps a shared prefix or another
-        // conversation's snapshot. A Host tier smaller than the conversations it serves cannot
-        // stand in for that slot: its images would take the slabs their blocks need.
+        // One resident snapshot per request lane, up to kDefaultCheckpointImages lanes, keeps
+        // every live conversation's latest endpoint restorable without PCIe traffic; one more slot
+        // stages taps and endpoints while their Host copies are written, and one more keeps a
+        // shared prefix or another conversation's snapshot. A Host tier smaller than the
+        // conversations it serves cannot stand in for that slot: its images would take the slabs
+        // their blocks need. Past kDefaultCheckpointImages lanes more snapshots would take the
+        // memory the requests' own states need, and the Host tier keeps the other conversations.
         // The default yields to a KV capacity that would not fit beside it (kv_capacity.cpp).
         hybrid.fit_device_snapshot_slots =
             hybrid.fit_device_snapshot_slots || !hybrid.device_snapshot_slots.has_value();
-        hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(concurrency + 2U);
+        hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(
+            std::min(concurrency, kDefaultCheckpointImages) + 2U);
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
         // Ladder taps are realized on prefill chunk boundaries, so the ladder never refines below
@@ -472,7 +512,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         return options;
     }
 
-    cache.device_state_slots = cache.device_state_slots.value_or(concurrency) + direct_grafts;
+    // Checkpoint images grow with the request count up to kDefaultCheckpointImages.
+    cache.device_state_slots =
+        cache.device_state_slots.value_or(std::min(concurrency, kDefaultCheckpointImages)) +
+        direct_grafts;
     const std::uint64_t default_private = 2ULL * concurrency;
     cache.max_private_continuations =
         cache.max_private_continuations.value_or(static_cast<std::uint32_t>(default_private));
@@ -951,6 +994,72 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
         instance.reset();
         device.synchronize();
         options.tensor_split = std::move(*refit);
+    }
+    // --max-concurrency auto: the most requests, up to the count asked for, whose recurrent states
+    // and one --max-context KV window each fit beside the weights (with an explicit KV capacity,
+    // whose windows it holds), the default hybrid snapshot slots yielding as they do to KV.
+    if (options.max_concurrency_auto) {
+        const auto extra_free = std::span<const std::size_t>(free_by_rank).subspan(1);
+        const std::uint32_t page_tokens = planner->capacity_curve().main_page_tokens;
+        const std::uint32_t context_pages =
+            (options.max_context + page_tokens - 1U) / page_tokens;
+        const std::uint64_t explicit_pages =
+            options.kv_capacity.mode == KvCapacityMode::Explicit
+                ? (std::uint64_t(options.kv_capacity.explicit_tokens) + page_tokens - 1U) /
+                      page_tokens
+                : std::numeric_limits<std::uint64_t>::max();
+        const auto fits = [&](std::uint32_t concurrency) {
+            if (std::uint64_t(concurrency) * context_pages > explicit_pages) { return false; }
+            EngineOptions trial = options;
+            adopt_concurrency(trial, concurrency);
+            const auto trial_planner = models::qwen3_5::make_sequence_planner(
+                instance->parameters, device,
+                artifact_scoped_disk_tier(trial, instance->model->info().artifact_id,
+                                          control_vectors_digest(instance->steering.get()),
+                                          instance->model->dspine() != nullptr
+                                              ? instance->model->dspine()->artifact_hex()
+                                              : std::string()),
+                graft_main_pages);
+            const auto& curve = trial_planner.capacity_curve();
+            std::vector<std::int64_t> spare =
+                kv_capacity_spare(options.kv_capacity, curve, concurrency * context_pages,
+                                  free_by_rank.front(), extra_free);
+            if (curve.state_slots_automatic) {
+                spare.front() += static_cast<std::int64_t>(
+                    std::uint64_t(curve.state_slots - curve.minimum_state_slots) *
+                    curve.bytes_per_state_slot);
+            }
+            return std::ranges::all_of(spare, [](std::int64_t bytes) { return bytes >= 0; });
+        };
+        std::uint32_t fitted = 1;
+        std::uint32_t last   = options.max_concurrency;
+        while (fitted < last) {
+            const std::uint32_t middle = fitted + (last - fitted + 1U) / 2U;
+            if (fits(middle)) {
+                fitted = middle;
+            } else {
+                last = middle - 1U;
+            }
+        }
+        const std::uint32_t asked = options.max_concurrency;
+        adopt_concurrency(options, fitted);
+        plan_sequences();
+        const auto& curve        = planner->capacity_curve();
+        const std::uint32_t pages = static_cast<std::uint32_t>(std::clamp<std::uint64_t>(
+            std::uint64_t(fitted) * context_pages + curve.resident_main_pages,
+            curve.minimum_main_page_groups, curve.maximum_main_page_groups));
+        constexpr double kMiB = 1024.0 * 1024.0;
+        publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Info,
+            "--max-concurrency auto: %u of %u requests fit, each with %.1f MiB of state and %.1f "
+            "MiB of KV (%u tokens); the plan reserves %.1f MiB of the %.1f MiB free after the "
+            "weights",
+            fitted, asked, static_cast<double>(curve.bytes_per_state_slot) / kMiB,
+            static_cast<double>(std::uint64_t(context_pages) *
+                                curve.bytes_per_additional_main_page_group) /
+                kMiB,
+            options.max_context, static_cast<double>(curve.reservation_bytes(pages)) / kMiB,
+            static_cast<double>(free_by_rank.front()) / kMiB);
     }
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(

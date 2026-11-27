@@ -3593,6 +3593,24 @@ int report_quantization_quality(KvCacheStorage storage, std::uint32_t seed) {
     return 0;
 }
 
+// An ordinary decode round past eight rows (up to ops::kMaximumDecodeRows): one column per row,
+// contexts from empty to `longest`, the cache rows permuted and fragmented. `idle_row` leaves the
+// middle row without a column, the masked form. Each cache row is sized by the longest context,
+// so wider batches use shorter ones.
+BatchAttentionCase wide_decode_case(std::int32_t batch, std::int32_t longest, std::uint32_t seed,
+                                    bool idle_row = false) {
+    BatchAttentionCase result{1, {}, {}, {}, MappingPattern::Fragmented, seed};
+    for (std::int32_t row = 0; row < batch; ++row) {
+        const std::int32_t context = row == 0           ? 0
+                                     : row == batch - 1 ? longest
+                                                        : (row * 2861 + 17) % longest;
+        result.contexts.push_back(context);
+        result.valid_columns.push_back(idle_row && row == batch / 2 ? 0 : 1);
+        result.table_rows.push_back((row * 7 + 3) % batch);
+    }
+    return result;
+}
+
 int run_quantized_batch_cases(KvCacheStorage storage, std::uint32_t seed) {
     int failures = 0;
     failures += run_batch_case(kGeometries[0], storage,
@@ -3610,6 +3628,10 @@ int run_quantized_batch_cases(KvCacheStorage storage, std::uint32_t seed) {
                                 {7, 0, 5, 2, 6, 1, 4, 3},
                                 MappingPattern::Fragmented,
                                 seed + 3u});
+    failures += run_batch_case(kGeometries[1], storage, wide_decode_case(9, 8191, seed + 4u));
+    failures +=
+        run_batch_case(kGeometries[0], storage, wide_decode_case(33, 2047, seed + 5u, true));
+    failures += run_batch_case(kGeometries[1], storage, wide_decode_case(64, 1023, seed + 6u));
     return failures;
 }
 
@@ -3988,11 +4010,19 @@ int run_batch_cases() {
                                {1, {8191}, {1}, {0}, MappingPattern::Fragmented, 510u});
     failures += run_batch_case(kGeometries[0], kPlanRk8v4,
                                {6, {5600}, {6}, {0}, MappingPattern::Identity, 511u});
+    // Ordinary decode rounds of 9..64 rows: the row domain past the speculative eight.
+    failures += run_batch_case(kGeometries[1], kPlanInt8, wide_decode_case(9, 8191, 512u));
+    failures += run_batch_case(kGeometries[0], kPlanBf16, wide_decode_case(16, 4095, 513u));
+    failures += run_batch_case(kGeometries[1], kPlanBf16, wide_decode_case(33, 2047, 514u, true));
+    failures += run_batch_case(kGeometries[0], kPlanInt8, wide_decode_case(64, 1023, 515u));
+    failures += run_batch_case(kGeometries[1], kPlanRk8v4, wide_decode_case(64, 1023, 516u));
+    failures += run_batch_case(kGeometries[0], kPlanRk4v4, wide_decode_case(33, 2047, 517u));
     failures += run_case_allowing_arch_skip(
         "causal_softmax_attention FP8 KV cache batched", [&] {
             return run_batch_case(kGeometries[0], kPlanFp8,
                                   {6, {61, 127, 511}, {6, 3, 0}, {2, 0, 1},
-                                   MappingPattern::Fragmented, 505u});
+                                   MappingPattern::Fragmented, 505u}) +
+                   run_batch_case(kGeometries[1], kPlanFp8, wide_decode_case(64, 1023, 518u));
         });
     return failures;
 }

@@ -1,6 +1,7 @@
 // ninfer::ops - causal cached Softmax Attention validation and finite route dispatch.
 #include "ninfer/ops/softmax_attention.h"
 
+#include "ninfer/ops/batch_rows.h"
 #include "ninfer/ops/sigmoid_mul.h"
 
 #include "core/layout.h"
@@ -35,7 +36,6 @@ constexpr std::int32_t kHeadDim                      = 256;
 constexpr float kExpectedScale                       = 0.0625f;
 constexpr std::int32_t kMaximumVerifyTokens          = 16;
 constexpr std::int32_t kMaximumSingleRowVerifyTokens = 64;
-constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
 // Visible keys per query row from which chunked small-T beats the prompt route for a single-row
@@ -277,8 +277,7 @@ void validate_batched_attention_tensors(const Tensor& q, const Tensor& positions
     const std::int32_t kv_heads = geometry.kv_heads;
     const std::int32_t width    = q.ne[2];
     const std::int32_t batch    = q.ne[3];
-    if (width <= 0 || batch <= 0 || batch > kMaximumBatchSize ||
-        (batch > 1 && width > kMaximumVerifyTokens)) {
+    if (!batch_rows_admitted(width, batch) || (batch > 1 && width > kMaximumVerifyTokens)) {
         throw std::invalid_argument(std::string(op) + ": unsupported B/W domain");
     }
     require_shape(q, kHeadDim, q_heads, width, batch, op, "q");
@@ -643,8 +642,8 @@ static std::size_t workspace_capacity_bytes(AttentionHeadGeometry geometry,
     if (cache_storage == KvCacheStorage::Bf16Packed && current_device_volta()) {
         throw std::invalid_argument("--kv-dtype bf16p needs sm_75 or newer");
     }
-    if (batch_size <= 0 || batch_size > kMaximumBatchSize || min_width <= 0 ||
-        max_width < min_width || (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
+    if (min_width <= 0 || max_width < min_width || !batch_rows_admitted(max_width, batch_size) ||
+        (batch_size > 1 && max_width > kMaximumVerifyTokens) ||
         envelope.min_visible_keys == 0 || envelope.min_visible_keys > envelope.max_visible_keys ||
         envelope.max_visible_keys > kCausalAttentionMaximumVisibleKeys) {
         throw std::invalid_argument(
@@ -914,8 +913,7 @@ void causal_softmax_attention_append(const Tensor& k, const Tensor& v, const Ten
     const std::int32_t width    = k.ne[2];
     const std::int32_t batch    = k.ne[3];
     const std::int32_t kv_heads = geometry.kv_heads;
-    if (width <= 0 || batch <= 0 || batch > kMaximumBatchSize ||
-        (batch > 1 && width > kMaximumVerifyTokens)) {
+    if (!batch_rows_admitted(width, batch) || (batch > 1 && width > kMaximumVerifyTokens)) {
         throw std::invalid_argument("causal_softmax_attention_append: unsupported B/W domain");
     }
     require_shape(k, kHeadDim, kv_heads, width, batch, op, "k");

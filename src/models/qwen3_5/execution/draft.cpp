@@ -720,7 +720,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                               ops::CausalAttentionExecutionEnvelope target_envelope) {
     target_envelope.wide_verification = state.ngram && k > 15;
     return [&state, batch_size, k, envelopes, target_envelope] {
-        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumConcurrency) ||
+        if (batch_size <= 0 || batch_size > static_cast<std::int32_t>(kMaximumSpeculativeRows) ||
             k == 0 || k > kDFlashVerifyMaximumDrafts) {
             throw std::logic_error("DFlash decode batch state is incomplete");
         }

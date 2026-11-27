@@ -882,7 +882,7 @@ std::string format_server_start_json(
              {"thorough_admission_search", cache.thorough_admission_search},
              {"recency_eviction", cache.recency_eviction},
              {"value_aware_demote", cache.value_aware_demote},
-             {"kv_lease_growth", cache.kv_lease_growth},
+             {"kv_lease_growth", cache.kv_lease_growth.value_or(false)},
              {"automatic_long_anchors", cache.automatic_long_anchors},
              {"branch_anchors", cache.branch_anchors},
              {"endpoint_anchors", cache.endpoint_anchors},

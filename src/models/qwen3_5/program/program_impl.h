@@ -1105,7 +1105,9 @@ public:
     // Engine commits it. The host copy of the device gather lands in logprobs_host, and
     // logprobs_armed mirrors the device flag that enables the gather, unknown after a resume.
     std::array<runtime::RawTokenLogprob,
-               kMaximumConcurrency * std::max(kMtpDecodeMaximumWidth, kDFlashVerifyMaximumWidth)>
+               std::max(kMaximumConcurrency,
+                        kMaximumSpeculativeRows *
+                            std::max(kMtpDecodeMaximumWidth, kDFlashVerifyMaximumWidth))>
         round_logprobs{};
     std::optional<PinnedHostBuffer> logprobs_host;
     std::optional<bool> logprobs_armed;
@@ -1548,9 +1550,10 @@ private:
     void hybrid_hold_drop(HybridLaneState& lane) noexcept;
 
     // Stop-string hold of a catalog Program (models::stop_hold_slots): the state where a stop
-    // string's match began, in the lane's own image past the catalog's slots. A turn that ends at
-    // that stop string returns to it before it is published, so its endpoint is the state a turn
-    // that ended there leaves, and the next turn resumes from it like from any endpoint.
+    // string's match began, in a hold image past the catalog's slots that the lane holds until it
+    // ends. A turn that ends at that stop string returns to it before it is published, so its
+    // endpoint is the state a turn that ended there leaves, and the next turn resumes from it like
+    // from any endpoint.
     struct StopHold {
         std::uint32_t frontier = 0;
         // A masked-draft backend: the frontier the image's draft context reaches.
@@ -1561,6 +1564,12 @@ private:
     };
     std::uint32_t stop_hold_slots_ = 0;
     std::array<std::optional<StopHold>, kMaximumConcurrency> stop_holds_;
+    // The hold image each lane holds (an index among the last stop_hold_slots_ pool slots), and
+    // the free ones (bit i: image i). Past kDefaultCheckpointImages lanes the images are shared.
+    std::array<std::optional<std::uint32_t>, kMaximumConcurrency> stop_hold_images_;
+    std::uint64_t stop_hold_free_ = 0;
+    // Drops the lane's hold and gives its image back.
+    void stop_hold_release(std::uint32_t lane) noexcept;
     // Drops the lane's hold and returns the pool slot a hold at `frontier` is written to, when
     // the lane keeps one.
     [[nodiscard]] std::optional<std::int32_t> stop_hold_slot(SequenceState& sequence,

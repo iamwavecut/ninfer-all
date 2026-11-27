@@ -103,7 +103,7 @@ void ProgramImpl::invalidate_lane(std::uint32_t lane) noexcept {
     if (lane >= max_concurrency) { return; }
     ++lane_epochs[lane];
     if (lane_epochs[lane] == 0) { ++lane_epochs[lane]; }
-    stop_holds_[lane].reset();
+    stop_hold_release(lane);
 }
 
 SequenceState& ProgramImpl::active_sequence(std::uint32_t lane) {
@@ -1571,7 +1571,7 @@ void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
 
 void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
                                            std::uint32_t backend_tokens) {
-    if (!context_cache.kv_lease_growth) { return; }
+    if (!context_cache.kv_lease_growth.value_or(false)) { return; }
     // Only a decode step may extend the lease: materialization during admission has to leave the
     // sequence holding exactly the entitlement its plan declared.
     RequestControl& request = requests[sequence.lane];

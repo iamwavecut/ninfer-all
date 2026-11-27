@@ -123,6 +123,11 @@ struct RuntimeStats {
     // left to later steps.
     std::uint64_t paced_prefill_steps           = 0;
     std::uint64_t paced_prefill_deferred_tokens = 0;
+    // ContextCacheOptions::kv_lease_growth: leases extended once retained cache was released, and
+    // requests whose lease could not take its smallest step, so the answer ended with
+    // finish_reason length before its max_tokens.
+    std::uint64_t kv_lease_reclaimed_extensions = 0;
+    std::uint64_t kv_lease_cut_requests         = 0;
 
     std::uint64_t state_moves     = 0;
     std::uint64_t state_forks     = 0;

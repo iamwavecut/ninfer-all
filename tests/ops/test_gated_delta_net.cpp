@@ -11,6 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -412,6 +413,91 @@ int split_invariance_case(const Case& test_case, const std::vector<int>& ends, s
            verify_exact(label + " state", split_state, single_state);
 }
 
+// The bit patterns of FP32 values, so an exact comparison also tells -0 from +0 and NaNs apart.
+std::vector<std::uint32_t> float_bits(const std::vector<float>& values) {
+    std::vector<std::uint32_t> bits(values.size());
+    std::memcpy(bits.data(), values.data(), values.size() * sizeof(float));
+    return bits;
+}
+
+// A batched update's rows do not depend on one another: each row's output and final state are the
+// bits that row gets alone, at B=1 over a pool of one slot.
+int batch_row_independence_case(const Case& test_case, int batch, std::uint32_t seed) {
+    const float scale = 1.0f / std::sqrt(static_cast<float>(kStateDim));
+    const std::size_t value_row_size =
+        static_cast<std::size_t>(kStateDim) * static_cast<std::size_t>(test_case.value_heads);
+    const std::size_t state_size = static_cast<std::size_t>(kStateDim * kStateDim) *
+                                   static_cast<std::size_t>(test_case.value_heads);
+    const auto run = [&](const gdn_ref::Inputs& inputs, const std::vector<float>& states, int rows,
+                         std::vector<std::uint16_t>& out_bits, std::vector<float>& state_values) {
+        DeviceInputs device(inputs);
+        DeviceBuffer state_buffer = to_device(states);
+        DeviceBuffer out(inputs.v.size() * sizeof(std::uint16_t));
+        std::vector<int> slots(static_cast<std::size_t>(rows));
+        for (int row = 0; row < rows; ++row) { slots[static_cast<std::size_t>(row)] = row; }
+        DeviceBuffer selectors = to_device(slots);
+        Tensor q(device.q.p, DType::BF16, {kStateDim, test_case.qk_heads, 1, rows});
+        Tensor k(device.k.p, DType::BF16, {kStateDim, test_case.qk_heads, 1, rows});
+        Tensor v(device.v.p, DType::BF16, {kStateDim, test_case.value_heads, 1, rows});
+        Tensor g(device.g.p, DType::FP32, {test_case.value_heads, 1, rows});
+        Tensor beta(device.beta.p, DType::FP32, {test_case.value_heads, 1, rows});
+        Tensor states_tensor(state_buffer.p, DType::FP32,
+                             {kStateDim, kStateDim, test_case.value_heads, rows});
+        Tensor selector_tensor(selectors.p, DType::I32, {rows});
+        Tensor out_tensor(out.p, DType::BF16, {kStateDim, test_case.value_heads, 1, rows});
+        ops::gated_delta_net_batch_update(q, k, v, g, beta, scale, test_case.normalize_qk,
+                                          states_tensor, selector_tensor, selector_tensor,
+                                          out_tensor, nullptr);
+        cuda_synchronize();
+        out_bits     = from_device<std::uint16_t>(out, inputs.v.size());
+        state_values = from_device<float>(state_buffer, states.size());
+    };
+
+    gdn_ref::Inputs aggregate;
+    aggregate.head_dim    = kStateDim;
+    aggregate.qk_heads    = test_case.qk_heads;
+    aggregate.value_heads = test_case.value_heads;
+    aggregate.tokens      = batch;
+    std::vector<gdn_ref::Inputs> rows;
+    std::vector<float> states;
+    for (int row = 0; row < batch; ++row) {
+        gdn_ref::Inputs input =
+            make_inputs(test_case, seed + static_cast<std::uint32_t>(row) * 97U);
+        aggregate.q.insert(aggregate.q.end(), input.q.begin(), input.q.end());
+        aggregate.k.insert(aggregate.k.end(), input.k.begin(), input.k.end());
+        aggregate.v.insert(aggregate.v.end(), input.v.begin(), input.v.end());
+        aggregate.g.insert(aggregate.g.end(), input.g.begin(), input.g.end());
+        aggregate.beta.insert(aggregate.beta.end(), input.beta.begin(), input.beta.end());
+        states.insert(states.end(), input.state.begin(), input.state.end());
+        rows.push_back(std::move(input));
+    }
+    std::vector<std::uint16_t> batched_out;
+    std::vector<float> batched_states;
+    run(aggregate, states, batch, batched_out, batched_states);
+
+    const std::string label = std::string(test_case.name) + " B=" + std::to_string(batch);
+    int failures            = 0;
+    for (int row = 0; row < batch; ++row) {
+        const gdn_ref::Inputs& input = rows[static_cast<std::size_t>(row)];
+        std::vector<std::uint16_t> alone_out;
+        std::vector<float> alone_state;
+        run(input, input.state, 1, alone_out, alone_state);
+        const std::size_t out_begin   = static_cast<std::size_t>(row) * value_row_size;
+        const std::size_t state_begin = static_cast<std::size_t>(row) * state_size;
+        failures += verify_exact(
+            label + " row " + std::to_string(row) + " out alone",
+            std::vector<std::uint16_t>(batched_out.begin() + out_begin,
+                                       batched_out.begin() + out_begin + value_row_size),
+            alone_out);
+        failures += verify_exact(
+            label + " row " + std::to_string(row) + " state alone",
+            float_bits(std::vector<float>(batched_states.begin() + state_begin,
+                                              batched_states.begin() + state_begin + state_size)),
+            float_bits(alone_state));
+    }
+    return failures;
+}
+
 int batch_update_case(const Case& test_case, const std::vector<int>& source_slots,
                       const std::vector<int>& destination_slots, int slots, std::uint32_t seed) {
     if (test_case.tokens != 1) { throw std::logic_error("batch_update_case requires W=1"); }
@@ -672,6 +758,23 @@ int main() {
                                   {8, 9, 10, 11, 12, 13, 14, 15}, 16, 13001u);
     failures += batch_update_case({"35b mixed fork destinations", 16, 32, 1, true}, {0, 2, 4, 6},
                                   {1, 3, 5, 7}, 8, 13101u);
+    // Ordinary decode rounds of more than eight requests (ops::kMaximumDecodeRows): even rows in
+    // place, odd rows forked to slots past the batch.
+    for (const int batch : {9, 16, 33, 64}) {
+        std::vector<int> sources(static_cast<std::size_t>(batch));
+        std::vector<int> destinations(static_cast<std::size_t>(batch));
+        for (int row = 0; row < batch; ++row) {
+            sources[static_cast<std::size_t>(row)]      = row;
+            destinations[static_cast<std::size_t>(row)] = row % 2 == 0 ? row : batch + row / 2;
+        }
+        const int slots = batch + batch / 2;
+        failures += batch_update_case({"27b wide decode", 16, 48, 1, true}, sources, destinations,
+                                      slots, 14000u + static_cast<std::uint32_t>(batch));
+        failures += batch_update_case({"35b wide decode", 16, 32, 1, true}, sources, destinations,
+                                      slots, 15000u + static_cast<std::uint32_t>(batch));
+    }
+    failures += batch_row_independence_case({"27b row independence", 16, 48, 1, true}, 64, 16001u);
+    failures += batch_row_independence_case({"35b row independence", 16, 32, 1, true}, 33, 16101u);
 
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net correctness\n";
     return failures == 0 ? 0 : 1;

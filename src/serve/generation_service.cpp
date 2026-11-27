@@ -301,6 +301,7 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.max_context              = options.max_context;
     engine_options.kv_capacity              = options.kv_capacity;
     engine_options.max_concurrency          = options.max_concurrency;
+    engine_options.max_concurrency_auto     = options.max_concurrency_auto;
     engine_options.max_pending_requests     = options.max_pending_requests;
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
     engine_options.prefill_chunk            = options.prefill_chunk;
@@ -398,6 +399,8 @@ GenerationService::GenerationService(
     engine_options.diagnostic_observer   = std::move(diagnostic_observer);
     engine_options.slot_auto_save.listener = std::move(auto_save_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    // --max-concurrency auto: the count the Engine resolved.
+    options_.max_concurrency = engine_->options().max_concurrency;
     refuse_family_options();
     // A request that says nothing about thinking gets its template's default. Qwen's templates
     // think unless told not to; Gemma 4's chat template keeps thinking off unless enable_thinking

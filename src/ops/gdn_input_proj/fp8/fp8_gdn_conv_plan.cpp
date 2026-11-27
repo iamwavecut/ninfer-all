@@ -4,6 +4,7 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_conv_plan.h"
 
 #include "core/layout.h"
+#include "ninfer/ops/batch_rows.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan.h"
 #include "ops/gdn_input_proj/gdn_projected_conv.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
@@ -84,7 +85,7 @@ void launch_projection(const Tensor& x, const Weight& weight, Tensor& projected,
 Fp8GdnConvPlan fp8_gdn_snapshot_resolve_plan(LinearPolicy policy, std::int32_t width,
                                              std::int32_t batch_size) {
     require_policy(policy, "fp8 GDN snapshot");
-    if (width <= 0 || batch_size <= 0 || batch_size > 8 || (batch_size > 1 && width > 16)) {
+    if (!batch_rows_admitted(width, batch_size) || (batch_size > 1 && width > 16)) {
         throw std::invalid_argument("fp8 GDN snapshot: invalid B/W domain");
     }
     if (batch_size == 1) {
