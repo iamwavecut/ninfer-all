@@ -2811,8 +2811,8 @@ struct Executor::Impl {
         }
         const std::int64_t pairs   = std::int64_t(c.t) * config.top_k_experts;
         const std::int64_t experts = config.num_experts;
-        return gguf::moe_vector_call_pays(p.gate_up_type, p.down_type, hidden, width, pairs,
-                                          experts);
+        return gguf::moe_vector_call_pays(p.gate_up_type, p.down_type, hidden,
+                                          int(config.moe_intermediate_size), pairs, experts);
     }
 
     // The routed experts of layer `p` for the call's MoE input; their product lands where the
