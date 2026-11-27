@@ -71,6 +71,11 @@ struct MemorySummary {
     std::uint32_t kv_capacity                 = 0; // Resolved page-aligned Main KV capacity.
     std::uint32_t kv_capacity_page_groups     = 0;
     std::uint32_t kv_capacity_max_page_groups = 0;
+    // --kv-page-dedup: groups two or more lanes map now, and the offers that shared so far.
+    std::uint32_t kv_shared_page_groups       = 0;
+    std::uint64_t kv_dedup_hits               = 0;
+    std::uint64_t kv_dedup_offers             = 0;
+    std::uint64_t kv_dedup_collisions         = 0;
     KvCacheStorage kv_cache                   = KvCacheStorage::BFloat16;
     ArenaMemorySummary weights;
     ArenaMemorySummary sequence;

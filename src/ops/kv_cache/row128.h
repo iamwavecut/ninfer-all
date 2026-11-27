@@ -34,7 +34,9 @@ inline constexpr int kKvRowDims = 128;
 inline constexpr float kRotatedRowScale = 0.125f, kRotatedQueryScale = 0.0625f;
 
 // A quantized plane: one row's codes at codes + sequence * code_seq + head * code_head +
-// slot * code_row, its scales likewise.
+// slot * code_row, its scales likewise. A paged plane (--kv-paging) has no per-sequence
+// strides: the row of slot lives in the page group named by the lane's row of the execution
+// table (block_table), at (slot within the group) * heads + head rows into the group.
 struct KvPlaneView {
     std::uint8_t* codes  = nullptr;
     std::uint8_t* scales = nullptr;
@@ -42,6 +44,27 @@ struct KvPlaneView {
                  scale_seq = 0;
     KvCoding coding = KvCoding::F16;
     bool rotated    = false;
+    // Null: dense addressing above. Else the device execution table ([lanes][table_stride]
+    // groups, table_stride entries a lane row) and the plane's bytes per page group.
+    const std::int32_t* block_table = nullptr;
+    std::int64_t table_stride = 0, code_page = 0, scale_page = 0;
+    int heads = 0;       // the plane's head extent (a page group holds page_tokens rows per head)
+    int page_tokens = 0; // positions of one page group when paged
 };
+
+// Where a plane's row of (sequence, head, slot) begins: codes with the code strides and code
+// page bytes, scales with the scale ones. __host__ __device__: the tile loaders call it.
+[[nodiscard]] NINFER_KV_ROW_HOST_DEVICE inline std::int64_t kv_plane_offset(
+    const KvPlaneView& plane, int sequence, int head, int slot, std::int64_t seq_stride,
+    std::int64_t head_stride, std::int64_t row_stride, std::int64_t page_bytes) {
+    if (plane.block_table != nullptr) {
+        const std::int32_t group = plane.block_table[std::int64_t(sequence) * plane.table_stride +
+                                                     slot / plane.page_tokens];
+        return std::int64_t(group) * page_bytes +
+               std::int64_t((slot % plane.page_tokens) * plane.heads + head) * row_stride;
+    }
+    return std::int64_t(sequence) * seq_stride + std::int64_t(head) * head_stride +
+           std::int64_t(slot) * row_stride;
+}
 
 } // namespace ninfer::ops::kv128

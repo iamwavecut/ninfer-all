@@ -118,6 +118,12 @@ struct SpeculativeOptions {
     static constexpr float kAutomaticDSparkMinP            = 0.5F;
 };
 
+// The paging queue's admission grant shape (--kv-reserve-mode).
+enum class KvReserveMode : std::uint8_t { Upfront, Chunked };
+
+// The paging queue's admission order among queued requests (--kv-queue-order).
+enum class KvQueueOrder : std::uint8_t { Fifo, Shortest };
+
 enum class DiagnosticLevel : std::uint8_t {
     Debug,
     Info,
@@ -682,6 +688,32 @@ struct EngineOptions {
     // Inkling 2 only: which keys and values the three passes of its looped core keep
     // (LoopKvCache). Anything but PerPass is lossy and never the default.
     LoopKvCache loop_kv = LoopKvCache::PerPass;
+    // Inkling 2: the eight full-attention visits' quantized planes live in a shared pool of
+    // 64-token page groups (--kv-paging) that lanes lease as they grow; needs --kv-dtype
+    // rk8v4 or rk4v4. Off keeps the dense per-sequence planes.
+    bool kv_paging                     = false;
+    // The pool's device-byte ceiling in MiB (0: as much as the device frees beside the fixed
+    // caches, the workspace and the CUDA graphs).
+    std::uint32_t kv_page_budget_mib   = 0;
+    // Inkling 2 with --kv-paging: positions of one page group (--kv-page-group), a power-of-two
+    // divisor of the model's sliding window. 64 keeps the landed shape.
+    std::uint32_t kv_page_group        = 64;
+    // Inkling 2 with --kv-paging: content-addressed sharing of byte-identical page groups across
+    // the lanes (a shared prompt prefix stores once), with copy-on-write on divergent writes.
+    bool kv_page_dedup                 = true;
+    // Inkling 2 paging queue: how admission grants generation pages. Upfront (the default)
+    // reserves prompt + the whole max_tokens; chunked reserves prompt + the first
+    // kv_reserve_gen_chunk tokens and extends the grant per decode round — more queued requests
+    // fit the same budget, and a lane whose extension cannot be granted fails its own request
+    // with a clean 503 while the server and the other lanes keep serving (extensions run before
+    // new admissions).
+    KvReserveMode kv_reserve_mode      = KvReserveMode::Upfront;
+    // Chunked mode: generation tokens per grant, extended as the lane decodes.
+    std::uint32_t kv_reserve_gen_chunk = 256;
+    // Inkling 2 paging queue: the admission order among queued requests. Fifo (the default)
+    // admits the longest-waiting request first; shortest admits the smallest
+    // prompt + max_tokens first.
+    KvQueueOrder kv_queue_order        = KvQueueOrder::Fifo;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

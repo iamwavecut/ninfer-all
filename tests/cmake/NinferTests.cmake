@@ -7,6 +7,7 @@
 # link options would leak into every other program (symbol wrapping) or that a script invokes as
 # an executable path.
 include(${PROJECT_SOURCE_DIR}/cmake/NinferBundles.cmake)
+include(${CMAKE_CURRENT_LIST_DIR}/GpuTestSupport.cmake)
 
 function(ninfer_test_includes target)
   ninfer_internal_includes(${target})
@@ -14,7 +15,7 @@ function(ninfer_test_includes target)
 endfunction()
 
 function(ninfer_add_test name)
-  cmake_parse_arguments(PARSE_ARGV 1 arg "NEEDS_SOURCE_DIR;STANDALONE" ""
+  cmake_parse_arguments(PARSE_ARGV 1 arg "NEEDS_SOURCE_DIR;STANDALONE;GPU" ""
     "SOURCES;LIBRARIES;TEST_ARGS")
   if(arg_STANDALONE)
     add_executable(${name} ${arg_SOURCES})
@@ -36,6 +37,9 @@ function(ninfer_add_test name)
   # permanently and stops being read. The executable still accepts any other configuration when run
   # by hand.
   add_test(NAME ${name} COMMAND ${command} ${arg_TEST_ARGS})
+  ninfer_test_is_gpu(${name} GPU ${arg_GPU} SERIAL ${arg_SERIAL}
+    SOURCES ${arg_SOURCES} LIBRARIES ${arg_LIBRARIES})
+  ninfer_apply_test_polarity(${name})
 endfunction()
 
 # Apply these to the translation unit containing the oracle, including shared

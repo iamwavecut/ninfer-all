@@ -92,6 +92,7 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
         error.code   = "numerical_failure";
         break;
     }
+    error.retry_after = exception.retry_after_seconds();
     return error;
 }
 
@@ -311,6 +312,13 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.kv_cache                 = options.kv_cache;
     engine_options.kv_cache_automatic       = options.kv_cache_automatic;
     engine_options.loop_kv                  = options.loop_kv;
+    engine_options.kv_paging                = options.kv_paging;
+    engine_options.kv_page_budget_mib       = options.kv_page_budget_mib;
+    engine_options.kv_page_group            = options.kv_page_group;
+    engine_options.kv_page_dedup            = options.kv_page_dedup;
+    engine_options.kv_reserve_mode          = options.kv_reserve_mode;
+    engine_options.kv_reserve_gen_chunk     = options.kv_reserve_gen_chunk;
+    engine_options.kv_queue_order           = options.kv_queue_order;
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
     options.steering.apply(engine_options);
