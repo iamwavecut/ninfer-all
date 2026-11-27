@@ -324,39 +324,58 @@ speculative_sparse_warp_accept(SamplingWorkspace workspace, const Logit* logits,
             }
         }
     } else {
-        const int n  = workspace.dist_support[a];
-        int token    = 0;
-        float weight = 0.0f;
-        if (lane < n) {
-            const int at = sampling_dist_offset(a, lane);
-            token        = workspace.dist_idx[at];
-            weight       = workspace.dist_prob[at];
-            if (a < extent) {
-                const int q_at = (row * k + a) * kSparseSpeculativeCandidates;
-                weight         = fmaxf(weight - speculative_sparse_probability(candidate_ids + q_at,
-                                                                               proposal_q + q_at, token),
-                                       0.0f);
-            }
-        }
-        float cdf = weight;
+        // Up to kSamplerCandidateCap (64) candidates, two per lane: ranks lane and lane + 32.
+        static_assert(kSamplerCandidateCap <= 64, "the residual draw holds two candidates per lane");
+        const int n = workspace.dist_support[a];
+        int token[2]     = {0, 0};
+        float weight[2]  = {0.0f, 0.0f};
+        float cdf[2]     = {0.0f, 0.0f};
+        float carry      = 0.0f;
 #pragma unroll
-        for (int offset = 1; offset < 32; offset *= 2) {
-            const float earlier = __shfl_up_sync(0xffffffffU, cdf, offset);
-            if (lane >= offset) cdf += earlier;
+        for (int half = 0; half < 2; ++half) {
+            const int rank = half * 32 + lane;
+            if (rank < n) {
+                const int at = sampling_dist_offset(a, rank);
+                token[half]  = workspace.dist_idx[at];
+                weight[half] = workspace.dist_prob[at];
+                if (a < extent) {
+                    const int q_at = (row * k + a) * kSparseSpeculativeCandidates;
+                    weight[half]   = fmaxf(weight[half] -
+                                               speculative_sparse_probability(
+                                                   candidate_ids + q_at, proposal_q + q_at, token[half]),
+                                           0.0f);
+                }
+            }
+            cdf[half] = weight[half];
+#pragma unroll
+            for (int offset = 1; offset < 32; offset *= 2) {
+                const float earlier = __shfl_up_sync(0xffffffffU, cdf[half], offset);
+                if (lane >= offset) cdf[half] += earlier;
+            }
+            cdf[half] += carry;
+            carry = __shfl_sync(0xffffffffU, cdf[half], 31);
         }
-        const float mass = __shfl_sync(0xffffffffU, cdf, 31);
+        const float mass = carry;
         const int purpose =
             a < extent ? kSamplePurposeSpeculativeCorrection : kSamplePurposeSpeculativeBonus;
-        const float u           = sampling_uniform(cfg.seed, old_length + a + 1, purpose, 0);
-        const float goal        = u * mass;
-        const unsigned positive = __ballot_sync(0xffffffffU, lane < n && weight > 0.0f);
-        const unsigned candidates =
-            __ballot_sync(0xffffffffU, lane < n && weight > 0.0f && goal < cdf);
-        const int selected = !(mass > 0.0f) ? 0
-                             : candidates   ? __ffs(candidates) - 1
-                             : positive     ? 31 - __clz(positive)
-                                            : 0;
-        terminal           = __shfl_sync(0xffffffffU, token, selected);
+        const float u    = sampling_uniform(cfg.seed, old_length + a + 1, purpose, 0);
+        const float goal = u * mass;
+        unsigned positive[2];
+        unsigned candidates[2];
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const bool live    = half * 32 + lane < n && weight[half] > 0.0f;
+            positive[half]     = __ballot_sync(0xffffffffU, live);
+            candidates[half]   = __ballot_sync(0xffffffffU, live && goal < cdf[half]);
+        }
+        const int selected = !(mass > 0.0f)  ? 0
+                             : candidates[0] ? __ffs(candidates[0]) - 1
+                             : candidates[1] ? 32 + __ffs(candidates[1]) - 1
+                             : positive[1]   ? 32 + 31 - __clz(positive[1])
+                             : positive[0]   ? 31 - __clz(positive[0])
+                                             : 0;
+        terminal           = __shfl_sync(0xffffffffU, selected < 32 ? token[0] : token[1],
+                                         selected & 31);
         // mass is the residual probability the selection drew from, and the stochastic branch does
         // write dist_prob, so this one is real. A NaN column makes mass NaN, and `!(mass > 0.0f)`
         // above already forces `selected` to 0 -- committing lane 0's token would be exactly the
