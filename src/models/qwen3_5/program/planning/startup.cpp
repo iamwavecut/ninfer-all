@@ -1731,7 +1731,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 graph_rows(impl->max_concurrency), "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             // Adaptive MTP captures one graph set per verification width it can select, and copy
-            // rounds one more at the ngram window for every batch size they admit.
+            // rounds one more at the ngram window, for every batch size of at most
+            // kMaximumGraphRows rows: a wider round runs ordinary and uncaptured.
             const auto family_allowance = [&](std::uint32_t verify_window) {
                 const auto profiles =
                     mtp_graph_profiles(impl->capacity, verify_window, impl->draft_window,
@@ -1766,11 +1767,12 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                 per_batch_allowance = checked_add(
                     per_batch_allowance, family_allowance(verify_window), "MTP graph allowance");
             }
-            impl->graph_allowance_bytes = checked_mul(per_batch_allowance, impl->max_concurrency,
-                                                      "MTP exact-b graph allowance");
+            impl->graph_allowance_bytes =
+                checked_mul(per_batch_allowance, graph_rows(impl->max_concurrency),
+                            "MTP exact-b graph allowance");
             if (impl->ngram_draft_window != 0) {
                 const std::uint32_t copy_batches =
-                    impl->ngram_draft_window > 15U ? 1U : impl->max_concurrency;
+                    impl->ngram_draft_window > 15U ? 1U : graph_rows(impl->max_concurrency);
                 impl->graph_allowance_bytes =
                     checked_add(impl->graph_allowance_bytes,
                                 checked_mul(family_allowance(impl->ngram_draft_window),
