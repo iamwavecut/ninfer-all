@@ -206,6 +206,9 @@ struct Spark {
     // final hidden.
     std::vector<int> tap_after;
     int taps = 0, block = 0, window = 0;
+    // A matrix of the drafter is BF16 (a drafter GGUF stored in BF16): its calls run on BF16 rows,
+    // which its GGUF matrices, if any, multiply as well; else on q8_1 rows.
+    bool bf16 = false;
     DeviceBuffer contexts, contexts_kept, state, prev, drafts, confidence;
     std::unique_ptr<PinnedHostBuffer> host;
     std::unique_ptr<CudaCompletionEvent> copied;
@@ -1015,6 +1018,10 @@ struct Executor::Impl {
             l.gate = mlp[0];
             l.up   = mlp[1];
             l.down = parts_of({lw.down}, {hidden}).front();
+            for (const Weight* m : {&l.query, &l.key, &l.value, &l.output, &l.context_key,
+                                    &l.context_value, &l.gate, &l.up, &l.down}) {
+                d->bf16 = d->bf16 || m->qtype == QType::BF16;
+            }
             l.context_norm     = fp32(model, lw.context_norm, hidden);
             l.attention_norm   = fp32(model, lw.attention_norm, hidden);
             l.ffn_norm         = fp32(model, lw.ffn_norm, hidden);
@@ -1092,7 +1099,8 @@ struct Executor::Impl {
         ma.slots          = kR;
         Q8Act xq;
         __nv_bfloat16* xb = nullptr;
-        if (c.q8) {
+        const bool q8     = c.q8 && !d.bf16;
+        if (q8) {
             xq           = alloc_q8(hidden, t, contexts);
             ma.out_q     = xq.rows;
             ma.q8_stride = std::int64_t(q8_bytes(hidden, t));
@@ -1105,7 +1113,7 @@ struct Executor::Impl {
         auto* kv = static_cast<float*>(workspace->alloc_bytes(std::size_t(n) * 2 * kvd * 4).data);
         for (int l = 0; l < contexts; ++l) {
             const SparkLayer& layer = d.layers[l];
-            if (c.q8) {
+            if (q8) {
                 const void* x = static_cast<const std::byte*>(xq.base) + std::size_t(l) * q8_bytes(hidden, t);
                 vector_f32(x, layer.context_key, t, kv, 2 * kvd, 0);
                 vector_f32(x, layer.context_value, t, kv, 2 * kvd, kvd);
@@ -1161,23 +1169,40 @@ struct Executor::Impl {
         rows.positions = static_cast<const std::int32_t*>(d_positions.p);
         rows.sequences = static_cast<const std::int32_t*>(d_sequences.p);
         rows.tokens    = b;
-        Q8Act x        = alloc_q8(hidden, b);
+        // The block's rows: q8_1 for the GGUF products, BF16 for a drafter with BF16 matrices.
+        const bool bf16 = d.bf16;
+        const auto bf16_rows = [&](int width) {
+            return static_cast<__nv_bfloat16*>(
+                workspace->alloc_bytes(std::size_t(b) * width * 2).data);
+        };
+        Q8Act x        = bf16 ? Q8Act{} : alloc_q8(hidden, b);
+        __nv_bfloat16* xb = bf16 ? bf16_rows(hidden) : nullptr;
         auto* qv       = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * q * 4).data);
         auto* kv       = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * 2 * kvd * 4).data);
-        Q8Act attn     = alloc_q8(q, b);
+        Q8Act attn     = bf16 ? Q8Act{} : alloc_q8(q, b);
+        __nv_bfloat16* attn_b = bf16 ? bf16_rows(q) : nullptr;
         auto* y        = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);
         auto* gu       = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * 2 * w * 4).data);
         auto* mid      = static_cast<__nv_bfloat16*>(workspace->alloc_bytes(std::size_t(b) * w * 2).data);
-        void* act      = workspace->alloc_bytes(gguf::vector_activation_bytes(w, b)).data;
+        void* act      = bf16 ? nullptr : workspace->alloc_bytes(gguf::vector_activation_bytes(w, b)).data;
+        // W x for the block's rows, in the form the drafter runs on.
+        const auto mul = [&](const Weight& m, const void* xq, __nv_bfloat16* xr, float* out,
+                             int column_stride, int row = 0) {
+            if (bf16) {
+                project_f32(Tensor(xr, DType::BF16, {m.k, b}), m, out, column_stride, row);
+            } else {
+                vector_f32(xq, m, b, out, column_stride, row);
+            }
+        };
         const int splits_sliding = 4;
         auto* partial = static_cast<float*>(workspace->alloc_bytes(
             kernels::attention_workspace_floats(b, query_heads,
                                                 std::max(decode_splits_full, splits_sliding)) * 4).data);
         for (const SparkLayer& l : d.layers) {
-            kernels::rms_norm(h, l.attention_norm, hidden, b, deps, nullptr, stream, x.rows);
-            vector_f32(x.base, l.query, b, qv, q);
-            vector_f32(x.base, l.key, b, kv, 2 * kvd, 0);
-            vector_f32(x.base, l.value, b, kv, 2 * kvd, kvd);
+            kernels::rms_norm(h, l.attention_norm, hidden, b, deps, xb, stream, x.rows);
+            mul(l.query, x.base, xb, qv, q);
+            mul(l.key, x.base, xb, kv, 2 * kvd, 0);
+            mul(l.value, x.base, xb, kv, 2 * kvd, kvd);
             kernels::SparkRotateArgs ra;
             ra.rows   = rows;
             ra.x      = qv;
@@ -1213,16 +1238,17 @@ struct Executor::Impl {
             aa.splits      = l.cache.full ? decode_splits_full : splits_sliding;
             aa.uniform     = true;
             aa.partial     = partial;
+            aa.out         = attn_b;
             aa.out_q       = attn.rows;
             kernels::attention(aa, stream);
-            vector_f32(attn.base, l.output, b, y, hidden);
+            mul(l.output, attn.base, attn_b, y, hidden);
             kernels::add_rows(h, y, hidden, hidden, b, stream);
-            kernels::rms_norm(h, l.ffn_norm, hidden, b, deps, nullptr, stream, x.rows);
-            vector_f32(x.base, l.gate, b, gu, 2 * w, 0);
-            vector_f32(x.base, l.up, b, gu, 2 * w, w);
+            kernels::rms_norm(h, l.ffn_norm, hidden, b, deps, xb, stream, x.rows);
+            mul(l.gate, x.base, xb, gu, 2 * w, 0);
+            mul(l.up, x.base, xb, gu, 2 * w, w);
             kernels::silu_mul(gu, w, b, mid, stream);
-            gguf::quantize_vector_activation(mid, w, b, nullptr, act, stream);
-            vector_f32(act, l.down, b, y, hidden);
+            if (!bf16) { gguf::quantize_vector_activation(mid, w, b, nullptr, act, stream); }
+            mul(l.down, act, mid, y, hidden);
             kernels::add_rows(h, y, hidden, hidden, b, stream);
         }
         auto* final_rows = static_cast<float*>(workspace->alloc_bytes(std::size_t(b) * hidden * 4).data);
