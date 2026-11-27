@@ -26,7 +26,9 @@ struct LoadOptions {
     bool embedding_q4   = false;
     bool embedding_q6   = false;
     bool mtp_experts_q4 = false;
-    // Host keeps the token embedding in mapped host RAM, read in place by the gather.
+    // Host keeps the token embedding in mapped host RAM, read in place by the gather. The Engine
+    // resolves Auto before loading (qwen3_5::host_embedding_suits); the loader reads any value but
+    // Host as Device.
     EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
     ExpertResidency expert_residency = ExpertResidency::Device;
     // Execution selection carried with the instance: admit the integer small-T gate_up route at

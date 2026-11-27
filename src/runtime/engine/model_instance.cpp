@@ -727,6 +727,24 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                             reader.directory().component("text").proposal.has_value();
         options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
     }
+    // Before the splits below, which size the head stage with the table where it will live. Only
+    // a KV pool that takes all free memory turns the table's device memory into KV: automatic
+    // capacity with the hybrid prefix cache, whose pages no request holds are block cache. Any
+    // other automatic pool stops at --max-context per request. A draft step gathers its token's
+    // row over the bus on its round's critical path (MTP with 3 drafts decoded 0.15% to 0.39%
+    // slower), so drafting keeps the table on the device.
+    if (options.embedding_residency == EmbeddingResidency::Auto) {
+        const bool kv_fills_memory = options.kv_capacity.mode == KvCapacityMode::Automatic &&
+                                     options.context_cache.enabled &&
+                                     options.context_cache.mode == ContextCacheMode::Hybrid;
+        const bool drafts = options.speculative.backend != SpeculativeBackend::None ||
+                            options.speculative.lookup_ngram != 0;
+        options.embedding_residency =
+            kv_fills_memory && !drafts &&
+                    models::qwen3_5::host_embedding_suits(reader, models::load_options(options))
+                ? EmbeddingResidency::Host
+                : EmbeddingResidency::Device;
+    }
     // Without --tensor-split the first load takes default_tensor_split's shares. Only the loaded
     // model's planner knows what the Engine reserves on each device; a device left short of it
     // (or with room the estimate did not give it) loads the model again with the shares

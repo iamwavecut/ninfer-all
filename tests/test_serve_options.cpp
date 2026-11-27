@@ -257,10 +257,13 @@ int main() {
         failures += check(rejected, "server accepted --draft-tokens without --spec or --lookup-ngram");
     }
     failures += check(parse({"ninfer-serve", "model.ninfer"}).embedding_residency ==
-                              ninfer::EmbeddingResidency::Device &&
+                              ninfer::EmbeddingResidency::Auto &&
                           parse({"ninfer-serve", "model.ninfer", "--embedding-residency", "host"})
-                                  .embedding_residency == ninfer::EmbeddingResidency::Host,
-                      "server did not default the embedding to the device or keep a host one");
+                                  .embedding_residency == ninfer::EmbeddingResidency::Host &&
+                          parse({"ninfer-serve", "model.ninfer", "--embedding-residency",
+                                 "device"})
+                                  .embedding_residency == ninfer::EmbeddingResidency::Device,
+                      "server did not default the embedding to auto or keep a chosen residency");
     {
         bool rejected = false;
         try {

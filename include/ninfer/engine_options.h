@@ -672,8 +672,9 @@ struct EngineOptions {
     bool embedding_q6                      = false;
     // Qwen3.5 family: keep the token embedding in mapped host RAM (`--embedding-residency
     // host`). Output is unchanged (the same gather reads the same stored bytes); excludes
-    // embedding_q4/q6, which only shrink the device copy.
-    EmbeddingResidency embedding_residency = EmbeddingResidency::Device;
+    // embedding_q4/q6, which only shrink the device copy. Auto resolves at startup, and
+    // options() reports the result; the other families resolve it to Device.
+    EmbeddingResidency embedding_residency = EmbeddingResidency::Auto;
     // Qwen3.6-35B-A3B only: the MTP draft layer's routed experts are stored W8 in the artifact;
     // transcode them to the text layers' formats (Q4 gate_up, Q6 down) at load. Drafts are
     // verified exactly, so this can change acceptance but never the output distribution.

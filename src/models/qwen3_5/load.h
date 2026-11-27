@@ -55,6 +55,13 @@ private:
                                  std::vector<ops::DeviceTier> rank_tiers = {});
 // The code tier of each rank's device, in rank order.
 [[nodiscard]] std::vector<ops::DeviceTier> rank_tiers(const DeviceContext& device);
+// Whether `--embedding-residency auto` may keep this artifact's token table in host memory: the
+// gather alone reads the table (the output head shares no stored object with it), nothing needs a
+// device copy (--embedding-q4/q6, a Vision overlay window), the routed experts are on the device
+// (host experts pin the same RAM and disk experts read through its page cache), the driver is not
+// WDDM (Windows and WSL2 charge pinned memory to the GPU's shared segment) and pinning the table
+// leaves the host artifact::kPinnedHeadroomBytes.
+[[nodiscard]] bool host_embedding_suits(const artifact::Reader& reader, const LoadOptions& options);
 // How many layers each of `free_bytes.size()` pipeline stages should own so that the most KV cache
 // fits on every device at once, given the bytes free on each. Sized from the artifact's stored
 // layers; the head stage (rank 0) also carries the embedding, head and round buffers, and as

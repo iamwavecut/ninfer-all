@@ -1,6 +1,9 @@
 #include "artifact/binder.h"
 #include "artifact/fixture.h"
 #include "artifact/formats.h"
+#include "artifact/materializer.h"
+#include "core/host_memory.h"
+#include "core/mapped_host_copy.h"
 #include "core/qtype.h"
 #include "models/qwen3_5/load.h"
 
@@ -424,6 +427,38 @@ void bf16_head_beside_gguf_blocks() {
             "the BF16 head lost its Use");
 }
 
+// `--embedding-residency auto` moves a table to host memory only where nothing else reads it on the
+// device: a tied table, a transcode, a Vision overlay window or host experts keep it there. Only the
+// Host answer depends on the machine (a WDDM driver, the host's pinning headroom).
+void automatic_embedding_residency() {
+    ModelFixture tied;
+    tied.file.write();
+    artifact::Reader tied_reader(tied.file.entry);
+    require(!qwen::host_embedding_suits(tied_reader, {}),
+            "auto moved a table the output head also reads to host memory");
+
+    ModelFixture fixture;
+    fixture.file.root["components"]["text"]["config"]["tie_word_embeddings"] = false;
+    fixture.tensor("embedding-own", {272, 128});
+    fixture.file.root["bindings"]["text/token_embedding"] = {{"object", "embedding-own"}};
+    fixture.file.write();
+    artifact::Reader reader(fixture.file.entry);
+    const auto suits = [&](LoadOptions options) { return qwen::host_embedding_suits(reader, options); };
+    require(!suits({.embedding_q4 = true}) && !suits({.embedding_q6 = true}),
+            "auto moved a table that a transcode shrinks on the device to host memory");
+    require(!suits({.expert_residency = ExpertResidency::Host}) &&
+                !suits({.expert_residency = ExpertResidency::Disk}),
+            "auto moved the table to host memory beside host or disk experts");
+    require(!suits({.vision = true, .vision_residency = VisionResidency::Overlay}),
+            "auto took the table out of the memory a Vision overlay window borrows");
+    // A margin far above the 68 KiB table keeps a host near the threshold from flaking.
+    const std::optional<std::uint64_t> available = available_host_memory_bytes();
+    const bool room = available && *available >= artifact::kPinnedHeadroomBytes + (256ULL << 20);
+    if (!serialized_copy_queue() && room) {
+        require(suits({}), "auto kept an untied table that only the gather reads on the device");
+    }
+}
+
 // The DFlash, DFlash2 and DSpine drafters predict the official 248320-row vocabulary's ids, so a
 // model with another vocabulary (a condensed GGUF's, here the fixture's 272 rows) refuses them by
 // name before reading a drafter, and loads without one.
@@ -512,6 +547,7 @@ int main() {
         native_uses();
         input_gathers();
         bf16_head_beside_gguf_blocks();
+        automatic_embedding_residency();
         drafters_need_the_official_vocabulary();
         vision_direct_format();
         invalid_model_data();
