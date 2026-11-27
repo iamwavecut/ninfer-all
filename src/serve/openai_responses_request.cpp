@@ -574,7 +574,7 @@ enum class AssistantInputPhase {
 
 [[noreturn]] void invalid_assistant_history(std::size_t index, std::string message) {
     bad_request("input Item " + std::to_string(index) + " " + std::move(message) +
-                    "; supported assistant Item order is reasoning, message content, then "
+                    "; supported assistant Item order is reasoning and message content, then "
                     "function calls",
                 "input", "invalid_assistant_history");
 }
@@ -589,9 +589,12 @@ struct AssistantInputRun {
             phase                  = AssistantInputPhase::Reasoning;
             return;
         case AssistantInputPhase::Reasoning:
-            invalid_assistant_history(index, "reasoning cannot follow another reasoning Item");
         case AssistantInputPhase::Content:
-            invalid_assistant_history(index, "reasoning cannot follow assistant message content");
+            // A response whose model reasoned after its content streams a reasoning Item after the
+            // message (and content after that in another message): the Items return its reasoning
+            // and its content in pieces, which join in order, as the response's own texts did.
+            turn.reasoning_content += reasoning;
+            return;
         case AssistantInputPhase::Calls:
             if (!lenient_) {
                 invalid_assistant_history(index, "reasoning cannot follow function_call Items");
