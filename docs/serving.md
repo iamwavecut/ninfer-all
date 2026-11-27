@@ -324,7 +324,14 @@ its Engine, host caches and retained conversations and gives back its device mem
 about two seconds where a cold load takes over ten (27B, RTX 3090: 1.8 s against 11.6 s), and its
 retained conversations reuse their prefixes as before. A model with requests in flight is never put
 to sleep or unloaded under them: the request that needs the room waits for them to finish (up to
-ten minutes, then 503). `--sleep-idle-seconds N` puts a model idle for N seconds to sleep (it needs
+ten minutes, then 503). When every loaded model has requests in flight and the request has waited
+`--models-switch-seconds N` (default 30), the least recently used busy model that has been loaded
+for `--models-hold-seconds N` (default 60) drains: it takes no new requests, which wait as for a
+model that is not loaded, finishes the ones it runs, and then makes way, and the room it leaves goes
+to the model the waiting request asked for before any other. A model under constant load so lets
+the others in after the switch delay plus its longest running request, and the hold time keeps two
+loaded models from changing places on every request. `--models-switch-seconds 0` never drains a
+model. `--sleep-idle-seconds N` puts a model idle for N seconds to sleep (it needs
 `--model-suspend`) and `--unload-idle-seconds N` unloads one; both apply to a single-model server
 too. Only requests count as use: polling a model's state (`/props`, `/metrics`, `/slots`) does not
 keep it awake. A model whose Engine fails Engine-wide is unloaded and loads again on its next request
@@ -332,7 +339,7 @@ keep it awake. A model whose Engine fails Engine-wide is unloaded and loads agai
 
 | Method and path | Behavior |
 |---|---|
-| `GET /models` | every catalog model: `status.value` (`unloaded`, `loading`, `loaded`, `sleeping`, `unloading`), `status.args` (its serve arguments), `status.failed` and `status.error` after a failed load, `aliases`, `path`; a loaded or sleeping model adds the fields of [`GET /v1/models`](#models) |
+| `GET /models` | every catalog model: `status.value` (`unloaded`, `loading`, `loaded`, `sleeping`, `unloading`), `status.args` (its serve arguments), `status.draining` while a loaded model takes no new requests to make way for another, `status.failed` and `status.error` after a failed load, `aliases`, `path`; a loaded or sleeping model adds the fields of [`GET /v1/models`](#models) |
 | `POST /models/load` | `{"model": "<id>"}`: load the model, or wake it when it sleeps |
 | `POST /models/unload` | `{"model": "<id>"}`: unload it once its requests have finished |
 | `POST /models/sleep` | `{"model": "<id>"}`: NInfer's addition, put an idle model to sleep; `409 model_busy` while it has requests |

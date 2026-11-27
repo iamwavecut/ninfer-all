@@ -1211,8 +1211,9 @@ ModelDescription HttpServer::model_description(const ModelRegistry::Lease& lease
                          .vision        = facts.vision,
                          .metadata      = facts.metadata};
     if (const auto status = registry_->status(lease.model())) {
-        out.status  = model_state_name(status->state);
-        out.aliases = status->aliases;
+        out.status   = model_state_name(status->state);
+        out.aliases  = status->aliases;
+        out.draining = status->draining;
     }
     out.path = lease.service().options().artifact_path;
     return out;

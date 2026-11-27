@@ -147,7 +147,8 @@ void ModelRegistry::put_to_sleep_locked(std::unique_lock<std::mutex>& lock, std:
         publish_locked(index);
         std::rethrow_exception(failure);
     }
-    slot.state = ModelState::Sleeping;
+    slot.state    = ModelState::Sleeping;
+    slot.draining = false;
     publish_locked(index);
 }
 
@@ -161,15 +162,51 @@ void ModelRegistry::unload_locked(std::unique_lock<std::mutex>& lock, std::size_
     // device and host memory.
     service.reset();
     lock.lock();
-    slot.state = ModelState::Unloaded;
+    slot.state    = ModelState::Unloaded;
+    slot.draining = false;
     publish_locked(index);
 }
 
 bool ModelRegistry::make_room_locked(std::unique_lock<std::mutex>& lock, std::size_t keep,
                                      Clock::time_point deadline) {
+    const Clock::time_point switch_at = Clock::now() + policy_.switch_after;
+    // The model this request drained, which it gives back should it stop waiting.
+    std::optional<std::size_t> drained;
+    const auto give_up = [&] {
+        if (drained) {
+            if (models_[*drained].draining) {
+                models_[*drained].draining = false;
+                publish_locked(*drained);
+            }
+            reserved_.reset();
+            changed_.notify_all();
+        }
+        return false;
+    };
     for (;;) {
-        if (stopping_) { return false; }
-        if (policy_.models_max == 0 || loaded_count_locked() < policy_.models_max) { return true; }
+        if (stopping_) { return give_up(); }
+        // Another request for the same model got there first: the caller waits for its load.
+        const ModelState wanted = models_[keep].state;
+        if (wanted == ModelState::Loading || wanted == ModelState::Loaded) {
+            if (reserved_ == keep) { reserved_.reset(); }
+            return true;
+        }
+        // The room a drained model leaves belongs to the model it was drained for: another
+        // request waits until that one has taken it.
+        if (reserved_ && *reserved_ != keep) {
+            if (changed_.wait_until(lock, deadline) == std::cv_status::timeout &&
+                Clock::now() >= deadline) {
+                return false;
+            }
+            continue;
+        }
+        if (policy_.models_max == 0 || loaded_count_locked() < policy_.models_max) {
+            if (reserved_) {
+                reserved_.reset();
+                changed_.notify_all();
+            }
+            return true;
+        }
         std::optional<std::size_t> victim;
         for (std::size_t index = 0; index < models_.size(); ++index) {
             const Slot& slot = models_[index];
@@ -195,7 +232,40 @@ bool ModelRegistry::make_room_locked(std::unique_lock<std::mutex>& lock, std::si
             unload_locked(lock, *victim);
             continue;
         }
-        if (changed_.wait_until(lock, deadline) == std::cv_status::timeout) { return false; }
+        // Every loaded model is busy. Past switch_after, drain the least recently used one loaded
+        // for hold_min, unless one drains already; until then wait for a lease to end.
+        const Clock::time_point now = Clock::now();
+        Clock::time_point wake      = deadline;
+        if (policy_.switch_after.count() > 0 && !reserved_) {
+            if (now >= switch_at) {
+                std::optional<std::size_t> busy;
+                Clock::time_point held_until = deadline;
+                for (std::size_t index = 0; index < models_.size(); ++index) {
+                    const Slot& slot = models_[index];
+                    if (index == keep || slot.state != ModelState::Loaded) { continue; }
+                    const Clock::time_point free_at = slot.loaded_at + policy_.hold_min;
+                    if (free_at > now) {
+                        held_until = std::min(held_until, free_at);
+                        continue;
+                    }
+                    if (!busy || slot.last_used < models_[*busy].last_used) { busy = index; }
+                }
+                if (busy) {
+                    models_[*busy].draining = true;
+                    drained                 = busy;
+                    reserved_               = keep;
+                    publish_locked(*busy);
+                    continue;
+                }
+                wake = held_until;
+            } else {
+                wake = std::min(deadline, switch_at);
+            }
+        }
+        if (changed_.wait_until(lock, wake) == std::cv_status::timeout &&
+            Clock::now() >= deadline) {
+            return give_up();
+        }
     }
 }
 
@@ -249,7 +319,7 @@ void ModelRegistry::make_loaded_locked(std::unique_lock<std::mutex>& lock, std::
         done.state  = ModelState::Loaded;
         done.failed = false;
         done.last_error.clear();
-        done.last_used = Clock::now();
+        done.last_used = done.loaded_at = Clock::now();
         publish_locked(index);
         return;
     }
@@ -261,6 +331,17 @@ ModelRegistry::Lease ModelRegistry::acquire(std::string_view model, std::optiona
     Slot& slot              = models_[index];
     if (slot.state == ModelState::Sleeping && slot.held) {
         throw ModelNotLoaded("model '" + slot.definition.id + "' is suspended");
+    }
+    if (slot.state == ModelState::Loaded && slot.draining) {
+        // It makes way for a waiting model first, then loads again for this request.
+        const Clock::time_point deadline = Clock::now() + policy_.room_timeout;
+        while (slot.state == ModelState::Loaded && slot.draining) {
+            if (stopping_) { throw ModelLoadFailed("the server is stopping"); }
+            if (changed_.wait_until(lock, deadline) == std::cv_status::timeout) {
+                throw ModelLoadFailed("model '" + slot.definition.id +
+                                      "' is making way for another model");
+            }
+        }
     }
     if (slot.state != ModelState::Loaded) {
         if (!autoload.value_or(policy_.autoload)) {
@@ -353,7 +434,8 @@ ModelStatusSnapshot ModelRegistry::snapshot_locked(const Slot& slot) const {
                                .last_error = slot.last_error,
                                .leases     = slot.leases,
                                .last_used  = slot.last_used,
-                               .held       = slot.held};
+                               .held       = slot.held,
+                               .draining   = slot.draining};
 }
 
 std::vector<ModelStatusSnapshot> ModelRegistry::status() const {

@@ -152,6 +152,11 @@ struct ServeOptions {
     // zero keeps it loaded. Both modes.
     std::uint32_t sleep_idle_seconds  = 0;
     std::uint32_t unload_idle_seconds = 0;
+    // Router: seconds a request waits for room before the least recently used busy model stops
+    // taking requests and makes way once its own are done (zero: never), and the seconds a model
+    // stays loaded before it may be made to.
+    std::uint32_t models_switch_seconds = 30;
+    std::uint32_t models_hold_seconds   = 60;
     // The option layers after the artifact path (configuration files, then the command line),
     // router options removed: what router mode starts each model with.
     std::vector<product::ArgumentLayer> model_layers;

@@ -62,6 +62,8 @@ struct ModelDescription {
     std::vector<std::string> aliases;
     bool failed = false;
     std::string last_error;
+    // A router's loaded model that takes no new requests until it has made way for another.
+    bool draining = false;
 };
 
 std::string make_models_list(const ModelDescription& model, std::int64_t created);

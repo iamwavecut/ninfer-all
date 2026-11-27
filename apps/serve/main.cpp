@@ -413,7 +413,9 @@ int main(int argc, char** argv) {
                 .models_max  = options.models_max,
                 .autoload    = options.models_autoload,
                 .sleep_idle  = std::chrono::seconds(options.sleep_idle_seconds),
-                .unload_idle = std::chrono::seconds(options.unload_idle_seconds)},
+                .unload_idle  = std::chrono::seconds(options.unload_idle_seconds),
+                .switch_after = std::chrono::seconds(options.models_switch_seconds),
+                .hold_min     = std::chrono::seconds(options.models_hold_seconds)},
             [&](const ninfer::serve::ModelDefinition& definition)
                 -> std::unique_ptr<ninfer::serve::ModelService> {
                 if (first) {

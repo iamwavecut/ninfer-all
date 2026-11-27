@@ -282,6 +282,7 @@ namespace {
 Json model_status_json(const ModelDescription& model) {
     Json status = {{"value", model.status}};
     if (!model.args.empty()) { status["args"] = model.args; }
+    if (model.draining) { status["draining"] = true; }
     if (model.failed) {
         status["failed"] = true;
         if (!model.last_error.empty()) { status["error"] = model.last_error; }
