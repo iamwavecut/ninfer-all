@@ -915,12 +915,12 @@ Migel Tissera's [Tess-4.5-26B-A3B](https://huggingface.co/migtissera/Tess-4.5-26
 agentic-coding fine-tune of Inkling 2 Mini. Its
 [NVFP4 GGUF](https://huggingface.co/migtissera/Tess-4.5-26B-A3B-GGUF) converts like the other
 quantizations ([converting](#converting)). The
-[published artifact](https://huggingface.co/WaveCut/Tess-4.5-26B-A3B-NVFP4-NInfer-v3) (17.6 GiB)
-keeps that GGUF byte for byte, with incoai's DFlash2 drafter of the base model and two side
-components re-quantized from the repository's BF16 files: the DSpark drafter in IQ4_NL (373 MB,
-749 in BF16), and the vision tower in IQ4_NL by block-wise GPTQ with its attention value and output
-projections in Q8_0 (212 MB, 642 in BF16). On a rented RTX 3090 (350 W, PCIe 4.0 x16), November 27,
-2026, one run each:
+[published artifact](https://huggingface.co/WaveCut/Tess-4.5-26B-A3B-NVFP4-NInfer-v3) (17.7 GiB)
+keeps that GGUF byte for byte, with incoai's DFlash2 drafter of the base model, ggml-org's Q8_0
+vision tower, as in the Inkling 2 Mini artifacts (Tess's BF16 tower equals the base's, and the
+Q8_0 matrices are its Q8_0 form), and the DSpark drafter re-quantized to IQ4_NL from the
+repository's BF16 file (373 MB, 749 in BF16). On a rented RTX 3090 (350 W, PCIe 4.0 x16), November
+27, 2026, one run each:
 
 | Prompt, greedy, up to 384 tokens | `--spec none` | DSpark (a round) | DFlash2, `--draft-min-p 0.5` | Host experts, DSpark |
 |---|---:|---:|---:|---:|
@@ -930,16 +930,17 @@ projections in Q8_0 (212 MB, 642 in BF16). On a rented RTX 3090 (350 W, PCIe 4.0
 | question in Russian | 116.2 | 113.1 (1.67) | 112.1 | 107.1 |
 
 - **Text.** Every drafted and host-memory run wrote its `--spec none` twin's text. In Russian both
-  drafters decode about 3% slower than `--spec none`.
+  drafters decode about 3% slower than `--spec none`. The speeds were measured on a file with a
+  4-bit tower, whose objects outside the tower equal the published file's byte for byte; from the
+  published file release `2026-11-27.5` wrote the same text with `--spec none`, DSpark and DFlash2.
 - **Drafter quantization.** At 7 drafts a round over the four prompts the IQ4_NL drafter had 666 of
   3,637 drafts accepted, the BF16 drafter 667 of 3,628, Q8_0 666 of 3,635 and Q4_K 662 of 3,663.
-- **Vision tower.** Against the BF16 tower's output rows on nine images: a mean cosine of 0.99436,
-  a first percentile of 0.964 and a relative RMS error of 9.1%; all matrices in IQ4_NL give 11.5%
-  (19.3% without GPTQ) and a Q8_0 tower 2.3%. On the five rendered images the greedy answers equal
-  the BF16 tower's.
+- **Vision tower.** Against the BF16 tower's output rows on nine images the Q8_0 tower has a mean
+  cosine of 0.99965, a first percentile of 0.9970 and a relative RMS error of 2.3%; on the five
+  rendered images its greedy answers state the same facts as the BF16 tower's.
 - **Memory.** 16.4 GiB of weights on the GPU, 16.8 GiB with DSpark; one sequence of 8,192 tokens
   plans 18.0 and 18.4 GiB of the GPU. With `--vision --max-context 65536` the server leaves
-  2.76 GiB of the card free.
+  2.64 GiB of the card free.
 - **Not measured.** No perplexity and no task benchmark. The GGUF was compared with the checkpoint
   on two experts of layers 0 and 20 only: layer 0's NVFP4 values are equal, layer 20's Q8_0 differs
   from the checkpoint's MXFP8 by 0.54-0.55% relative RMS.
