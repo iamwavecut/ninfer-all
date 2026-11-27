@@ -49,7 +49,8 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   output, tool calls in Gemma's
   `<|tool_call>call:NAME{...}<tool_call|>` form returned as OpenAI tool calls (a forced
   `tool_choice` ends the generation prompt with Gemma's own opener, `<|tool_call>call:NAME{`, so
-  the model continues with the arguments; see [forced selection](serving.md#function-tools)),
+  the model continues with the arguments; see [forced selection](serving.md#function-tools); a
+  call the model opens before it closes its thought ends the thought and is returned as a call),
   streaming, reasoning in its own channel when thinking is on, and causal scoring
   (`ninfer-perplexity`).
 - **Dependent launches.** On sm_90 and newer cards the decode graph launches each kernel as a
@@ -105,6 +106,24 @@ python -m tools.convert --model models/gemma4/hf --recipe gemma4_gguf \
 ```
 
 The conversion takes under three minutes and writes one 14.5 GB `.ninfer` file.
+
+The stored `tokenizer.json` carries Google's glitch-token remediation. The Gemma 4 releases share
+one tokenizer, and Google patched it in E2B, E4B and 12B
+([E2B-it #51](https://huggingface.co/google/gemma-4-E2B-it/discussions/51),
+[E4B-it #50](https://huggingface.co/google/gemma-4-E4B-it/discussions/50),
+[12B-it #55](https://huggingface.co/google/gemma-4-12B-it/discussions/55)) but not in 26B-A4B or
+31B: tokens whose embeddings collapsed to nearly one vector (`CYCLONEDB`, `drawingCodehint`) lose
+the BPE merges that build them, so their text encodes as trained subwords, and the one
+single-character token among them, `𡉺`, becomes `<glitch_pruned_249788>`, so the character falls
+back to its UTF-8 bytes. The converter applies the union of the three patches
+([`gemma4_glitch_tokens.json`](../tools/convert/gemma4_glitch_tokens.json): 298 merges of 260
+tokens and the one renamed token); applying one patch's list alone reproduces Google's file for that
+model byte for byte. In the 26B-A4B and 31B QAT token tables these 261 tokens sit in the same
+cluster: their cosine to its centroid is 0.869 to 0.999 (median 0.981 and 0.998), against a median of
+0.155 and 0.076 for random tokens. Token ids and the vocabulary stay; 257 of the 261 strings now
+encode differently (the other 4 were already encoded through other tokens), and 2.27 million tokens
+of WikiText, C++ and Markdown encode exactly as before. The artifact's provenance records the edit
+(`resource_edits`).
 
 The assistant joins as the artifact's `mtp` component from a llama.cpp `gemma4-assistant` GGUF.
 The QAT model takes the QAT assistant (Google's model card: a QAT target needs a QAT drafter);

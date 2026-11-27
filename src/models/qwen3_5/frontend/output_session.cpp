@@ -640,8 +640,14 @@ public:
         if (inkling) {
             return token != inkling->end && token != inkling->header && !inkling->content(token);
         }
-        if (flint) { return token != flint->think_close; }
-        if (gemma) { return token != gemma->channel_close; }
+        if (flint) {
+            return token != flint->think_close &&
+                   (token != flint->call_open || !flint_tools.has_value());
+        }
+        if (gemma) {
+            return token != gemma->channel_close &&
+                   (token != gemma->call_open || !gemma_tools.has_value());
+        }
         return false;
     }
 
@@ -1151,11 +1157,18 @@ OutputSession::preview_tokens(std::span<const TokenId> tokens, std::uint32_t tot
                 }
             } else if (token == markers.channel_close) {
                 bytes = decoder.in_reasoning ? std::string_view("</think>\n") : std::string_view{};
+            } else if (token == markers.call_open && decoder.in_reasoning &&
+                       impl_->gemma_tools.has_value()) {
+                // The model may open a call without closing its thought: the call ends the
+                // reasoning, as <channel|> would, and the call decoder reads it from the content.
+                static const std::string kCloseThenCall =
+                    std::string(kReasoningClose) + std::string(fi::kGemmaCallOpen);
+                bytes = kCloseThenCall;
             } else if (markers.markup(token)) {
                 bytes = decoded.bytes;
             }
             if (thinking.loop != ReasoningLoopAction::Off && !thinking.loop_detected &&
-                decoder.in_reasoning && token != markers.channel_close) {
+                decoder.in_reasoning && impl_->thinking_body(token)) {
                 append_words(bytes, thinking.loop_partial, thinking.loop_round);
                 append_tail(bytes, thinking.loop_tail);
             }
@@ -1171,9 +1184,15 @@ OutputSession::preview_tokens(std::span<const TokenId> tokens, std::uint32_t tot
             } else if (token == markers.think_close && decoder.in_reasoning) {
                 // The close marker followed by a line break closes the channel at once.
                 bytes = std::string_view("</think>\n");
+            } else if (token == markers.call_open && decoder.in_reasoning &&
+                       impl_->flint_tools.has_value()) {
+                // A call opened before </think> ends the reasoning, as Gemma's does.
+                static const std::string kCloseThenCall =
+                    std::string(kReasoningClose) + std::string(fi::kFlintCallOpen);
+                bytes = kCloseThenCall;
             }
             if (thinking.loop != ReasoningLoopAction::Off && !thinking.loop_detected &&
-                decoder.in_reasoning && token != markers.think_close) {
+                decoder.in_reasoning && impl_->thinking_body(token)) {
                 append_words(bytes, thinking.loop_partial, thinking.loop_round);
                 append_tail(bytes, thinking.loop_tail);
             }

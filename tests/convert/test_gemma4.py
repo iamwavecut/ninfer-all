@@ -463,3 +463,74 @@ def test_a_vision_source_of_another_projector_or_wider_values_is_refused(tmp_pat
                 hidden_size=2 * VISION)), target)
         with pytest.raises(ValueError):
             gemma4.vision_config(vision, _hf_config(), dict(target, hidden_size=2 * HIDDEN))
+
+
+def _gemma_tokenizer(merges, glyph="\U0002127A"):
+    """A Gemma 4 shaped tokenizer.json: the release's formatting, its renamed token's id and the
+    pieces of the listed merges in the vocabulary."""
+    vocab = {"<pad>": 0, "<eos>": 1, "<bos>": 2}
+    for left, right in merges:
+        for token in (left, right, left + right):
+            vocab.setdefault(token, len(vocab))
+    vocab[glyph] = 249788
+    vocab["tail"] = 249789
+    tokenizer = {"version": "1.0", "added_tokens": [],
+                 "model": {"type": "BPE", "byte_fallback": True, "vocab": vocab,
+                           "merges": [list(merge) for merge in merges]}}
+    return json.dumps(tokenizer, ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def test_the_glitch_tokens_lose_their_merges_and_the_glyph_its_name():
+    patch = json.loads(gemma4.GLITCH_TOKENS.read_text(encoding="utf-8"))
+    listed = [tuple(merge) for merge in patch["removed_merges"][:3]]
+    data = _gemma_tokenizer([("ab", "cd")] + listed + [("ef", "gh")])
+    patched, edit = gemma4.remediate_glitch_tokens(data)
+    assert edit == {"removed_merges": 3, "renamed_tokens": 1}
+    model = json.loads(patched)["model"]
+    # Merges outside the list stay in their order; listed merges go.
+    assert model["merges"] == [["ab", "cd"], ["ef", "gh"]]
+    # Every id keeps its token or placeholder, and the renamed entry its place.
+    original = json.loads(data)["model"]["vocab"]
+    assert list(model["vocab"].values()) == list(original.values())
+    assert "\U0002127A" not in model["vocab"]
+    assert model["vocab"]["<glitch_pruned_249788>"] == 249788
+    assert list(model["vocab"])[-2] == "<glitch_pruned_249788>"
+    # The release's formatting: one remediation written over another changes nothing.
+    assert patched == json.dumps(json.loads(patched), ensure_ascii=False, indent=2).encode()
+    again, edit = gemma4.remediate_glitch_tokens(patched)
+    assert again == patched and edit == {"removed_merges": 0, "renamed_tokens": 0}
+
+
+def test_a_tokenizer_whose_renamed_id_names_another_token_is_refused():
+    data = _gemma_tokenizer([], glyph="x")
+    with pytest.raises(ValueError, match="249788"):
+        gemma4.remediate_glitch_tokens(data)
+
+
+def test_the_artifact_stores_the_remediated_tokenizer_and_records_the_edit(tmp_path):
+    from tools.artifact.reader import Artifact
+    from tools.convert.pipeline import convert
+    from tools.convert.recipe import Recipe
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, path, _ = _release(tmp_path)
+    patch = json.loads(gemma4.GLITCH_TOKENS.read_text(encoding="utf-8"))
+    tokenizer = json.loads((hf / "tokenizer.json").read_text())
+    merge = patch["removed_merges"][0]
+    for index, token in enumerate((merge[0], merge[1], merge[0] + merge[1])):
+        tokenizer["model"]["vocab"].pop(f"t{index}")
+        tokenizer["model"]["vocab"][token] = index
+    tokenizer["model"]["merges"] = [merge, ["t3", "t4"]]
+    (hf / "tokenizer.json").write_text(json.dumps(tokenizer))
+    output = tmp_path / "gemma.ninfer"
+    with SafetensorsSource(hf) as base, GGUFFile(path) as gguf:
+        model = gemma4.build_model(base, gguf)
+        recipe = Recipe(model)
+        gemma4.gemma4_gguf(model, recipe, {"base": base, "gguf": gguf})
+        convert(model, recipe, output, device="cpu",
+                provenance={"resource_edits": model.resource_edits})
+    with Artifact(output) as artifact:
+        stored = json.loads(artifact.read_object("resource/text/tokenizer.json"))
+        assert stored["model"]["merges"] == [["t3", "t4"]]
+        assert artifact.directory.provenance["resource_edits"] == {
+            "tokenizer.json": {"glitch_tokens": {"removed_merges": 1, "renamed_tokens": 0}}}

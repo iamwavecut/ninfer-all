@@ -7,7 +7,8 @@
 //
 // Thinking control: a thinking budget counts the tokens of the thought channel the model opens,
 // stops a round at the budget's last token, closes the channel with the guidance and <channel|>,
-// and bans <|channel> for the rest of the response.
+// and bans <|channel> for the rest of the response. A call the model opens before it closes its
+// thought ends the thought when the request declared tools.
 
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/gemma_output.h"
@@ -430,6 +431,61 @@ void test_bad_words_rewind() {
     }
 }
 
+// A call the model opens before it closes its thought: with tools declared the call ends the
+// reasoning, as <channel|> would, and becomes a structured call; without tools its markup stays in
+// the reasoning, as before.
+void test_call_in_open_thought() {
+    constexpr ninfer::TokenId kCallOpenId = 260, kCallCloseId = 261, kQuoteId = 262;
+    const auto frontend = gemma_frontend();
+    for (const bool tools : {true, false}) {
+        ninfer::PromptInput input;
+        input.messages.push_back(
+            {.role  = ninfer::ChatRole::User,
+             .parts = {{.kind = ninfer::MessagePartKind::Text, .text = "Weather?"}}});
+        input.options.continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
+        if (tools) {
+            input.options.tool_jsons = {
+                R"({"type":"function","function":{"name":"get_weather","parameters":)"
+                R"({"type":"object","properties":{"city":{"type":"string"}}}}})"};
+        }
+        const auto prompt = frontend.prepare(std::move(input));
+        auto session      = frontend.make_output_session(
+            prompt, {}, ninfer::OutputOptions{.tool_name_max_length = 64});
+        std::string reasoning, content;
+        const auto take = [&](const auto& deltas) {
+            for (const ninfer::OutputDelta& delta : deltas) {
+                (delta.channel == ninfer::OutputChannel::Reasoning ? reasoning : content) +=
+                    delta.text;
+            }
+        };
+        std::vector<ninfer::TokenId> tokens = tokens_of({kChannelOpenId}, "thought\nPlan");
+        for (const ninfer::TokenId id : tokens_of({kCallOpenId}, "call:get_weather{city:")) {
+            tokens.push_back(id);
+        }
+        tokens.push_back(kQuoteId);
+        for (const char byte : std::string_view("Oslo")) {
+            tokens.push_back(static_cast<unsigned char>(byte));
+        }
+        tokens.insert(tokens.end(), {kQuoteId, '}', kCallCloseId, kEosId});
+        (void)session.preview_model(tokens, 256, ninfer::FinishReason::OutputLimit);
+        take(session.commit_preview());
+        const auto calls = session.take_tool_calls();
+        if (tools) {
+            expect(reasoning == "Plan" && content.empty() && calls.size() == 1 &&
+                       calls[0].name == "get_weather" &&
+                       nlohmann::json::parse(calls[0].arguments_json) ==
+                           nlohmann::json({{"city", "Oslo"}}),
+                   "a call in an open thought ends it: reasoning '" + reasoning + "', content '" +
+                       content + "', calls " + std::to_string(calls.size()));
+        } else {
+            expect(reasoning.starts_with("Plan<|tool_call>call:get_weather") && content.empty() &&
+                       calls.empty(),
+                   "without tools the markup stays reasoning: reasoning '" + reasoning +
+                       "', content '" + content + "'");
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -614,6 +670,7 @@ int main() {
         test_thinking_control();
         test_bad_words();
         test_bad_words_rewind();
+        test_call_in_open_thought();
     } catch (const std::exception& error) {
         std::cerr << "FAIL " << error.what() << '\n';
         ++failures;
