@@ -17,6 +17,7 @@
 #include "models/divided_head.h"
 #include "models/dspine/runtime.h"
 #include "ninfer/ops/linear_policy.h"
+#include "ninfer/ops/sampling.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
@@ -437,6 +438,9 @@ struct Executor::Impl {
         DeviceBuffer taps, ids, values, scratch;
         std::unique_ptr<PinnedHostBuffer> host;
         std::unique_ptr<CudaCompletionEvent> copied;
+        // Sampled drafts (ExecutorOptions::sampled_drafts): the row's config, then its keys.
+        DeviceBuffer sampling;
+        std::unique_ptr<PinnedHostBuffer> host_sampling;
     };
     std::optional<Drafter> drafter;
     // A standalone DSpine drafter (ExecutorOptions::dspine): its ring, table and features, and the
@@ -1091,6 +1095,11 @@ struct Executor::Impl {
         d.scratch = DeviceBuffer(kernels::markov_scratch_bytes());
         d.host    = std::make_unique<PinnedHostBuffer>(std::size_t(2 * d.block) * 4);
         d.copied  = std::make_unique<CudaCompletionEvent>(device);
+        if (options.sampled_drafts) {
+            const std::size_t bytes = sizeof(ops::SamplingConfig) + std::size_t(d.block) * 4;
+            d.sampling      = DeviceBuffer(bytes);
+            d.host_sampling = std::make_unique<PinnedHostBuffer>(bytes);
+        }
         kv_bytes += d.taps.bytes;
     }
 
@@ -1787,6 +1796,10 @@ struct Executor::Impl {
             const std::size_t r = std::min<std::size_t>(window, std::max<std::size_t>(t, n));
             seed_bytes = sum({r * std::size_t(drafter->targets) * h * 2, r * h * 4, r * h * 2,
                               r * drafter->layers.size() * kLatent * 4, r * 4});
+            if (options.sampled_drafts) { // a sampled step's scores and its sampler
+                seed_bytes += sum({std::size_t(drafter->domain) * 4,
+                                   ops::sampling_workspace_capacity_bytes(drafter->domain, 1, 1)});
+            }
         }
         return pass + std::max({engram_bytes, attention, ffn, head_bytes}) + seed_bytes + gguf_scratch +
                stq_scratch + allocations * kAlign + (32u << 20);
@@ -2957,9 +2970,10 @@ struct Executor::Impl {
 
     // The drafter's block over staged rows (the anchor, then the noise token, at the sequence's
     // next positions; then each row's visible position, the block's last): its blocks, the head
-    // over the final norm of the collapsed streams, the Markov chain's greedy drafts and their
-    // confidences, copied to the pinned buffer.
-    void draft_pass(int b) {
+    // over the final norm of the collapsed streams, the Markov chain's greedy drafts (`sampled`:
+    // its draws with the staged config and keys) and their confidences, copied to the pinned
+    // buffer.
+    void draft_pass(int b, bool sampled) {
         Drafter& d = *drafter;
         workspace->reset();
         auto scope     = workspace->scope();
@@ -2993,9 +3007,24 @@ struct Executor::Impl {
         project(x, head, plane, vocab);
         auto* ids = static_cast<std::int32_t*>(d.ids.p);
         CUDA_CHECK(cudaMemcpyAsync(ids, d_tokens.p, 4, cudaMemcpyDeviceToDevice, stream));
-        for (int i = 0; i < b; ++i) {
-            kernels::markov_step(plane + std::size_t(i) * vocab, d.markov_head, d.markov_embed, d.domain,
-                                 ids, i, d.scratch.p, stream);
+        if (!sampled) {
+            for (int i = 0; i < b; ++i) {
+                kernels::markov_step(plane + std::size_t(i) * vocab, d.markov_head, d.markov_embed,
+                                     d.domain, ids, i, d.scratch.p, stream);
+            }
+        } else {
+            auto* scores        = alloc<float>(std::size_t(d.domain));
+            const auto* configs = static_cast<const ops::SamplingConfig*>(d.sampling.p);
+            auto* keys          = reinterpret_cast<std::int32_t*>(
+                static_cast<std::byte*>(d.sampling.p) + sizeof(ops::SamplingConfig));
+            const Tensor row(scores, DType::FP32, {d.domain, 1});
+            for (int i = 0; i < b; ++i) {
+                kernels::markov_scores(plane + std::size_t(i) * vocab, d.markov_head, d.markov_embed,
+                                       d.domain, ids, i, scores, stream);
+                Tensor drawn(ids + i + 1, DType::I32, {1});
+                ops::sample(row, drawn, d.domain, configs, Tensor(keys + i, DType::I32, {1}),
+                            ops::kSamplePurposeDecode, *workspace, stream);
+            }
         }
         kernels::dspark_confidence(h, pre, b, streams, hidden, d.confidence, d.markov_embed, ids,
                                    static_cast<float*>(d.values.p), stream);
@@ -3006,7 +3035,8 @@ struct Executor::Impl {
     }
 
     void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
-               std::span<float> confidence) {
+               std::span<float> confidence, const ops::SamplingConfig* sampler = nullptr,
+               std::int32_t length = 0) {
         if (!drafter) { throw std::logic_error("deepseek_v41 draft: no DSpark drafter"); }
         Drafter& d  = *drafter;
         const int b = d.block;
@@ -3026,7 +3056,26 @@ struct Executor::Impl {
             pos[std::size_t(b + i)] = std::int32_t(first) + b - 1;
         }
         stage(tokens, pos, seq);
-        run_graph(32 + std::uint32_t(b), [&] { draft_pass(b); });
+        const bool sampled =
+            options.sampled_drafts && sampler != nullptr && sampler->temperature > 0.0F;
+        if (sampled) {
+            // The target's own draw of draft i's position is keyed (seed, length + i + 1).
+            auto* host            = static_cast<std::byte*>(d.host_sampling->data());
+            ops::SamplingConfig c = *sampler;
+            c.presence_penalty    = 0.0F;
+            c.frequency_penalty   = 0.0F;
+            c.token_counts        = nullptr;
+            c.token_mask          = nullptr;
+            c.token_mask_stride   = 0;
+            c.non_finite_token    = 0;
+            std::memcpy(host, &c, sizeof(c));
+            auto* keys = reinterpret_cast<std::int32_t*>(host + sizeof(c));
+            for (int i = 0; i < b; ++i) { keys[i] = length + i + 1; }
+            CUDA_CHECK(cudaMemcpyAsync(d.sampling.p, host, sizeof(c) + std::size_t(b) * 4,
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        run_graph((sampled ? 0x10000U : 0U) | (32 + std::uint32_t(b)),
+                  [&] { draft_pass(b, sampled); });
         d.copied->record(stream);
         d.copied->synchronize();
         const auto* host = static_cast<const std::int32_t*>(d.host->data());
@@ -3727,6 +3776,11 @@ struct Executor::Impl {
                 std::vector<std::int32_t> drafts(std::size_t(drafter->block));
                 std::vector<float> confidence(drafts.size());
                 draft(0, 2, drafts, confidence);
+                if (options.sampled_drafts) {
+                    ops::SamplingConfig sampler;
+                    sampler.temperature = 1.0F;
+                    draft(0, 2, drafts, confidence, &sampler, 1);
+                }
                 reset_state(0);
             }
         }
@@ -4007,8 +4061,9 @@ std::uint32_t Executor::dspark_block() const noexcept {
 }
 
 void Executor::draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
-                     std::span<float> confidence) {
-    impl_->draft(sequence, anchor, drafts, confidence);
+                     std::span<float> confidence, const ops::SamplingConfig* sampler,
+                     std::int32_t length) {
+    impl_->draft(sequence, anchor, drafts, confidence, sampler, length);
 }
 
 void Executor::draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,

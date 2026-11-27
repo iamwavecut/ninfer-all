@@ -478,7 +478,9 @@ model:
 - **A round.** The drafter runs the last accepted token and four noise tokens through its three
   blocks in one pass (each row attends over the ring and over all five rows; the MoE routes each
   row to 3 of 128 experts beside a shared expert), adds a rank-256 Markov term of the previous token
-  to the backbone's head logits and takes each row's greedy token, so five rows give five drafts.
+  to the backbone's head logits and takes each row's greedy token (with `--gumbel-sampling`, a
+  sampled request's draw under the target's keyed noise,
+  [coupled draws](cli.md#speculative-decoding)), so five rows give five drafts.
   A confidence head scores each draft; the round keeps the drafts up to the first scored below
   `--draft-confidence` (0.5 by default, Strata's for this drafter; 0 keeps every draft), at most
   `--draft-tokens`, and with none decodes one token.

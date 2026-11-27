@@ -348,6 +348,10 @@ inline constexpr int kMarkovRank = 256;
 [[nodiscard]] std::size_t markov_scratch_bytes();
 void markov_step(const float* logits, const __nv_bfloat16* head, const __nv_bfloat16* embed,
                  int domain, std::int32_t* ids, int step, void* scratch, cudaStream_t stream);
+// A sampled step's scores: scores[v] = logits[v] + sum_r head[v][r] embed[ids[step]][r] for every
+// v < domain, the values markov_step takes the maximum of, for a sampler to draw ids[step + 1].
+void markov_scores(const float* logits, const __nv_bfloat16* head, const __nv_bfloat16* embed,
+                   int domain, const std::int32_t* ids, int step, float* scores, cudaStream_t stream);
 
 // The drafter's confidence of each row t: sigmoid(sum_i x[i] w[i] + sum_r embed[ids[t]][r]
 // w[hidden + r]) for the FP32 collapse x = sum_s pre[t][s] h[t][s] (h [T][S][H], pre [T][S]).

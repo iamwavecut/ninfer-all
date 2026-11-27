@@ -472,11 +472,14 @@ void spark_candidates(const float* base, std::int64_t stride, int vocab, int row
 //   joint  = W [state; embed[prev]; hidden[row]; context] + bias     (W FP32 [768][512 + 2 hidden])
 //   logits = cap tanh((base[row][v] + c[v] + M[v] tanh(joint[512:768])) / cap)
 //            over the row's candidates v (spark_candidates of the block's rows 1..)
-//   prev   = the first maximum (the lowest id among equal logits); confidence[row - 1] = its
-//            probability over the candidates; drafts[row - 1] = prev
+//   prev   = the first maximum (the lowest id among equal logits), or with `sampled` the id there;
+//            confidence[row - 1] = its probability over the candidates; drafts[row - 1] = prev
 //   state  = tanh(joint[256:512]) + sigmoid(joint[0:256]) (state - tanh(joint[256:512]))
 // The context is the ring row of the position before the block's first (rows.positions[0] - 1) of
 // rows.sequences[0]. `joint` and `logits` are scratch (spark_step_floats).
+// spark_step runs spark_score, then spark_take. A sampled step runs spark_score with `scores`, a
+// row of `vocab` floats that it fills with -inf beside the candidates' logits; the caller then
+// draws a candidate id from that row into `sampled` (one int on the device) and runs spark_take.
 struct SparkStepArgs {
     const float* weight = nullptr;
     const float* bias   = nullptr;
@@ -500,9 +503,14 @@ struct SparkStepArgs {
     float* confidence = nullptr;     // [block - 1]
     float* joint = nullptr;
     float* logits = nullptr;
+    float* scores = nullptr;                 // [vocab], a sampled step's row, or null
+    int vocab = 0;
+    const std::int32_t* sampled = nullptr;   // [1], a sampled step's draw, or null
 };
 [[nodiscard]] std::size_t spark_step_floats();
 void spark_step(const SparkStepArgs& args, cudaStream_t stream);
+void spark_score(const SparkStepArgs& args, cudaStream_t stream);
+void spark_take(const SparkStepArgs& args, cudaStream_t stream);
 
 // sums[i] += products[i] for i < n when *flag is nonzero: the 2^-32 fixed-point sums of the
 // routed experts the CPU computed for a call (ExpertDelivery), added as the expert kernels add

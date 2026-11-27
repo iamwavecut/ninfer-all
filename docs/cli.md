@@ -277,11 +277,12 @@ retained proposal distribution by rejection sampling.
 `--gumbel-sampling` draws each sampled token by Gumbel-max instead: the token whose logit plus
 keyed Gumbel noise (keyed by the seed, the position and the token) is largest. The tokens follow the
 same distribution, but a seed gives other tokens than the default draw, so the option is off by
-default. Drafts from an MTP block (Qwen3.5-core models, Qwen3.8-Flash-Next) and from Gemma 4's
-assistant then are the drafter's own draws under the same noise, so a draft and the target's draw
-agree wherever the two distributions agree. Whether the target keeps more of these drafts than of
-greedy ones depends on the drafter and the temperature: Qwen3.6-35B-A3B's MTP block kept fewer at
-0.7 and more at 1.0. DSpark and lookup drafts, and DSpine's outside the Qwen3.5 core, stay
+default. Drafts from an MTP block (Qwen3.5-core models, Qwen3.8-Flash-Next), from Gemma 4's
+assistant and from the DSpark drafters of Inkling 2 and DeepSeek-V4.1 then are the drafter's own
+draws under the same noise (Inkling 2's among each draft row's 16,384 candidates), so a draft and
+the target's draw agree wherever the two distributions agree. Whether the target keeps more of these
+drafts than of greedy ones depends on the drafter and the temperature: Qwen3.6-35B-A3B's MTP block
+kept fewer at 0.7 and more at 1.0. Lookup drafts, and DSpine's outside the Qwen3.5 core, stay
 greedy; DFlash2 and DSpine on Qwen3.5-core models keep their rejection sampling for the tokens they
 verify. A greedy request drafts and decodes as without the option (on Qwen3.6-35B-A3B, 3 of 3
 answers with the same bytes and log probabilities). One request, three prompts, seeds 1 to 3, 256
@@ -302,6 +303,18 @@ Qwen3.6-35B-A3B, an RTX 5090 (2026-11-12):
 With the option, Gemma 4's and Flash-Next's speculative answers were the bytes of their plain answers
 with the same seed (21 of 21 each); Qwen3.8-27B's and Qwen3.6-35B-A3B's differed as their greedy
 ones do, by the verification width's floating-point effect.
+
+Inkling 2 Mini UD-IQ4_XS with its experts in host memory, drawn DSpark drafts against the greedy
+drafts they replace, both with the option (the same prompts and seeds, RTX 4080, 2026-11-27):
+
+| Drafter | Temperature | Acceptance, greedy drafts | Acceptance, drawn drafts | tok/s, greedy drafts | tok/s, drawn drafts | Runs faster |
+|---|---|---|---|---|---|---|
+| DSpark, default draft count | 1.0 | 0.452 | 0.505 | 126.1 | 129.9 | 7 of 9 (-1.0% to +10.3%) |
+| `--spec dspark` | 1.0 | 0.166 | 0.183 | 94.1 | 98.2 | 7 of 9 (-2.8% to +12.1%) |
+| `--spec dspark` | 0.7 | 0.189 | 0.197 | 100.7 | 101.8 | 6 of 9 (-5.3% to +4.9%) |
+
+The answers were the same bytes in all 27 pairs. DeepSeek-V4.1's DSpark drafts take the same path
+and have no end-to-end measurement.
 
 ### Choosing a draft count
 
@@ -424,7 +437,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |
 | `--seed N` | sampling seed | `0` |
-| `--gumbel-sampling` | draw sampled tokens by Gumbel-max over keyed noise, and MTP-style drafts as the drafter's own draws under that noise ([coupled draws](#speculative-decoding)); a seed gives other tokens than the default draw | off |
+| `--gumbel-sampling` | draw sampled tokens by Gumbel-max over keyed noise, and MTP-style and DSpark drafts as the drafter's own draws under that noise ([coupled draws](#speculative-decoding)); a seed gives other tokens than the default draw | off |
 | `--lora FNAME[,...]`, `--lora-scaled FNAME:SCALE[,...]` | llama.cpp LoRA adapters that remove a residual direction, at scale 1 or the given scale ([adapters and control vectors](serving.md#lora-adapters-and-control-vectors)) | none |
 | `--lora-init-without-apply` | load the adapters at scale 0 | off |
 | `--control-vector FNAME[,...]`, `--control-vector-scaled FNAME:SCALE[,...]` | llama.cpp control vectors added to the residual, at scale 1 or the given scale | none |
