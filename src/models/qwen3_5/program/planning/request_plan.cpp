@@ -238,7 +238,7 @@ KVEntitlementShape ProgramImpl::kv_entitlement_shape() const noexcept {
 std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
     // A Device KV lease holds a bounded window of the output, not the whole budget, so lanes do
     // not compete for the pool up front: the remaining context stays the budget.
-    if (context_cache.kv_lease_growth) {
+    if (context_cache.kv_lease_growth.value_or(false)) {
         return prompt_tokens == 0 || prompt_tokens > capacity ? 0U
                                                               : capacity - prompt_tokens + 1U;
     }
@@ -415,7 +415,7 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     base->drafting = options.speculative_drafting || speculative_backend == SpeculativeBackend::None;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
-    if (!context_cache.kv_lease_growth) {
+    if (!context_cache.kv_lease_growth.value_or(false)) {
         // One formula with concurrent_output_budget (planning/output_budget.h).
         const KVPageEntitlement entitlement =
             kv_page_entitlement(kv_entitlement_shape(), base->summary.prompt_tokens,

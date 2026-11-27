@@ -9,7 +9,19 @@ namespace ninfer {
 
 using TokenId = std::int32_t;
 
-inline constexpr std::uint32_t kMaximumConcurrency               = 8;
+// Requests one Engine runs at once (--max-concurrency): ordinary decode rounds take up to this
+// many rows.
+inline constexpr std::uint32_t kMaximumConcurrency               = 64;
+
+// Rows of a speculative round (MTP, DFlash2, DSpine, lookup drafts): a speculative backend runs at
+// most this many requests at once.
+inline constexpr std::uint32_t kMaximumSpeculativeRows           = 8;
+
+// Device state images a context cache keeps by default past the active requests' own (hybrid
+// snapshot slots beyond two, catalog checkpoint slots, catalog stop-string holds) grow with the
+// request count up to this many and stay there: past it they would take the memory more requests
+// need.
+inline constexpr std::uint32_t kDefaultCheckpointImages          = 8;
 
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
 

@@ -1326,7 +1326,8 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
                                         Tensor& hidden, Tensor& logits) {
     const std::int32_t batch = ids.ne[0];
     if (batch <= 0 || batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
-        throw std::invalid_argument("ordinary decode batch size must be in [1,8]");
+        throw std::invalid_argument("ordinary decode batch size must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "]");
     }
     require_tensor_shape(ids, DType::I32, {batch}, "ordinary decode ids");
     require_tensor_shape(cache_positions, DType::I32, {batch}, "ordinary decode cache positions");
@@ -1376,7 +1377,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kDFlashVerifyMaximumWidth) || batch <= 0 ||
-        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        batch > static_cast<std::int32_t>(kMaximumSpeculativeRows)) {
         throw std::invalid_argument("target verify batch shape is outside the supported domain");
     }
     const std::int32_t columns = width * batch;
@@ -1462,7 +1463,7 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
     if (width <= 0 || width > static_cast<std::int32_t>(kMtpVerifyMaximumWidth) || batch <= 0 ||
-        batch > static_cast<std::int32_t>(kMaximumConcurrency)) {
+        batch > static_cast<std::int32_t>(kMaximumSpeculativeRows)) {
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");

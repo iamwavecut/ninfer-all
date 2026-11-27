@@ -1457,13 +1457,23 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         throw std::invalid_argument("prefill_chunk must be a nonzero multiple of 128");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("max_concurrency must be in [1,8]");
+        throw std::invalid_argument("max_concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "]");
+    }
+    // Speculative rounds keep at most kMaximumSpeculativeRows rows: past eight requests a round of
+    // drafts costs more than the tokens it saves (docs/performance.md, "Several requests at once").
+    if (options.speculative.backend != SpeculativeBackend::None &&
+        options.max_concurrency > kMaximumSpeculativeRows) {
+        throw std::invalid_argument("a speculative backend runs at most " +
+                                    std::to_string(kMaximumSpeculativeRows) +
+                                    " requests at once; max_concurrency is " +
+                                    std::to_string(options.max_concurrency));
     }
     // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
     // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
     // would put a weight-sized scratch into every round workspace and change decode numerics -- so
     // the widest round sits at or below the floor no device profile moves its width gate past.
-    static_assert(kMaximumConcurrency * kMtpDecodeMaximumWidth <=
+    static_assert(std::max(kMaximumConcurrency, kMaximumSpeculativeRows * kMtpDecodeMaximumWidth) <=
                       static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens),
                   "the widest decode/verify round must stay below the cuBLAS prefill width gate");
     if (parameters.text.rank_count != device.size()) {
@@ -1703,7 +1713,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                     ordinary_graph_profiles(impl->capacity, attention_geometry, impl->kv_storage),
                     [](GraphExecutionProfile) { return 12ULL * kMiB; },
                     "ordinary graph allowance"),
-                impl->max_concurrency, "ordinary exact-b graph allowance");
+                graph_rows(impl->max_concurrency), "ordinary exact-b graph allowance");
         } else if (impl->speculative_backend == SpeculativeBackend::Mtp) {
             // Adaptive MTP captures one graph set per verification width it can select, and copy
             // rounds one more at the ngram window for every batch size they admit.

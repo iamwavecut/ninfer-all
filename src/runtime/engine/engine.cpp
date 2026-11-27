@@ -366,6 +366,22 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     return resolved;
 }
 
+// Requests the families with an Engine core of their own run at once: their decode takes no more
+// rows than a speculative round. They choose no automatic count.
+void require_own_core_concurrency(const EngineOptions& options, const char* family) {
+    if (options.max_concurrency_auto) {
+        throw std::invalid_argument(std::string("--max-concurrency auto is not available for ") +
+                                    family + "; give a count of 1 to " +
+                                    std::to_string(kMaximumSpeculativeRows));
+    }
+    if (options.max_concurrency > kMaximumSpeculativeRows) {
+        throw std::invalid_argument(std::string(family) + " runs at most " +
+                                    std::to_string(kMaximumSpeculativeRows) +
+                                    " requests at once; max_concurrency is " +
+                                    std::to_string(options.max_concurrency));
+    }
+}
+
 std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_context) {
     return "prepared prompt has " + std::to_string(prompt_tokens) +
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
@@ -564,6 +580,7 @@ public:
         report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::is_gemma4_artifact(options.artifact_path)) {
+            require_own_core_concurrency(options, "Gemma 4");
             auto constructed    = runtime::construct_gemma4(options, device);
             gemma               = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -582,6 +599,7 @@ public:
             return;
         }
         if (runtime::is_flint_artifact(options.artifact_path)) {
+            require_own_core_concurrency(options, "Flint");
             auto constructed    = runtime::construct_flint(options, device);
             flint               = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -596,6 +614,7 @@ public:
             return;
         }
         if (runtime::is_inkling2_artifact(options.artifact_path)) {
+            require_own_core_concurrency(options, "Inkling 2");
             auto constructed    = runtime::construct_inkling2(options, device);
             inkling             = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -610,6 +629,7 @@ public:
             return;
         }
         if (runtime::is_deepseek_v41_artifact(options.artifact_path)) {
+            require_own_core_concurrency(options, "DeepSeek-V4.1-Flash");
             auto constructed    = runtime::construct_deepseek_v41(options, device);
             deepseek            = std::move(constructed.instance);
             load                = std::move(constructed.load);
@@ -624,6 +644,7 @@ public:
             return;
         }
         if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+            require_own_core_concurrency(options, "Qwen3.8-Flash-Next");
             auto constructed    = runtime::construct_qwen4_exp(options, device);
             flash               = std::move(constructed.instance);
             load                = std::move(constructed.load);

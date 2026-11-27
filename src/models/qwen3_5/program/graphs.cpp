@@ -107,9 +107,12 @@ void instantiate_graph_family(DecodeGraphFamily& family, const char* label, Devi
 void ProgramImpl::prepare_graphs() {
     if (!use_cuda_graph) { return; }
     nvtx::ScopedRange prepare_range(nvtx::Name::CudaGraphPrepare, nvtx::Category::Graph);
+    // Captures cover the rounds of at most kMaximumGraphRows rows; a speculative backend never runs
+    // more (kMaximumSpeculativeRows).
+    const std::uint32_t capture_rows = graph_rows(max_concurrency);
 
     std::array<StateImageHandle, kMaximumConcurrency> capture_states{};
-    for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+    for (std::uint32_t row = 0; row < capture_rows; ++row) {
         std::optional<StateImageHandle> state = state_store->reserve_reset(compute_streams);
         if (!state) {
             throw ninfer::ContextCacheExhausted(
@@ -130,12 +133,12 @@ void ProgramImpl::prepare_graphs() {
                                           const char* label) {
         DeviceKVPagePool& pool       = cache.page_pool();
         KVExecutionTablePool& tables = cache.execution_tables();
-        if (pool.capacity_pages() < max_concurrency) {
+        if (pool.capacity_pages() < capture_rows) {
             throw std::invalid_argument(std::string(label) +
                                         " cannot provide one Paged KV page per concurrent request");
         }
-        allocations.reserve(max_concurrency);
-        for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+        allocations.reserve(capture_rows);
+        for (std::uint32_t row = 0; row < capture_rows; ++row) {
             std::optional<KVAddressSpaceHandle> allocation =
                 addresses.create_active(1, static_cast<std::int32_t>(row), compute_streams);
             if (!allocation) {
@@ -194,7 +197,7 @@ void ProgramImpl::prepare_graphs() {
         };
     const auto prepare_representative = [&](std::uint32_t frontier, std::uint32_t batch_size,
                                             std::uint32_t verify_window) {
-        if (batch_size == 0 || batch_size > max_concurrency) {
+        if (batch_size == 0 || batch_size > capture_rows) {
             throw std::logic_error("CUDA Graph representative batch is invalid");
         }
         work.reset();
@@ -345,7 +348,7 @@ void ProgramImpl::prepare_graphs() {
         const auto ordinary_profiles =
             ordinary_graph_profiles(capacity, attention_geometry, kv_storage);
         validate_graph_profiles(ordinary_profiles, capacity - 1, "ordinary");
-        const std::uint32_t ordinary_batch_limit = max_concurrency;
+        const std::uint32_t ordinary_batch_limit = capture_rows;
         execution::OrdinaryBatchContext ordinary_state{
             execution_core(),      decoder->text_kv,
             *io.ordinary,          *ordinary_host_ingress,
@@ -413,8 +416,8 @@ void ProgramImpl::prepare_graphs() {
             device.synchronize();
 
             mtp_graphs.profiles.reserve(mtp_graphs.profiles.size() +
-                                        planned_profiles.size() * max_concurrency);
-            for (std::uint32_t batch_size = 1; batch_size <= max_concurrency; ++batch_size) {
+                                        planned_profiles.size() * capture_rows);
+            for (std::uint32_t batch_size = 1; batch_size <= capture_rows; ++batch_size) {
                 for (const GraphExecutionProfile planned : planned_profiles) {
                     mtp_graphs.profiles.emplace_back();
                     DecodeGraphProfile& profile    = mtp_graphs.profiles.back();
@@ -424,7 +427,7 @@ void ProgramImpl::prepare_graphs() {
                     profile.verify_window          = verify_window;
                     profile.topology_class =
                         (verify_window * kMtpClassesPerWidth + planned.topology_class) *
-                            max_concurrency +
+                            capture_rows +
                         (batch_size - 1U);
                     execution::capture_mtp_decode_batch(
                         mtp_state, static_cast<std::int32_t>(batch_size), verify_window,
@@ -439,7 +442,7 @@ void ProgramImpl::prepare_graphs() {
             // Copy rounds verify at the ngram window and propose the draft window, on the same
             // frame viewed at that width. Above 15 drafts only one request may be active.
             const std::uint32_t verify_window = ngram_draft_window;
-            const std::uint32_t batch_limit   = verify_window > 15U ? 1U : max_concurrency;
+            const std::uint32_t batch_limit   = verify_window > 15U ? 1U : capture_rows;
             const auto planned_profiles = mtp_graph_profiles(capacity, verify_window, draft_window,
                                                              attention_geometry, kv_storage);
             validate_graph_profiles(planned_profiles, capacity - 1, "ngram MTP");
@@ -471,7 +474,7 @@ void ProgramImpl::prepare_graphs() {
                     profile.max_execution_frontier = planned.max;
                     profile.verify_window          = verify_window;
                     profile.topology_class =
-                        planned.topology_class * max_concurrency + (batch_size - 1U);
+                        planned.topology_class * capture_rows + (batch_size - 1U);
                     execution::capture_mtp_decode_batch(
                         mtp_state, static_cast<std::int32_t>(batch_size), verify_window,
                         draft_window,
@@ -499,7 +502,7 @@ void ProgramImpl::prepare_graphs() {
             // batch>1 copy round also runs the drafter so rows without a copy keep their neural
             // proposal.
             DecodeGraphFamily& family         = copy ? ngram_graphs : dflash_graphs;
-            const std::uint32_t batch_limit   = copy && family_window > 15U ? 1U : max_concurrency;
+            const std::uint32_t batch_limit   = copy && family_window > 15U ? 1U : capture_rows;
             const auto batch_one_profiles =
                 dflash_graph_profiles(speculative_backend, capacity, family_window, 1);
             validate_graph_profiles(batch_one_profiles, capacity - 1, "DFlash");
@@ -546,7 +549,7 @@ void ProgramImpl::prepare_graphs() {
                     profile.verify_window          = family_window;
                     profile.topology_class =
                         (family_window * kMaskedClassesPerWidth + planned.topology_class) *
-                            max_concurrency +
+                            capture_rows +
                         (batch_size - 1U);
                     const ops::CausalAttentionExecutionEnvelope target_envelope{
                         1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -591,7 +594,7 @@ void ProgramImpl::prepare_graphs() {
     }
     CUDA_CHECK(cudaMemsetAsync(token_counts.data, 0, token_counts.bytes(), device.stream));
     device.synchronize();
-    for (std::uint32_t row = 0; row < max_concurrency; ++row) {
+    for (std::uint32_t row = 0; row < capture_rows; ++row) {
         if (!state_store->release(capture_states[row])) {
             throw std::logic_error("CUDA Graph capture StateImage could not be released");
         }

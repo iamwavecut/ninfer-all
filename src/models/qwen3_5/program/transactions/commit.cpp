@@ -579,7 +579,7 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
             if (decisions[row].stop_cut) {
                 stop_hold_rewind(lanes[row]);
             } else {
-                stop_holds_[lanes[row]].reset();
+                stop_hold_release(lanes[row]);
             }
         }
 

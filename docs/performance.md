@@ -791,6 +791,25 @@ The same server runs as for Bonsai 2, total generated tok/s:
 | RTX 3090 | MTP 3 | 88.2 | 154.8 | 238.4 | 328.9 |
 | RTX 3090 | DFlash2 5 | 89.1 | 155.4 | 206.0 | |
 
+### Up to 64 requests at once
+
+Server with `--max-concurrency 64 --kv-dtype rk8v4` and the hybrid cache's automatic KV capacity,
+`tools/bench/serve_load.py --profile chat`: N short-chat requests of 256 tokens arrive together,
+EOS ignored. tok/s while all N decode at once (`steady_tps`); without drafts, as `--spec` runs at
+most eight requests. Rounds of more than eight requests run without a CUDA graph.
+
+| Card | Model | `--max-context` | 8 | 16 | 32 | 48 | 64 |
+|---|---|---:|---:|---:|---:|---:|---:|
+| RTX 5090 | Qwen3.8-27B | 2,048 | 606.8 | 977.7 | 1,229.5 | 1,055.1 | 1,175.6 |
+| RTX 5090 | Ternary Bonsai 2 27B | 4,096 | 1,078.3 | 1,645.5 | 1,777.4 | 1,766.4 | 1,841.5 |
+| RTX 3090 | Ternary Bonsai 2 27B | 2,048 | 549.0 | 744.8 | 856.3 | 835.7 | 903.5 |
+
+48 requests decode slower than 32 in each row: their projections take routes that 32 and 64
+columns do not. `--max-concurrency auto --max-context 4096` admits 29 Qwen3.8-27B requests on the
+RTX 3090 (552.1 tok/s with 29 streams) and 60 on the RTX 5090 (1,111.1 tok/s with 60), 63 Bonsai 2
+requests on the RTX 3090 (891.4 tok/s): each request holds 146.8 MiB of recurrent state and
+102.0 MiB of KV.
+
 ### RTX PRO 6000 against RTX 5090, October 2026
 
 The PRO 6000's server rows measured again next to an RTX 5090 (600 W boards), build `796f98500`,

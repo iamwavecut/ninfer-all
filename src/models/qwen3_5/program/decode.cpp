@@ -291,7 +291,8 @@ std::int32_t ProgramImpl::arm_readout(std::span<const TokenId> ids) {
 void ProgramImpl::fetch_readout(std::int32_t count) {
     if (count <= 0) { return; }
     if (!readout_host) {
-        readout_host.emplace(kMaximumConcurrency * kMaximumReadoutTokens * sizeof(float));
+        // The device's readout plane: kMaximumReadoutTokens values (round_buffers.cpp).
+        readout_host.emplace(kMaximumReadoutTokens * sizeof(float));
     }
     CUDA_CHECK(cudaMemcpyAsync(readout_host->data(), io.readout_values.data,
                                static_cast<std::size_t>(count) * sizeof(float),
@@ -645,7 +646,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
-        if (use_cuda_graph) {
+        if (use_cuda_graph && lanes.size() <= kMaximumGraphRows) {
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");

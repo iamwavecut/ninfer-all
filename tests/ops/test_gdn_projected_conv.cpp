@@ -218,6 +218,9 @@ int main() {
                 failures += run_case(profile, 16, 1, false, snapshot, ++seed);
                 failures += run_case(profile, 4, 3, true, snapshot, ++seed);
                 failures += run_case(profile, 2, 8, false, snapshot, ++seed);
+                // Ordinary decode rounds past eight rows (ops::kMaximumDecodeRows).
+                failures += run_case(profile, 1, 33, true, snapshot, ++seed);
+                failures += run_case(profile, 1, 64, false, snapshot, ++seed);
             }
         }
     } catch (const std::exception& error) {

@@ -216,7 +216,10 @@ std::string serve_usage_text(const char* argv0) {
            "MODEL & CONTEXT\n"
            "  --max-context N               logical context ceiling of each request (default\n"
            "                                8192)\n"
-           "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
+           "  --max-concurrency N|auto      requests decoded together, 1..64 (default 1); at\n"
+           "                                most 8 with --spec and for the families with an\n"
+           "                                Engine core of their own; auto: the most whose\n"
+           "                                states and --max-context KV windows fit\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
            "                                (default 1024; 4096 for native MoE experts\n"
            "                                in host memory or files; 2048 for\n"
@@ -384,7 +387,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-prefix-reuse             disable compatible-prefix caching (on by\n"
            "                                default); excludes the options below\n"
            "  --device-state-slots N        checkpoint states on the device beyond the\n"
-           "                                active lanes (default max-concurrency)\n"
+           "                                active lanes (default min(max-concurrency,8))\n"
            "  --host-state-slots N          pinned host checkpoint states (default 8)\n"
            "  --host-kv-mib N               pinned host KV in MiB (default 8192)\n"
            "  --host-cache-mib N            one pinned host RAM ceiling instead of the two\n"
@@ -461,7 +464,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                cheapest to rebuild and demoting the costliest\n"
            "  --kv-lease-growth             reserve a 4096-token output window and extend it\n"
            "                                instead of the whole max_tokens budget; an answer\n"
-           "                                the pool cannot extend ends with length\n"
+           "                                the pool cannot extend ends with length (default\n"
+           "                                on past eight requests at once)\n"
            "  --concurrent-prefill          admit waiting requests to free lanes while other\n"
            "                                requests prefill\n"
            "  --disk-kv-path DIR            disk tier: evicted continuations write their KV\n"
@@ -487,9 +491,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --use-original-prefix-caching the checkpoint catalog instead of the hybrid\n"
            "                                prefix cache\n"
            "  --device-snapshot-slots N     hybrid: device state snapshot slots (default\n"
-           "                                concurrency + 2, lowered as far as one when the\n"
-           "                                KV capacity would not fit beside them; a given\n"
-           "                                count is kept)\n"
+           "                                min(concurrency,8) + 2, lowered as far as one\n"
+           "                                when the KV capacity would not fit beside them;\n"
+           "                                a given count is kept)\n"
            "  --cache-taps-per-request N    hybrid: new prefill snapshots per request\n"
            "                                (default 8; 2 without a Host tier)\n"
            "  --cache-tap-ladder N          hybrid: ladder base in tokens for history\n"
@@ -699,7 +703,8 @@ std::string serve_usage_text(const char* argv0) {
            "                                among them)\n"
            "  --max-request-mib N           request body limit, enforced before parsing\n"
            "                                (default 384)\n"
-           "  --max-pending-requests N      requests waiting for admission (default 16)\n"
+           "  --max-pending-requests N      requests waiting for admission (default\n"
+           "                                max(16, max-concurrency))\n"
            "  --pending-timeout-ms N        preparation-plus-admission wait (default 600000)\n"
            "  --recover-invariant-failures  on a broken internal invariant, fail the active\n"
            "                                requests and keep serving the queue instead of\n"
@@ -725,9 +730,9 @@ std::string serve_usage_text(const char* argv0) {
            "NOTES\n"
            "  Sampler defaults come from the loaded model and the resolved thinking mode;\n"
            "  server flags and request fields override individual values.\n"
-           "  context cache defaults: device-state=max-concurrency, private=2x concurrency,\n"
-           "  shared=max(max-concurrency,7), anchors=2 (4 with --auto-long-anchors),\n"
-           "  Host state=8 slots, Host KV=8192 MiB.\n";
+           "  context cache defaults: device-state=min(max-concurrency,8), private=2x\n"
+           "  concurrency, shared=max(max-concurrency,7), anchors=2 (4 with\n"
+           "  --auto-long-anchors), Host state=8 slots, Host KV=8192 MiB.\n";
 }
 
 // "1,2,3" selects the ordered devices the model's pipeline stages run on; the first also holds the
@@ -878,13 +883,19 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
             continue;
         }
         if (arg == "--max-concurrency") {
-            options.max_concurrency = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--max-concurrency"), "max-concurrency"));
+            const std::string value = require_value("--max-concurrency");
+            options.max_concurrency_auto = value == "auto";
+            options.max_concurrency =
+                options.max_concurrency_auto
+                    ? kMaximumConcurrency
+                    : static_cast<std::uint32_t>(
+                          parse_nonnegative_int(value.c_str(), "max-concurrency"));
             continue;
         }
         if (arg == "--max-pending-requests") {
             options.max_pending_requests = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--max-pending-requests"), "max-pending-requests"));
+            options.max_pending_requests_given = true;
             continue;
         }
         if (arg == "--pending-timeout-ms") {
@@ -2077,7 +2088,23 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
                                       "--kv-capacity must be at least --max-context");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
-        throw std::invalid_argument("--max-concurrency must be in [1,8]");
+        throw std::invalid_argument("--max-concurrency must be in [1," +
+                                    std::to_string(kMaximumConcurrency) + "] or auto");
+    }
+    if (options.speculative.backend != SpeculativeBackend::None) {
+        if (options.max_concurrency_auto) {
+            options.max_concurrency = std::min(options.max_concurrency, kMaximumSpeculativeRows);
+        } else if (options.max_concurrency > kMaximumSpeculativeRows) {
+            throw product::OptionConflict(
+                {"spec", "max-concurrency"},
+                "--spec runs at most " + std::to_string(kMaximumSpeculativeRows) +
+                    " requests at once; past that a round of drafts costs more than it saves. "
+                    "Use --max-concurrency " + std::to_string(kMaximumSpeculativeRows) +
+                    " or less, or --spec none");
+        }
+    }
+    if (!options.max_pending_requests_given) {
+        options.max_pending_requests = std::max(16U, options.max_concurrency);
     }
     if (options.max_pending_requests == 0) {
         throw std::invalid_argument("--max-pending-requests must be positive");

@@ -100,9 +100,9 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 /**
  * Returns the transient capacity required by the registered two-parent Q4/Q5 or single-parent Q8
  * snapshot profile. `batch_size` is exact and the query covers every W in the inclusive width
- * interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 uses aggregate
- * projection plus one BF16 [C,B*W] projected plane. The query throws for an unregistered row
- * profile or unsupported B/W domain.
+ * interval. B=1 preserves the format-specific fused/composed resolver. B=2..8 at W=1..16 and
+ * B=9..64 at W=1 use aggregate projection plus one BF16 [C,B*W] projected plane. The query throws
+ * for an unregistered row profile or unsupported B/W domain.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     std::int32_t query_rows, std::int32_t key_rows, std::int32_t value_rows,
@@ -129,8 +129,9 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 /**
  * Returns the transient capacity for a registered [16384,5120] NVFP4 or row-scaled FP8 snapshot
  * profile. `batch_size` is exact and the query covers every W in the inclusive width interval.
- * B=1 preserves the format-specific fused/materialized resolver; B=2..8 covers its aggregate
- * projection mechanism plus any projected BF16 plane selected by the complete-Op plan.
+ * B=1 preserves the format-specific fused/materialized resolver; B=2..8 at W=1..16 and B=9..64 at
+ * W=1 cover its aggregate projection mechanism plus any projected BF16 plane selected by the
+ * complete-Op plan.
  */
 [[nodiscard]] std::size_t gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
     QType parent_qtype, std::int32_t parent_rows, std::int32_t input_rows, LinearPolicy policy,
@@ -150,8 +151,8 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
  *   The 27B registered form has x [5120,W,B], Q4 q/k weight [4096,5120], one Q5 value/z parent
  *   [12288,5120], conv_weight [10240,4], conv_states [10240,3,Slots], query/key [2048,W,B],
  *   value/z [6144,W,B], and I32 selectors [B]. B=1 accepts every positive W; B=2..8 accepts
- *   W=1..16. `valid_columns` is empty for a dense invocation or I32 [B] for a mixed-width batch.
- *   A mixed-width invocation has B>=1 and every valid extent lies in [1,W].
+ *   W=1..16; B=9..64 accepts W=1. `valid_columns` is empty for a dense invocation or I32 [B] for a
+ *   mixed-width batch. A mixed-width invocation has B>=1 and every valid extent lies in [1,W].
  *
  * Numeric:
  *   The oracle exact-decodes packed weights and evaluates projection, convolution, SiLU, z, and
@@ -196,10 +197,10 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& qk_weight,
  * [12288,2048], NVFP4 BlockScaleK16M128x4 [16384,5120], and FP8_E4M3FN_ROW_BF16 RowScale
  * [16384,5120], all in q/k/value/z row order. All policies permit Q8 A16. NVFP4 uses A16
  * under A16Only/AllowA8; AllowA4 may use A4. FP8 may use A8 under AllowA8/AllowA4. B=1 accepts
- * every positive W for FP8; the batched domain is B=2..8 and W=1..16. Tensor operands, the complete
- * FP8 parent, and live workspace must be mutually non-overlapping, except that the read-only
- * initial_state_slots and snapshot_base_slots selectors may alias each other; same-row state-slot
- * overlap remains governed by the snapshot state contract.
+ * every positive W for FP8; the batched domain is B=2..8 at W=1..16 and B=9..64 at W=1. Tensor
+ * operands, the complete FP8 parent, and live workspace must be mutually non-overlapping, except
+ * that the read-only initial_state_slots and snapshot_base_slots selectors may alias each other;
+ * same-row state-slot overlap remains governed by the snapshot state contract.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,
@@ -210,7 +211,7 @@ void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value
 
 /**
  * Applies the A16-only single-parent form. FP8 accepts every positive W for dense B=1; the batched
- * domain is B=2..8 and W=1..16.
+ * domain is B=2..8 at W=1..16 and B=9..64 at W=1.
  */
 void gdn_input_proj_conv_snapshot(const Tensor& x, const Weight& query_key_value_z_weight,
                                   const Tensor& conv_weight, Tensor& conv_states,

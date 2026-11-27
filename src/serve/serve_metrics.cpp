@@ -292,6 +292,13 @@ std::string ServeMetrics::render(const LoadCapacity& capacity, const LoadSample&
     append(out, "ninfer:paced_prefill_deferred_tokens_total", "counter",
            "Prompt tokens those steps left to later steps.",
            static_cast<double>(stats.paced_prefill_deferred_tokens));
+    append(out, "ninfer:kv_lease_reclaimed_extensions_total", "counter",
+           "Device KV leases extended after retained cache was released for them.",
+           static_cast<double>(stats.kv_lease_reclaimed_extensions));
+    append(out, "ninfer:kv_lease_cut_requests_total", "counter",
+           "Requests whose Device KV lease could not grow, so the answer ended with "
+           "finish_reason length before its max_tokens.",
+           static_cast<double>(stats.kv_lease_cut_requests));
     append_context_cache(out, stats);
     append_gpus(out, gpus);
     return out;

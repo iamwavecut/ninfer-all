@@ -345,9 +345,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
       experts(std::move(expert_runtime)),
-      round_host(plan.causal_scoring
-                     ? std::nullopt
-                     : std::make_optional<PinnedHostBuffer>(kMaximumConcurrency * sizeof(TokenId))),
+      round_host(plan.causal_scoring ? std::nullopt
+                                     : std::make_optional<PinnedHostBuffer>(
+                                           std::size_t(plan.max_concurrency) * sizeof(TokenId))),
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreMaximumTile * sizeof(float))
                                               : std::nullopt),
@@ -511,6 +511,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         stop_hold_slots_ >= static_cast<std::uint32_t>(state_images->slot_count())) {
         throw std::logic_error("Qwen3.5 StateImage pool does not cover its stop-string holds");
     }
+    stop_hold_free_ = stop_hold_slots_ >= 64U ? ~0ULL : (1ULL << stop_hold_slots_) - 1ULL;
     const std::uint32_t catalog_state_slots =
         static_cast<std::uint32_t>(state_images->slot_count()) - stop_hold_slots_;
     const std::uint64_t logical_state_capacity =

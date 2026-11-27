@@ -2,6 +2,7 @@
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_snapshot_plan_unified.h"
 
 #include "core/layout.h"
+#include "ninfer/ops/batch_rows.h"
 #include "ops/gdn_input_proj/nvfp4/nvfp4_gdn_input_plan_unified.h"
 
 #include <stdexcept>
@@ -28,7 +29,7 @@ Nvfp4GdnProjectedWorkspace allocate_workspace(Allocator& allocator, std::int32_t
 
 Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t tokens,
                                              std::int32_t batch_size) {
-    if (tokens <= 0 || batch_size <= 0 || batch_size > 8) {
+    if (!batch_rows_admitted(tokens, batch_size)) {
         throw std::invalid_argument("nvfp4 gdn conv: invalid B/T domain");
     }
     if (!valid_linear_policy(policy)) {
