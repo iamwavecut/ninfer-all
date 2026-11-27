@@ -119,14 +119,25 @@ MoE, Gemma MoE, Flint, DeepSeek-V4.1-Flash and Inkling 2 with host or disk exper
 missing experts while a replayed graph waits for them on the device; on Windows and under WSL2
 their delivery runs every copy of a call and of the work after it (layer banks, promotions, the
 cache's rounds) as the same kernel, reading the pinned block at its device addresses, and they keep
-their CUDA Graphs (`NINFER_MISS_COPY_KERNEL` forces either copy here too). Each launch is a grid of
-32 blocks at the device's greatest stream priority, which leaves the rest of the device to the
-prompt's kernels. Forced on Linux on an RTX 4090 (PCIe 4.0 x16, 5,753-token prompt, 128 tokens),
-the kernel prefilled Inkling 2 with host experts 4.9% slower than the copy engine (4.08k against
-4.29k tokens/s), Gemma MoE, Flint and Qwen3.6-35B-A3B with host experts 0.8-1.7% faster, and the
-five families with disk experts 0.9% (DeepSeek-V4.1-Flash) to 16% faster; decode changed by
-−1.9% (DeepSeek-V4.1-Flash) to +10.8% (Qwen3.6-35B-A3B). This repository has no
-Windows or WSL2 host: `ninfer_qwen4_exp_hybrid_experts_test`,
+their CUDA Graphs (`NINFER_MISS_COPY_KERNEL` forces either copy here too). A decode or verification
+call's launch is a grid of 32 blocks at the device's greatest stream priority; a prompt chunk's
+copies (its layer banks) run on an eighth of the device's multiprocessors, at least 4 blocks, so
+the chunk's kernels keep the rest. Forced on Linux with Inkling 2 Mini GSQ-RCO IQ2_S, host experts
+and a 3.1K-token prompt (the flags of #500), 32 blocks for every copy prefilled 14% below the copy
+engine on an RTX 3060 (1.10k against 1.28k tokens/s) and 17% below on an RTX 4090 (4.52k against
+5.41k); of 4 to 64 blocks for every copy, 4 cost least on the RTX 3060 (1.19k) and 8 to 16 on the
+RTX 4090 (5.03k to 5.06k; 4 blocks 3.55k), and the stream priority changed nothing. With the
+prompt's copies on their eighth the RTX 3060 prefilled at 1.19k (4 blocks; copy engine 1.27k,
+32 blocks 1.10k) and the RTX 4090 at 5.04k (16 blocks; copy engine 5.40k, 32 blocks 4.56k), 6-7%
+below the copy engine, and the RTX 4090 with disk experts at 2.44k (copy engine 2.42k, 32 blocks
+2.18k to 2.45k); Gemma 4 26B-A4B prefilled at 3.90k with host experts and 1.74k with disk experts,
+as with 32 blocks (copy engine 3.86k and 1.73k). Decode, whose calls keep 32 blocks, stayed within
+the runs' spread. Earlier, with 32 blocks on an RTX 4090 (PCIe 4.0 x16, 5,753-token prompt, 128
+tokens), Flint and Qwen3.6-35B-A3B with host experts prefilled 0.8-1.7% faster with the kernel than
+with the copy engine, the five families with disk experts 0.9% (DeepSeek-V4.1-Flash) to 16% faster,
+and decode changed by −1.9% (DeepSeek-V4.1-Flash) to +10.8% (Qwen3.6-35B-A3B); those prompt copies
+now run on 16 blocks there. This repository has no Windows or WSL2 host:
+`ninfer_qwen4_exp_hybrid_experts_test`,
 `ninfer_qwen4_exp_expert_misses_test` and `ninfer_expert_delivery_test` run both forms on Linux and
 only the kernel under WDDM, where a contributor ran the second on an RTX 4090 D, and Edge0-145B
 with host experts served there with CUDA Graphs. Inkling 2 ran under Windows 11 in a

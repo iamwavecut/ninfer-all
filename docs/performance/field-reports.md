@@ -16,6 +16,7 @@ or against each other as a benchmark. [Send a report](#send-a-report) to add a c
 | RTX 5060 Ti, 16 GB, two and four | Linux | Qwen3.8-27B NVFP4 | `--tensor-parallel` prompts to 28.8K tokens, KV capacity | [RTX 5060 Ti](#rtx-5060-ti-two-and-four-cards) |
 | Tesla T10, 16 GB, two | Linux | Inkling 2 Mini UD-IQ4_XS | `--tensor-parallel` without peer access, retrieval prompts to 261,760 tokens, against llama.cpp | [Tesla T10](#tesla-t10-two-cards) |
 | RTX 3070 Ti, 8 GB | Windows 11 | Inkling 2 Mini UD-IQ4_XS | experts in host memory, the largest context with `rk4v4`, a 168K-token retrieval prompt | [RTX 3070 Ti](#rtx-3070-ti-windows-11) |
+| RTX 3060, 12 GB | Windows 11, WSL2 | Inkling 2 Mini GSQ-RCO IQ2_S | a 3,038-token prompt with experts in host memory, two releases | [RTX 3060](#rtx-3060-wsl2) |
 
 ## RTX 5070 Ti, Windows 11
 
@@ -442,6 +443,36 @@ tokens of `rk4v4` context (8.75 KiB a token) below the ceiling measured here.
 
 The CPU, host memory, driver version and power limit are not in the report. Prefill and decode at
 other prompt lengths and the other KV formats were not measured.
+
+## RTX 3060, WSL2
+
+Reported by @NeuroCloud-Activate in
+[iamwavecut/ninfer-all#500](https://github.com/iamwavecut/ninfer-all/issues/500), 27 November 2026.
+
+- RTX 3060 12 GB (`sm_86`), Windows 11, Docker Desktop with WSL2; the published CUDA 13.4 images
+  and source builds with `ARCHS=86`.
+- Inkling 2 Mini converted from ISTA-DASLab's GSQ-RCO IQ2_S GGUF, its perplexity checked against the
+  published artifact's.
+
+```bash
+ninfer-serve Inkling-2-Mini-GSQ-RCO-IQ2_S-ninfer.ninfer --max-context 32768 --kv-dtype rk4v4 \
+  --loop-kv last-full --expert-residency host --expert-cache-mib 4480 \
+  --spec dflash2 --draft-tokens 6 --lookup-ngram 3
+```
+
+One 3,038-token prompt, nothing reused, one request at a time:
+
+| Build | Prefill (tok/s) | TTFT (s) | Decode (tok/s) |
+|---|---:|---:|---:|
+| `9ba127602246` image | 1,153.0 | 2.63 | 117.7 |
+| `2a981ff602aa`, source build, three flag variants | 780.3 to 877.7 | 3.46 to 3.89 | 109.2 to 137.4 |
+| `9ba127602246` + the reporter's serve patch, `--loop-kv per-pass` | 1,178 | 2.58 | 107 |
+| `2a981ff602aa` + the same patch | 883 | 3.44 | 112 |
+
+The newer build delivers host experts with CUDA Graphs under WSL2, its copies running as a kernel
+([Windows build](../build-windows.md#build)); the older one ran those passes eagerly with the copy
+engine. The runs were short and not interleaved, so the reporter treats the percentages as
+approximate.
 
 ## Send a report
 

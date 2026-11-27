@@ -123,7 +123,7 @@ means the card calibrates once at its first start.
 | ✅ | RTX 3070 Ti | 8 GB | GeForce | ✓ | Inkling 2 Mini under Windows 11 (experts in host memory; [field report](performance/field-reports.md#rtx-3070-ti-windows-11)) |
 | ⬜ | RTX 3070 | 8 GB | GeForce | ✓ | |
 | ✅ | RTX 3060 Ti | 8 GB | GeForce | ✓ | Bonsai 2, Flash-Next (experts in host memory, on disk) |
-| ✅ | RTX 3060 | 12 GB | GeForce | ✓ | Bonsai 2, IQ3_S, Flash-Next (experts in host memory, on disk), Inkling 2 Mini (experts in host memory) |
+| ✅ | RTX 3060 | 12 GB | GeForce | ✓ | Bonsai 2, IQ3_S, Flash-Next (experts in host memory, on disk), Inkling 2 Mini (experts in host memory; under WSL2 in a [field report](performance/field-reports.md#rtx-3060-wsl2)) |
 | ⬜ | RTX 3060 | 8 GB | GeForce | the 12 GB card's (28 SMs) | |
 | ⬜ | RTX 3050 | 8 GB | GeForce | ✓ | |
 | ✅ | RTX A6000 | 48 GB | Workstation | ✓ | Flash-Next (experts on the GPU, in host memory, on disk), Inkling 2 Mini |
