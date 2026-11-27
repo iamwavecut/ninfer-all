@@ -1508,6 +1508,28 @@ __global__ void __launch_bounds__(kMarkovThreads)
     if (threadIdx.x == 0) { out[blockIdx.x] = best; }
 }
 
+// Warp w of the grid: the scores of every v = w (mod the grid's warps) below the domain.
+__global__ void __launch_bounds__(kMarkovThreads)
+    markov_scores_kernel(const float* __restrict__ logits, const __nv_bfloat16* __restrict__ head,
+                         const __nv_bfloat16* __restrict__ embed, const std::int32_t* __restrict__ ids,
+                         int step, int domain, float* __restrict__ scores) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = kMarkovThreads / 32;
+    const __nv_bfloat16* e_row = embed + std::int64_t(ids[step]) * kMarkovRank + lane * 8;
+    float e[8];
+    {
+        const float4 a = ld_bf16x4(e_row), b = ld_bf16x4(e_row + 4);
+        e[0] = a.x, e[1] = a.y, e[2] = a.z, e[3] = a.w, e[4] = b.x, e[5] = b.y, e[6] = b.z, e[7] = b.w;
+    }
+    for (int v = blockIdx.x * warps + warp; v < domain; v += gridDim.x * warps) {
+        const __nv_bfloat16* h_row = head + std::int64_t(v) * kMarkovRank + lane * 8;
+        const float4 a = ld_bf16x4(h_row), b = ld_bf16x4(h_row + 4);
+        float dot = a.x * e[0] + a.y * e[1] + a.z * e[2] + a.w * e[3] + b.x * e[4] + b.y * e[5] +
+                    b.z * e[6] + b.w * e[7];
+        dot = warp_sum(dot);
+        if (lane == 0) { scores[v] = logits[v] + dot; }
+    }
+}
+
 __global__ void __launch_bounds__(kMarkovThreads)
     markov_pick_kernel(const Best* __restrict__ blocks, std::int32_t* __restrict__ ids, int step) {
     float bv = -INFINITY;
@@ -1878,6 +1900,14 @@ void markov_step(const float* logits, const __nv_bfloat16* head, const __nv_bflo
     check_launch("markov_best");
     markov_pick_kernel<<<1, kMarkovThreads, 0, stream>>>(blocks, ids, step);
     check_launch("markov_pick");
+}
+
+void markov_scores(const float* logits, const __nv_bfloat16* head, const __nv_bfloat16* embed,
+                   int domain, const std::int32_t* ids, int step, float* scores, cudaStream_t stream) {
+    if (domain <= 0) { throw std::invalid_argument("deepseek_v41 markov_scores: an empty domain"); }
+    markov_scores_kernel<<<kMarkovBlocks, kMarkovThreads, 0, stream>>>(logits, head, embed, ids, step,
+                                                                       domain, scores);
+    check_launch("markov_scores");
 }
 
 void dspark_confidence(const float* h, const float* pre, int tokens, int streams, int hidden,

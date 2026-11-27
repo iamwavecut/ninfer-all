@@ -2928,7 +2928,15 @@ __global__ void __launch_bounds__(256) spark_logits_kernel(SparkStepArgs a) {
     if (lane == 0) {
         const float logit = a.candidate_values[at] + a.c[v] + dot;
         a.logits[o]       = a.cap * tanhf(logit * (1.0f / a.cap));
+        if (a.scores != nullptr) { a.scores[v] = a.logits[o]; }
     }
+}
+
+// A sampled step's row: -inf everywhere, before spark_logits_kernel writes the candidates.
+__global__ void __launch_bounds__(256) spark_clear_kernel(float* scores, int vocab) {
+    ninfer::pdl::arch_enter_glue();
+    const int v = int(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v < vocab) { scores[v] = -INFINITY; }
 }
 
 // The running (maximum, its first index, sum of e^(x - maximum)) of a set of logits.
@@ -2978,10 +2986,14 @@ __device__ Pick block_pick(Pick p) {
 }
 
 // One block: the first maximum of the step's candidate logits (the lowest id among equal ones),
-// its probability over the candidates, then the state update.
+// or the sampled id, its probability over the candidates, then the state update.
 __global__ void __launch_bounds__(kSparkPickThreads) spark_pick_kernel(SparkStepArgs a) {
     ninfer::pdl::arch_enter_glue();
+    __shared__ float drawn;
     const std::int32_t* ids = a.candidate_ids + std::int64_t(a.row - 1) * kSparkCandidates;
+    const int token = a.sampled != nullptr ? *a.sampled : -1;
+    if (threadIdx.x == 0) { drawn = -INFINITY; }
+    __syncthreads();
     Pick p;
     for (int o = threadIdx.x; o < kSparkCandidates; o += blockDim.x) {
         Pick one;
@@ -2989,12 +3001,16 @@ __global__ void __launch_bounds__(kSparkPickThreads) spark_pick_kernel(SparkStep
         one.index = ids[o];
         one.sum   = 1.0f;
         p         = merge_pick(p, one);
+        if (one.index == token) { drawn = one.top; } // candidate ids are distinct
     }
-    p = block_pick(p);
+    p = block_pick(p); // its __syncthreads publishes `drawn`
     if (threadIdx.x == 0) {
-        *a.prev                 = p.index;
-        a.drafts[a.row - 1]     = p.index;
-        a.confidence[a.row - 1] = 1.0f / p.sum;
+        // A draw outside the candidates (none passed the sampler's filters) keeps the argmax.
+        const bool take         = a.sampled != nullptr && drawn != -INFINITY;
+        const int id            = take ? token : p.index;
+        *a.prev                 = id;
+        a.drafts[a.row - 1]     = id;
+        a.confidence[a.row - 1] = take ? expf(drawn - p.top) / p.sum : 1.0f / p.sum;
     }
     for (int r = threadIdx.x; r < kSparkRank; r += blockDim.x) {
         const float gate      = sigmoidf(a.joint[r]);
@@ -3708,19 +3724,32 @@ void spark_candidates(const float* base, std::int64_t stride, int vocab, int row
     check_launch("spark_candidates write");
 }
 
-void spark_step(const SparkStepArgs& a, cudaStream_t stream) {
+void spark_score(const SparkStepArgs& a, cudaStream_t stream) {
     if (a.row < 1 || a.hidden_size % 4 != 0 || a.cap <= 0.0f || a.candidate_ids == nullptr ||
-        a.candidate_values == nullptr) {
+        a.candidate_values == nullptr || (a.scores != nullptr && a.vocab < kSparkCandidates)) {
         throw std::invalid_argument("inkling2 spark_step: invalid step");
     }
     const int k = 2 * kSparkRank + 2 * a.hidden_size;
     ninfer::pdl::launch_arch(3 * kSparkRank / 8, 256, std::size_t(k) * 4, stream,
                              spark_joint_kernel, a);
     check_launch("spark_joint");
+    if (a.scores != nullptr) {
+        ninfer::pdl::launch_arch(blocks_for(a.vocab, 256), 256, 0, stream, spark_clear_kernel,
+                                 a.scores, a.vocab);
+        check_launch("spark_clear");
+    }
     ninfer::pdl::launch_arch(kSparkCandidates / 8, 256, 0, stream, spark_logits_kernel, a);
     check_launch("spark_logits");
+}
+
+void spark_take(const SparkStepArgs& a, cudaStream_t stream) {
     ninfer::pdl::launch_arch(1, kSparkPickThreads, 0, stream, spark_pick_kernel, a);
     check_launch("spark_pick");
+}
+
+void spark_step(const SparkStepArgs& a, cudaStream_t stream) {
+    spark_score(a, stream);
+    spark_take(a, stream);
 }
 
 void add_fixed(unsigned long long* sums, const void* products, const std::int32_t* flag,

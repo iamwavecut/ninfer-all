@@ -2834,7 +2834,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--presence-penalty F` | process-level presence-penalty override | unset |
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
 | `--seed N` | fixed seed when a request omits one | fresh random seed per request |
-| `--gumbel-sampling` | draw sampled tokens by Gumbel-max over keyed noise, and MTP-style drafts as the drafter's own draws under that noise ([the CLI's coupled draws](cli.md#speculative-decoding)); a seed gives other tokens than the default draw | off |
+| `--gumbel-sampling` | draw sampled tokens by Gumbel-max over keyed noise, and MTP-style and DSpark drafts as the drafter's own draws under that noise ([the CLI's coupled draws](cli.md#speculative-decoding)); a seed gives other tokens than the default draw | off |
 | `--greedy` | force exact argmax for all requests | off |
 | `--post-thinking` | sample the answer of every thinking request with the post-thinking preset once its reasoning closes | off |
 | `--post-thinking-temperature F`, `--post-thinking-top-p F`, `--post-thinking-top-k N` | post-thinking overrides; each implies `--post-thinking` | preset |

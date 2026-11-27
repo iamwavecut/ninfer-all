@@ -19,6 +19,7 @@
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
+#include "runtime/contract/draft_sampling.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/lookup_draft.h"
@@ -257,6 +258,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     executor.dspine        = dspine;
     executor.dspark        = dspark;
     executor.dflash2       = dflash2;
+    executor.sampled_drafts = dspark && options.gumbel_sampling;
     if (block) {
         // The drafter's block less its anchor a round, or fewer with --draft-tokens; a round of a
         // context lookup's may verify as many as the lookup proposes.
@@ -2437,13 +2439,19 @@ struct Inkling2Core::Impl {
         if (block_drafts != 0) { steps = std::min(steps, block_drafts); }
         std::vector<std::uint32_t> sequences;
         std::vector<std::int32_t> anchors;
+        // DSpark draws each row's drafts with the keys its verification columns draw the target's
+        // tokens with (runtime::draft_sampling); the other drafters stay greedy.
+        std::vector<ops::SamplingConfig> configs;
+        std::vector<std::int32_t> lengths;
         for (const auto& request : rows) {
             sequences.push_back(request->slot);
             anchors.push_back(request->feed.front());
+            configs.push_back(runtime::draft_sampling(*sample_row(*request).params));
+            lengths.push_back(static_cast<std::int32_t>(request->position));
         }
         std::vector<std::int32_t> drafted(rows.size() * steps);
         std::vector<float> confidence(rows.size() * steps);
-        instance.executor->draft(sequences, anchors, steps, drafted, confidence);
+        instance.executor->draft(sequences, anchors, steps, drafted, confidence, configs, lengths);
         std::vector<std::vector<TokenId>> out(rows.size());
         for (std::size_t j = 0; j < rows.size(); ++j) {
             std::uint32_t length = steps;

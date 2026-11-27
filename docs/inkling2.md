@@ -144,7 +144,9 @@ tokenization, the chat template, output parsing and the serving protocols.
   converter folded with the release's BF16 head. The head scores only each row's 16,384 candidates,
   its largest head logits by their BF16 truncation (the lowest ids among those equal to the
   16,384th), as vLLM's top-k Markov sampling does when a drafter's config asks for it; a draft is
-  the best candidate and its probability is taken over the candidates. Without `--spec`, an artifact
+  the best candidate (with `--gumbel-sampling`, a sampled request's draw among the candidates under
+  the target's keyed noise, [coupled draws](cli.md#speculative-decoding)) and its probability is
+  taken over the candidates. Without `--spec`, an artifact
   that carries the drafter drafts with it while the Engine serves one request at a time: 3 drafts a
   round, the round's width adapting from 1 to 3 by how far the drafts survive and how long the
   rounds take (`--adaptive-mtp`), each proposal ending after its first draft at or below probability

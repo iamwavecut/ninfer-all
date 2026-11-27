@@ -35,6 +35,7 @@
 #include "models/inkling2/kv_format.h"
 #include "models/inkling2/model.h"
 #include "ninfer/model_enums.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -82,6 +83,9 @@ struct ExecutorOptions {
     // Drafts with the model's DFlash2 drafter (Model::dflash2(); draft_tokens of them at most, its
     // block less one).
     bool dflash2 = false;
+    // --gumbel-sampling: draft() may take samplers, whose rows' DSpark drafter then draws its
+    // drafts (runtime/contract/draft_sampling.h).
+    bool sampled_drafts = false;
     // Prompt calls may carry images (a model loaded with its vision tower): the most patches an
     // image has, which sizes the tower's scratch. 0: text only.
     std::uint32_t vision_max_patches = 0;
@@ -185,9 +189,13 @@ public:
     void commit(std::span<const std::uint32_t> sequences, std::span<const std::uint32_t> kept);
     // The drafter's greedy drafts of the `k` positions after each sequence's anchor and each
     // draft's probability under it, sequence-major; returns once they are on the host. DSpark runs
-    // one block per sequence. A block needs a committed token before it.
+    // one block per sequence. A block needs a committed token before it. With sampled_drafts and
+    // `configs`, a DSpark row whose config samples draws its draft i among its candidates with
+    // that config at the key lengths[j] + i + 1 instead.
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
-               std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence);
+               std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence,
+               std::span<const ops::SamplingConfig> configs = {},
+               std::span<const std::int32_t> lengths       = {});
     // A block drafter (DSpark, DFlash2): the drafts its block proposes a round, its block less one
     // (0 without one).
     [[nodiscard]] std::uint32_t block_drafts() const noexcept;

@@ -20,6 +20,7 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_policy.h"
 #include "ninfer/ops/moe_expert_prefetch.h"
+#include "ninfer/ops/sampling.h"
 #include "ninfer/ops/weight_input.h"
 #include "ops/common/device_tier.h"
 #include "ops/linear/gguf/ggml_bridge.h"
@@ -208,6 +209,9 @@ struct Spark {
     DeviceBuffer contexts, contexts_kept, state, prev, drafts, confidence;
     std::unique_ptr<PinnedHostBuffer> host;
     std::unique_ptr<CudaCompletionEvent> copied;
+    // Sampled drafts (ExecutorOptions::sampled_drafts): a row's config, then its keys.
+    DeviceBuffer sampling;
+    std::unique_ptr<PinnedHostBuffer> host_sampling;
     std::uint64_t bytes = 0; // beside the caches (in kv_bytes)
 };
 
@@ -1051,6 +1055,11 @@ struct Executor::Impl {
         d->confidence = DeviceBuffer(std::size_t(d->block) * 4);
         d->host   = std::make_unique<PinnedHostBuffer>(std::size_t(d->block) * 8);
         d->copied = std::make_unique<CudaCompletionEvent>(device);
+        if (options.sampled_drafts) {
+            const std::size_t bytes = sizeof(ops::SamplingConfig) + std::size_t(d->block) * 4;
+            d->sampling      = DeviceBuffer(bytes);
+            d->host_sampling = std::make_unique<PinnedHostBuffer>(bytes);
+        }
         spark = std::move(d);
     }
 
@@ -1124,11 +1133,17 @@ struct Executor::Impl {
         }
     }
 
+    // The sampled vocabulary.
+    [[nodiscard]] int sample_domain() const {
+        return static_cast<int>(model.resources().public_token_count);
+    }
+
     // The drafter's block over staged rows (the anchor, then masks, at the sequence's next
     // positions): its layers over the context and the block (every row seeing the anchor's window
     // and the whole block), the final norm, the head's products, then `k` steps of the recurrent
-    // head, their drafts and probabilities copied to the pinned buffer.
-    void spark_pass(int k) {
+    // head (`sampled`: each draws its draft among the candidates with the staged config and keys),
+    // their drafts and probabilities copied to the pinned buffer.
+    void spark_pass(int k, bool sampled) {
         Spark& d = *spark;
         const DSparkConfig& dc = *d.config;
         const int b = d.block, q = query_heads * kD, w = int(dc.intermediate_size);
@@ -1260,9 +1275,28 @@ struct Executor::Impl {
         sa.confidence   = static_cast<float*>(d.confidence.p);
         sa.joint        = scratch;
         sa.logits       = scratch + 3 * dc.markov_rank;
-        for (int i = 1; i <= k; ++i) {
-            sa.row = i;
-            kernels::spark_step(sa, stream);
+        if (!sampled) {
+            for (int i = 1; i <= k; ++i) {
+                sa.row = i;
+                kernels::spark_step(sa, stream);
+            }
+        } else {
+            sa.scores = static_cast<float*>(workspace->alloc_bytes(std::size_t(vocab) * 4).data);
+            sa.vocab  = vocab;
+            const auto* configs = static_cast<const ops::SamplingConfig*>(d.sampling.p);
+            auto* keys          = reinterpret_cast<std::int32_t*>(
+                static_cast<std::byte*>(d.sampling.p) + sizeof(ops::SamplingConfig));
+            const Tensor scores(sa.scores, DType::FP32, {vocab, 1});
+            for (int i = 1; i <= k; ++i) {
+                sa.row = i;
+                kernels::spark_score(sa, stream);
+                Tensor drawn(sa.drafts + i - 1, DType::I32, {1});
+                ops::sample(scores, drawn, std::min(vocab, sample_domain()), configs,
+                            Tensor(keys + i - 1, DType::I32, {1}), ops::kSamplePurposeDecode,
+                            *workspace, stream);
+                sa.sampled = sa.drafts + i - 1;
+                kernels::spark_take(sa, stream);
+            }
         }
         auto* host = static_cast<std::uint8_t*>(d.host->data());
         CUDA_CHECK(cudaMemcpyAsync(host, d.drafts.p, std::size_t(k) * 4, cudaMemcpyDeviceToHost, stream));
@@ -1270,8 +1304,10 @@ struct Executor::Impl {
                                    cudaMemcpyDeviceToHost, stream));
     }
 
+    // `config` and `length`: a row's sampler and committed length (draft()), or null.
     void spark_draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
-                     std::span<float> confidence) {
+                     std::span<float> confidence, const ops::SamplingConfig* config = nullptr,
+                     std::int32_t length = 0) {
         if (!spark) { throw std::logic_error("inkling2: an executor without the DSpark drafter"); }
         Spark& d    = *spark;
         const int b = d.block;
@@ -1290,7 +1326,25 @@ struct Executor::Impl {
         tokens[0] = anchor;
         for (int i = 0; i < b; ++i) { pos[i] = std::int32_t(first) + i; }
         stage(tokens, pos, seq);
-        run_graph(48 + std::uint32_t(k), [&] { spark_pass(k); });
+        const bool sampled = options.sampled_drafts && config != nullptr && config->temperature > 0.0F;
+        if (sampled) {
+            // The target's own draw of draft i's position is keyed (seed, length + i + 1).
+            auto* host = static_cast<std::byte*>(d.host_sampling->data());
+            ops::SamplingConfig c = *config;
+            c.presence_penalty    = 0.0F;
+            c.frequency_penalty   = 0.0F;
+            c.token_counts        = nullptr;
+            c.token_mask          = nullptr;
+            c.token_mask_stride   = 0;
+            c.non_finite_token    = 0;
+            std::memcpy(host, &c, sizeof(c));
+            auto* keys = reinterpret_cast<std::int32_t*>(host + sizeof(c));
+            for (int i = 0; i < k; ++i) { keys[i] = length + i + 1; }
+            CUDA_CHECK(cudaMemcpyAsync(d.sampling.p, host, sizeof(c) + std::size_t(k) * 4,
+                                       cudaMemcpyHostToDevice, stream));
+        }
+        run_graph((sampled ? 0x10000U : 0U) | (48 + std::uint32_t(k)),
+                  [&] { spark_pass(k, sampled); });
         d.copied->record(stream);
         d.copied->synchronize();
         const auto* host = static_cast<const std::uint8_t*>(d.host->data());
@@ -1612,6 +1666,10 @@ struct Executor::Impl {
         add(t * h * 4);                   // MoE raw mix
         if (options.dspark) {             // the drafter's stored taps
             add((model.dspark_config()->target_visits.size() - 1) * t * h * 4);
+            if (options.sampled_drafts) { // a sampled step's row and its sampler
+                add(std::size_t(vocab) * 4);
+                add(ops::sampling_workspace_capacity_bytes(std::min(vocab, sample_domain()), 1, 1));
+            }
         }
         // Visit scope.
         add(t * query_rows * 4);          // [Q; gate; relative]
@@ -3194,7 +3252,13 @@ struct Executor::Impl {
     }
 
     void draft(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> anchors,
-               std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence) {
+               std::uint32_t k, std::span<std::int32_t> drafts, std::span<float> confidence,
+               std::span<const ops::SamplingConfig> configs = {},
+               std::span<const std::int32_t> lengths       = {}) {
+        if ((!configs.empty() || !lengths.empty()) &&
+            (configs.size() != sequences.size() || lengths.size() != sequences.size())) {
+            throw std::invalid_argument("inkling2 draft: invalid samplers");
+        }
         if (spark) {
             if (anchors.size() != sequences.size() || drafts.size() != sequences.size() * k ||
                 confidence.size() != drafts.size()) {
@@ -3202,7 +3266,8 @@ struct Executor::Impl {
             }
             for (std::size_t j = 0; j < sequences.size(); ++j) {
                 spark_draft(sequences[j], anchors[j], drafts.subspan(j * k, k),
-                            confidence.subspan(j * k, k));
+                            confidence.subspan(j * k, k), configs.empty() ? nullptr : &configs[j],
+                            lengths.empty() ? 0 : lengths[j]);
             }
             return;
         }
@@ -3238,6 +3303,13 @@ struct Executor::Impl {
             std::vector<std::int32_t> drafts(options.draft_tokens);
             std::vector<float> confidence(options.draft_tokens);
             for (int pass = 0; pass < 2; ++pass) { spark_draft(0, 2, drafts, confidence); }
+            if (options.sampled_drafts) {
+                ops::SamplingConfig sampler;
+                sampler.temperature = 1.0F;
+                for (int pass = 0; pass < 2; ++pass) {
+                    spark_draft(0, 2, drafts, confidence, &sampler, 1);
+                }
+            }
         }
         positions[0] = 0;
         std::vector<std::uint32_t> sequences;
@@ -3580,8 +3652,10 @@ void Executor::commit(std::span<const std::uint32_t> sequences,
 
 void Executor::draft(std::span<const std::uint32_t> sequences,
                      std::span<const std::int32_t> anchors, std::uint32_t k,
-                     std::span<std::int32_t> drafts, std::span<float> confidence) {
-    impl_->draft(sequences, anchors, k, drafts, confidence);
+                     std::span<std::int32_t> drafts, std::span<float> confidence,
+                     std::span<const ops::SamplingConfig> configs,
+                     std::span<const std::int32_t> lengths) {
+    impl_->draft(sequences, anchors, k, drafts, confidence, configs, lengths);
 }
 
 std::uint32_t Executor::block_drafts() const noexcept {

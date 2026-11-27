@@ -42,6 +42,7 @@
 #include "models/expert_profile.h"
 #include "models/qwen4_exp/ngram_table.h"
 #include "ninfer/model_enums.h"
+#include "ninfer/ops/sampling.h"
 
 #include <cuda_runtime.h>
 
@@ -97,6 +98,9 @@ struct ExecutorOptions {
     // Drafts with the model's DSpine drafter (Model::dspine(), draft_tokens of them at most). When
     // it taps a decoder block, every prompt row runs every block (no prefill tail).
     bool dspine = false;
+    // --gumbel-sampling: the DSpark draft() may take a sampler, whose Markov chain then draws its
+    // drafts (runtime/contract/draft_sampling.h).
+    bool sampled_drafts = false;
     // The Engram table's rows and how they are read; none runs the model without its Engram (a
     // non-standard mode that degrades the output).
     std::optional<qwen4_exp::NgramTableLayout> engram_table;
@@ -248,9 +252,11 @@ public:
     [[nodiscard]] std::uint32_t dspark_block() const noexcept;
     // The drafter's greedy drafts of the dspark_block() positions after the sequence's next token
     // `anchor` (not yet run), and the confidence of each. The sequence's position and backbone
-    // state do not change.
+    // state do not change. With sampled_drafts and a `sampler` that samples, the chain draws draft
+    // i with it at the key length + i + 1 instead.
     void draft(std::uint32_t sequence, std::int32_t anchor, std::span<std::int32_t> drafts,
-               std::span<float> confidence);
+               std::span<float> confidence, const ops::SamplingConfig* sampler = nullptr,
+               std::int32_t length = 0);
     // DSpine (ExecutorOptions::dspine): for each of `sequences` (distinct, at most 8), the greedy
     // drafts of the `k` (1..draft_tokens) positions after its anchor, the token it reads next,
     // and each draft's probability under the drafter, k a sequence in `drafts` and `confidence`;

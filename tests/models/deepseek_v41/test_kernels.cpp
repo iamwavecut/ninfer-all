@@ -36,7 +36,8 @@
 //  - guard_columns (in one call and in calls of six columns) and unscale_columns, ring_copy,
 //    f32_to_bf16.
 //  - the DSpark drafter's: sparse_attention of a draft block (the window and the block's own
-//    rows), stream_mean, markov_step (a chain, ties, the domain) and dspark_confidence.
+//    rows), stream_mean, markov_step (a chain, ties, the domain), markov_scores (a sampled
+//    step's row, whose first maximum is markov_step's draft) and dspark_confidence.
 //  - the routed experts of a call on the CPU (CpuExperts) against the GPU's vector kernels over
 //    IQ1_S, IQ1_M, IQ2_XXS and IQ2_S banks: the same 2^-32 fixed-point sums bit for bit, all on
 //    the CPU and half on each (add_fixed).
@@ -1498,6 +1499,26 @@ void drafter(std::mt19937& rng) {
         report(first && got[2] == a, "markov_step: chain " + std::to_string(got[1]) + " (oracle " +
                                          std::to_string(best) + "), then " + std::to_string(got[2]) +
                                          " (the lower of two equal leaders, " + std::to_string(a) + ")");
+        // A sampled step's row: every score below the domain, none past it, and markov_step's
+        // draft its first maximum.
+        DeviceBuffer scores(std::size_t(vocab) * 4);
+        std::vector<float> marker(vocab, -7.0f);
+        check(cudaMemcpy(scores.p, marker.data(), marker.size() * 4, cudaMemcpyHostToDevice), "scores");
+        k::markov_scores(as<float>(dl), as<bf16>(dh), as<bf16>(de), domain, as<std::int32_t>(ids), 0,
+                         as<float>(scores), nullptr);
+        sync("markov_scores");
+        const auto row = download<float>(scores, vocab);
+        double worst_score = 0.0;
+        int top = 0;
+        for (int v = 0; v < domain; ++v) {
+            worst_score = std::max(worst_score, std::fabs(row[v] - value(logits.data(), 4242, v)));
+            if (row[v] > row[top]) { top = v; }
+        }
+        bool untouched = true;
+        for (int v = domain; v < vocab; ++v) { untouched = untouched && row[v] == -7.0f; }
+        report(worst_score <= 1e-4 && untouched && top == got[1],
+               "markov_scores: worst " + num(worst_score) + ", first maximum " + std::to_string(top) +
+                   (untouched ? "" : ", scores past the domain written"));
     }
     {
         const int t = 5;
