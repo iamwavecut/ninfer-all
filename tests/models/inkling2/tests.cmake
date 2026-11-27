@@ -28,3 +28,8 @@ ninfer_add_test(ninfer_inkling2_loop_kv_real_test STANDALONE
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_loop_kv_real.cpp"
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_inkling2_loop_kv_real_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_inkling2_wide_decode_real_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wide_decode_real.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_inkling2_wide_decode_real_test PROPERTIES SKIP_RETURN_CODE 77)

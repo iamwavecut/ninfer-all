@@ -12,3 +12,8 @@ ninfer_add_test(ninfer_flint_kv_planes_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv_planes.cpp"
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_flint_kv_planes_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_flint_wide_decode_real_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wide_decode_real.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_flint_wide_decode_real_test PROPERTIES SKIP_RETURN_CODE 77)
