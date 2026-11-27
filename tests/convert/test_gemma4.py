@@ -534,3 +534,139 @@ def test_the_artifact_stores_the_remediated_tokenizer_and_records_the_edit(tmp_p
         assert stored["model"]["merges"] == [["t3", "t4"]]
         assert artifact.directory.provenance["resource_edits"] == {
             "tokenizer.json": {"glitch_tokens": {"removed_merges": 1, "renamed_tokens": 0}}}
+
+
+DRAFT_HEADS, DRAFT_KV, DRAFT_DIM, DRAFT_WIDTH, MARKOV = 4, 2, 64, 128, 256
+
+
+def _drafter_config(**overrides):
+    config = dict(
+        architectures=["DFlashDraftModel"], model_type="qwen3", hidden_act="silu",
+        attention_bias=False, tie_word_embeddings=True, hidden_size=HIDDEN, vocab_size=VOCAB,
+        intermediate_size=DRAFT_WIDTH, num_hidden_layers=2, num_attention_heads=DRAFT_HEADS,
+        num_key_value_heads=DRAFT_KV, head_dim=DRAFT_DIM, num_target_layers=2, block_size=16,
+        sliding_window=2048, layer_types=["sliding_attention", "full_attention"],
+        rms_norm_eps=1e-6, rope_theta=1e6, rope_scaling=None, final_logit_softcapping=30.0,
+        dflash_config={"mask_token_id": 4, "target_layer_ids": [0, 1]})
+    config.update(overrides)
+    return config
+
+
+def _drafter_dir(tmp_path, name, markov=False, extra=(), **overrides):
+    """A two-layer DFlashDraftModel directory of the synthetic release's geometry: random
+    weight-sized BF16 values, with `markov` the vanilla Markov head's two tables."""
+    import struct
+
+    root = tmp_path / name
+    root.mkdir()
+    config = _drafter_config(**overrides)
+    if markov:
+        config |= {"markov_rank": MARKOV, "markov_head_type": "vanilla"}
+    (root / "config.json").write_text(json.dumps(config))
+    h, d = HIDDEN, DRAFT_DIM
+    q, kv = DRAFT_HEADS * d, DRAFT_KV * d
+    shapes = {"fc.weight": (h, 2 * h), "hidden_norm.weight": (h,), "norm.weight": (h,)}
+    for i in range(2):
+        g = f"layers.{i}."
+        shapes |= {
+            g + "input_layernorm.weight": (h,), g + "post_attention_layernorm.weight": (h,),
+            g + "self_attn.q_norm.weight": (d,), g + "self_attn.k_norm.weight": (d,),
+            g + "self_attn.q_proj.weight": (q, h), g + "self_attn.k_proj.weight": (kv, h),
+            g + "self_attn.v_proj.weight": (kv, h), g + "self_attn.o_proj.weight": (h, q),
+            g + "mlp.gate_proj.weight": (DRAFT_WIDTH, h), g + "mlp.up_proj.weight": (DRAFT_WIDTH, h),
+            g + "mlp.down_proj.weight": (h, DRAFT_WIDTH)}
+    if markov:
+        shapes |= {"markov_head.markov_w1.weight": (VOCAB, MARKOV),
+                   "markov_head.markov_w2.weight": (VOCAB, MARKOV)}
+    for tensor in extra:
+        shapes[tensor] = (VOCAB, h)
+    rng = np.random.default_rng(len(name))
+    tensors, header, data, offset = {}, {}, b"", 0
+    for tensor, shape in shapes.items():
+        # Weight-sized values, so the Q8 group scales stay within FP16.
+        values = (rng.standard_normal(size=shape) * 0.05).astype(np.float32)
+        words = (values.view(np.uint32) >> 16).astype(np.uint16)
+        raw = words.astype("<u2").tobytes()
+        header[tensor] = {"dtype": "BF16", "shape": list(shape),
+                          "data_offsets": [offset, offset + len(raw)]}
+        tensors[tensor], data, offset = words, data + raw, offset + len(raw)
+    encoded = json.dumps(header).encode()
+    (root / "model.safetensors").write_bytes(struct.pack("<Q", len(encoded)) + encoded + data)
+    return root, tensors
+
+
+def _convert_drafters(tmp_path, hf, path, drafters):
+    from tools.convert.pipeline import convert
+    from tools.convert.recipe import Recipe
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    output = tmp_path / "gemma-drafters.ninfer"
+    with SafetensorsSource(hf) as base, GGUFFile(path) as gguf:
+        stores = {name: SafetensorsSource(root) for name, root in drafters.items()}
+        model = gemma4.build_model(base, gguf, drafters=stores)
+        recipe = Recipe(model)
+        gemma4.gemma4_gguf(model, recipe, {"base": base, "gguf": gguf} | stores)
+        convert(model, recipe, output, device="cpu")
+    return output
+
+
+def test_the_dflash_and_dspark_drafters_join_as_their_components(tmp_path):
+    from tools.artifact.reader import Artifact
+
+    hf, path, _ = _release(tmp_path, dense=True)
+    dflash, dflash_tensors = _drafter_dir(tmp_path, "dflash")
+    dspark, dspark_tensors = _drafter_dir(tmp_path, "dspark", markov=True)
+    output = _convert_drafters(tmp_path, hf, path, {"dflash": dflash, "dspark": dspark})
+    with Artifact(output) as artifact:
+        directory = artifact.directory
+        for name, rank in (("dflash", 0), ("dspark", MARKOV)):
+            config = directory.components[name]["config"]
+            assert directory.components[name]["target"] == "text"
+            assert config["architectures"] == [gemma4.DRAFTER_ARCHITECTURE]
+            assert config["layer_types"] == ["sliding_attention", "full_attention"]
+            assert config["target_layer_ids"] == [0, 1] and config["mask_token_id"] == 4
+            assert config["num_attention_heads"] == DRAFT_HEADS
+            assert config["logit_softcap"] == 30.0 and config["markov_rank"] == rank
+            assert config["rope_theta"] == 1e6 and config["sliding_window"] == 2048
+        bindings = directory.bindings
+        read = lambda name: artifact.read_object(bindings[name]["object"])
+        # Norms and the Markov tables keep the checkpoint's BF16 words.
+        for name, tensor, tensors in (
+                ("dflash/context_norm", "hidden_norm.weight", dflash_tensors),
+                ("dflash/layers/1/attention/key_norm", "layers.1.self_attn.k_norm.weight",
+                 dflash_tensors),
+                ("dspark/markov/embedding", "markov_head.markov_w1.weight", dspark_tensors),
+                ("dspark/markov/output", "markov_head.markov_w2.weight", dspark_tensors)):
+            assert read(name) == tensors[tensor].astype("<u2").tobytes()
+        assert "dflash/markov/embedding" not in bindings
+        assert "dflash/output_head" not in bindings and "dspark/token_rows" not in bindings
+        formats = {name: artifact.by_id[bindings[name]["object"]].format
+                   for name in bindings if name.startswith(("dflash/", "dspark/"))}
+    projections = {f"layers/{i}/{role}" for i in range(2) for role in (
+        "attention/query", "attention/key", "attention/value", "attention/output", "mlp/gate",
+        "mlp/up", "mlp/down")} | {"feature_projection"}
+    for name, fmt in formats.items():
+        expected = "q8_g32_fp16" if name.split("/", 1)[1] in projections else "bf16"
+        assert fmt == expected, name
+
+
+@pytest.mark.parametrize("component, markov, overrides, extra, message", [
+    ("dspark", False, {}, (), "vanilla Markov head"),
+    ("dflash", True, {}, (), "convert it as dspark"),
+    ("dflash", False, {"hidden_size": HIDDEN * 2}, (), "hidden_size"),
+    ("dflash", False, {"num_target_layers": 3}, (), "num_target_layers"),
+    ("dflash", False, {"final_logit_softcapping": None}, (), "final_logit_softcapping"),
+    ("dflash", False, {"layer_types": ["sliding_attention"]}, (), "layer_types"),
+    ("dflash", False, {"dflash_config": {"mask_token_id": 4, "target_layer_ids": [1, 0]}}, (),
+     "target_layer_ids"),
+    ("dflash", False, {}, ("lm_head.weight",), "does not implement"),
+])
+def test_a_drafter_the_target_cannot_run_is_refused(tmp_path, component, markov, overrides,
+                                                    extra, message):
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    hf, path, _ = _release(tmp_path, dense=True)
+    root, _ = _drafter_dir(tmp_path, component, markov=markov, extra=extra, **overrides)
+    with SafetensorsSource(hf) as base, GGUFFile(path) as gguf, SafetensorsSource(root) as store:
+        with pytest.raises(ValueError, match=message):
+            gemma4.build_model(base, gguf, drafters={component: store})
