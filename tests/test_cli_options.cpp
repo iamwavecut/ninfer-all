@@ -790,7 +790,7 @@ int run_tests() {
                       "CLI accepted an unknown log level");
     failures +=
         check(rejects([] {
-                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "21"});
+                  (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--top-k", "65"});
               }),
               "CLI accepted top_k beyond the executable candidate domain");
     failures += check(rejects([] {

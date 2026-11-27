@@ -702,7 +702,7 @@ int top64_candidate_set_contract() {
     }
     int failures = 0;
     for (const int width : {8, 17}) {
-        RunResult result = run_repeated(column, token_domain, 8192, width, config, 3000,
+        RunResult result = run_repeated(column, token_domain, width * 1024, width, config, 3000,
                                         ops::kSamplePurposeDecode);
         failures += result.integrity_failures +
                     verify_distribution(width == 8 ? "sample top-64 multi-block route"
