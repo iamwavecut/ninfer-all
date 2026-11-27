@@ -432,7 +432,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
 | `--post-thinking-sampler temp=F,top_p=F,top_k=N[,min_p=F,presence=F,frequency=F]` | the same overrides in one flag | preset |
 | `--temperature F` | sampling temperature override | registered model/mode default |
 | `--top-p F` | nucleus-threshold override | registered model/mode default |
-| `--top-k N` | top-k-threshold override (`0..20`; zero selects the top-20 cap) | registered model/mode default |
+| `--top-k N` | top-k-threshold override (`0..64`; zero selects the top-64 cap) | registered model/mode default |
 | `--min-p F` | min-p-threshold override | registered model/mode default |
 | `--presence-penalty F` | presence-penalty override | registered model/mode default |
 | `--frequency-penalty F` | frequency-penalty override | registered model/mode default (`0`) |

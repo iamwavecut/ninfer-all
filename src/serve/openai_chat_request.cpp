@@ -856,7 +856,7 @@ void parse_sampling(const Json& body, GenerationRequest& output) {
     // to NInfer's native sampler and are useful for Qwen's published sampling presets.
     sampling.top_k = optional_int(body, "top_k");
     sampling.min_p = get_number(body, "min_p");
-    output.post_thinking = parse_post_thinking(body, 2.0);
+    output.post_thinking = parse_post_thinking(body);
 
     if (const std::optional<int> count = optional_int(body, "n")) {
         if (*count != 1) {

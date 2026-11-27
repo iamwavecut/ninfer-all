@@ -75,7 +75,7 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   A reached thinking budget, or the [reasoning-loop guard](serving.md#openai-chat-completions)
   under `conclude`, closes the reasoning with Qwen's early-close guidance and the `</think>` token,
   and the model answers from what it has thought.
-- **Sampling defaults.** The release's: temperature 1.0, top-p 1.0 (top-k 20, the candidates the
+- **Sampling defaults.** The release's: temperature 1.0, top-p 1.0 (top-k 64, the candidates the
   sampler keeps).
 - **Speculative decoding with the DSpark drafter.** An artifact converted with the release's drafter
   (the `dspark` component, from beamster's STQ pack as in the published artifact, or from Unsloth's

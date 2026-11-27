@@ -29,6 +29,10 @@ enum class SamplingMode : std::uint8_t {
     NonThinking,
 };
 
+// The sampler keeps at most this many candidates. A request top_k above it is clamped to it; zero
+// means no explicit limit, the same as the cap.
+inline constexpr std::int32_t kSamplingTopKCap = 64;
+
 // Immutable model-owned values used when a request does not override a sampling field. Seed is
 // deliberately excluded: it is an execution choice rather than a model recommendation.
 struct SamplingPreset {

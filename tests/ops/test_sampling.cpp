@@ -168,8 +168,8 @@ Distribution distribution_oracle(const std::vector<float>& column, int token_dom
         return a.token < b.token;
     });
 
-    int cap = 20;
-    if (config.top_k > 0 && config.top_k < 20) { cap = config.top_k; }
+    int cap = 64;
+    if (config.top_k > 0 && config.top_k < 64) { cap = config.top_k; }
     cap = std::min(cap, token_domain);
     candidates.resize(static_cast<std::size_t>(cap));
 
@@ -631,19 +631,19 @@ int gumbel_contract() {
 }
 
 int capped_distribution_contract() {
-    std::vector<float> column(24, 0.0f);
-    for (int token = 0; token < 24; ++token) {
-        column[static_cast<std::size_t>(token)] = 2.0f - 0.1f * token;
+    std::vector<float> column(80, 0.0f);
+    for (int token = 0; token < 80; ++token) {
+        column[static_cast<std::size_t>(token)] = 2.0f - 0.03125f * token;
     }
     round_to_bf16(column);
     ops::SamplingConfig config;
     config.temperature = 1.1f;
-    config.top_k       = 64;
+    config.top_k       = 100;
     config.seed        = 884422;
 
     const Distribution oracle =
         distribution_oracle(column, static_cast<int>(column.size()), config);
-    if (oracle.tokens.size() != 20) {
+    if (oracle.tokens.size() != 64) {
         std::cerr << "top-k cap oracle fixture has unexpected support\n";
         return 1;
     }
@@ -677,6 +677,39 @@ int real_shape_distribution_contract() {
         run_repeated(column, token_domain, samples, 8, config, 2000, ops::kSamplePurposeDecode);
     return result.integrity_failures +
            verify_distribution("sample real token-domain B=8", result.tokens, oracle);
+}
+
+// The 64-candidate cap at the real token domain: 70 tokens tie at the top logit, one or none per
+// partial tile, so every merge level meets them. The 64 lowest ids are the support and the other
+// six never appear, on the multi-block route (8 columns) and on the single-block fallback (17).
+int top64_candidate_set_contract() {
+    constexpr int physical_rows = 248320;
+    constexpr int token_domain  = 248077;
+    std::vector<float> column(physical_rows, -20.0f);
+    for (int i = 0; i < 70; ++i) { column[static_cast<std::size_t>(17 + i * 3541)] = 4.0f; }
+    column[token_domain]      = 100.0f;
+    column[physical_rows - 1] = 200.0f;
+    round_to_bf16(column);
+
+    ops::SamplingConfig config;
+    config.temperature        = 1.0f;
+    config.top_k              = 0;
+    config.seed               = 646464;
+    const Distribution oracle = distribution_oracle(column, token_domain, config);
+    if (oracle.tokens.size() != 64 || oracle.tokens.back() != 17 + 63 * 3541) {
+        std::cerr << "top-64 oracle fixture has unexpected support\n";
+        return 1;
+    }
+    int failures = 0;
+    for (const int width : {8, 17}) {
+        RunResult result = run_repeated(column, token_domain, width * 1024, width, config, 3000,
+                                        ops::kSamplePurposeDecode);
+        failures += result.integrity_failures +
+                    verify_distribution(width == 8 ? "sample top-64 multi-block route"
+                                                   : "sample top-64 single-block fallback",
+                                        result.tokens, oracle);
+    }
+    return failures;
 }
 
 int rng_key_contract() {
@@ -890,6 +923,7 @@ int run_contracts() {
     failures += gumbel_contract();
     failures += capped_distribution_contract();
     failures += real_shape_distribution_contract();
+    failures += top64_candidate_set_contract();
     failures += rng_key_contract();
     failures += workspace_route_boundary_contract();
     failures += workspace_route_rng_contract();

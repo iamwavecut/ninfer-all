@@ -85,12 +85,12 @@ int main() {
     overrides.seed              = 123;
     const ninfer::ResolvedSamplingParameters overridden =
         ninfer::runtime::resolve_sampling(dense, ninfer::SamplingMode::NonThinking, overrides);
-    failures += check(overridden.temperature == 0.0F && overridden.top_k == 20 &&
+    failures += check(overridden.temperature == 0.0F && overridden.top_k == 64 &&
                           overridden.top_p == 0.0F && overridden.presence_penalty == 0.0F &&
                           overridden.frequency_penalty == -1.0F && overridden.seed == 123,
                       "explicit zero sampling overrides were not normalized to the target cap");
 
-    overrides.top_k = 21;
+    overrides.top_k = 65;
     failures += check(throws_invalid([&] {
                           (void)ninfer::runtime::resolve_sampling(
                               dense, ninfer::SamplingMode::Thinking, overrides);

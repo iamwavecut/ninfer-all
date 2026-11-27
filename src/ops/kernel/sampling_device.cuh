@@ -3,7 +3,7 @@
 // Shared implementation primitives for include/ninfer/ops/sampling.h and
 // include/ninfer/ops/speculative_round.h. The ordering key is exact for finite BF16
 // logits (including numeric-zero ties); candidate storage is bounded by the
-// semantic top-20 cap and all global staging is supplied by the caller.
+// public top-k cap (kSamplerCandidateCap) and all global staging is supplied by the caller.
 
 #include "ops/common/math.h"
 #include "ops/common/sampling_workspace.h"
@@ -34,8 +34,6 @@ __device__ __forceinline__ unsigned int sampling_lane_max(unsigned int mask, uns
 
 using SamplingPartialSort =
     cub::BlockMergeSort<unsigned long long, kSamplerBlock, kSamplerItemsPerThread>;
-using SamplingGroupSort =
-    cub::BlockMergeSort<unsigned long long, kSamplerGroupBlock, kSamplerGroupItemsPerThread>;
 inline constexpr int kSamplingTileWarps              = kSamplerBlock / 32;
 inline constexpr int kSamplingTileIndexBits          = 9;
 inline constexpr unsigned int kSamplingTileIndexMask = (1u << kSamplingTileIndexBits) - 1u;
@@ -419,48 +417,160 @@ sampling_build_truncated_small(const Logit* logits, std::int64_t base, std::int3
     sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, cap);
 }
 
-// Single-block fallback for large columns when the finite multi-block workspace
-// route cannot represent the launch. It still reads each vocab entry once and
-// keeps a bounded per-thread top-20, so it avoids a top_k*vocab global reread.
+// Warp-level merge of sorted candidate lists. The calling warp (all 32 lanes) writes to out[0..cap)
+// the first `cap` keys, descending, of `list_count` <= 32 lists sorted descending, list l at
+// lists[l * stride] with `cap` keys. Empty keys (0) rank last.
+__device__ inline void sampling_merge_sorted_lists(const unsigned long long* lists, int list_count,
+                                                   int stride, int cap, unsigned long long* out) {
+    constexpr unsigned int kFull = 0xffffffffu;
+    const int lane               = static_cast<int>(threadIdx.x) & 31;
+    int position                 = 0;
+    for (int rank = 0; rank < cap; ++rank) {
+        const unsigned long long key =
+            lane < list_count && position < cap ? lists[lane * stride + position] : 0ull;
+        const unsigned int high     = static_cast<unsigned int>(key >> 32);
+        const unsigned int max_high = sampling_lane_max<32>(kFull, high);
+        const unsigned int low      = high == max_high ? static_cast<unsigned int>(key) : 0u;
+        const unsigned int max_low  = sampling_lane_max<32>(kFull, low);
+        const unsigned int winners  = __ballot_sync(kFull, high == max_high && low == max_low);
+        const int source            = __ffs(static_cast<int>(winners)) - 1;
+        if (lane == 0) { out[rank] = (static_cast<unsigned long long>(max_high) << 32) | max_low; }
+        if (lane == source) { ++position; }
+    }
+}
+
+struct SamplingMergeStorage {
+    unsigned long long lists[kSamplerPartialsPerGroup * kSamplerCandidateCap];
+    unsigned long long merged[kSamplerCandidateCap];
+};
+
+// All threads of the block must call. Merges the top-cap lists of `count` <= 32 consecutive
+// workspace slots from `first` into storage.merged[0..cap).
+__device__ inline void sampling_merge_workspace_lists(const SamplingWorkspace& workspace, int col,
+                                                      int first, int count, int cap,
+                                                      SamplingMergeStorage& storage) {
+    const unsigned long long* source =
+        workspace.partial_keys + sampling_partial_offset(workspace, col, first, 0);
+    for (int i = static_cast<int>(threadIdx.x); i < count * kSamplerCandidateCap;
+         i += static_cast<int>(blockDim.x)) {
+        if (i % kSamplerCandidateCap < cap) { storage.lists[i] = source[i]; }
+    }
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        sampling_merge_sorted_lists(storage.lists, count, kSamplerCandidateCap, cap,
+                                    storage.merged);
+    }
+    __syncthreads();
+}
+
+// All threads of the block must call. Writes storage.merged[0..cap) to workspace slot `slot`.
+__device__ inline void sampling_store_merged(const SamplingWorkspace& workspace, int col, int slot,
+                                             int cap, const SamplingMergeStorage& storage) {
+    for (int rank = static_cast<int>(threadIdx.x); rank < cap;
+         rank += static_cast<int>(blockDim.x)) {
+        workspace.partial_keys[sampling_partial_offset(workspace, col, slot, rank)] =
+            storage.merged[rank];
+    }
+}
+
+struct SamplingBlockTopKStorage {
+    typename SamplingTileWarpSort::TempStorage warp[kSamplingTileWarps];
+    unsigned long long chunk[kSamplingTileWarps][32 * kSamplerItemsPerThread];
+    unsigned long long list[2][kSamplingTileWarps][kSamplerCandidateCap];
+    unsigned long long merged[kSamplerCandidateCap];
+};
+
+// Number of keys in the descending list[0..n) greater than key.
+__device__ __forceinline__ int sampling_count_greater(const unsigned long long* list, int n,
+                                                      unsigned long long key) {
+    int lo = 0;
+    int hi = n;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (list[mid] > key) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+// Single-block fallback for large columns when the finite multi-block workspace route cannot
+// represent the launch. Each warp reads its share of the vocabulary once, 64 tokens at a time,
+// and keeps its own exact top-cap list: a slice none of whose keys beats the list's last is
+// skipped, any other is sorted and merged in. Warp 0 then merges the eight lists.
 template <typename Logit>
 __device__ __forceinline__ void
 sampling_build_truncated_block_fast(const Logit* logits, std::int64_t base, std::int32_t vocab,
-                                    const SamplingConfig& cfg, float* merge_val, int* merge_idx,
+                                    const SamplingConfig& cfg, SamplingBlockTopKStorage& storage,
                                     float* cand_val, int* cand_idx, float* prob, int* n_support,
                                     const std::int32_t* overlay = nullptr, int overlay_len = 0) {
-    const int tid = threadIdx.x;
-    const int cap = sampling_candidate_cap(cfg, vocab); // always <= kSamplerFastCandidates
+    constexpr int kSlice         = 32 * kSamplerItemsPerThread;
+    constexpr unsigned int kFull = 0xffffffffu;
+    const int warp               = static_cast<int>(threadIdx.x) >> 5;
+    const int lane               = static_cast<int>(threadIdx.x) & 31;
+    const int warps              = static_cast<int>(blockDim.x) >> 5;
+    const int cap                = sampling_candidate_cap(cfg, vocab);
 
-    float* th_val = &merge_val[tid * kSamplerFastCandidates];
-    int* th_idx   = &merge_idx[tid * kSamplerFastCandidates];
+    int current = 0;
+    for (int j = lane; j < cap; j += 32) { storage.list[0][warp][j] = 0ull; }
+    __syncwarp();
+    unsigned long long threshold = 0ull;
+    for (int slice = warp * kSlice; slice < vocab; slice += warps * kSlice) {
+        unsigned long long keys[kSamplerItemsPerThread];
+        bool enters = false;
 #pragma unroll
-    for (int j = 0; j < kSamplerFastCandidates; ++j) {
-        th_val[j] = -CUDART_INF_F;
-        th_idx[j] = INT_MAX;
+        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            const int v = slice + item * 32 + lane;
+            keys[item]  = v < vocab ? sampling_sort_key(sampling_adjusted_logit(
+                                                           sampling_logit(logits[base + v]), v, cfg,
+                                                           overlay, overlay_len),
+                                                       v)
+                                    : 0ull;
+            enters      = enters || keys[item] > threshold;
+        }
+        if (!__any_sync(kFull, enters)) { continue; }
+        SamplingTileWarpSort(storage.warp[warp]).Sort(keys, SamplingKeyGreater{});
+#pragma unroll
+        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            storage.chunk[warp][lane * kSamplerItemsPerThread + item] = keys[item];
+        }
+        __syncwarp();
+        const unsigned long long* list = storage.list[current][warp];
+        unsigned long long* next       = storage.list[current ^ 1][warp];
+#pragma unroll
+        for (int item = 0; item < kSamplerItemsPerThread; ++item) {
+            const int rank = lane * kSamplerItemsPerThread + item +
+                             sampling_count_greater(list, cap, keys[item]);
+            if (rank < cap) { next[rank] = keys[item]; }
+        }
+        for (int j = lane; j < cap; j += 32) {
+            const int rank = j + sampling_count_greater(storage.chunk[warp], kSlice, list[j]);
+            if (rank < cap) { next[rank] = list[j]; }
+        }
+        __syncwarp();
+        current ^= 1;
+        threshold = storage.list[current][warp][cap - 1];
     }
-
-    const int fast_cap = cap;
-    for (int v = tid; v < vocab; v += blockDim.x) {
-        const float x =
-            sampling_adjusted_logit(sampling_logit(logits[base + v]), v, cfg, overlay, overlay_len);
-        sampling_insert_candidate(th_val, th_idx, fast_cap, x, v);
+    if (current != 0) {
+        for (int j = lane; j < cap; j += 32) {
+            storage.list[0][warp][j] = storage.list[1][warp][j];
+        }
     }
     __syncthreads();
-
-    if (tid == 0) {
-        for (int j = 0; j < cap; ++j) {
-            cand_val[j] = -CUDART_INF_F;
-            cand_idx[j] = INT_MAX;
-        }
-        const int merge_n = blockDim.x * kSamplerFastCandidates;
-        for (int p = 0; p < merge_n; ++p) {
-            const int idx = merge_idx[p];
-            if (idx == INT_MAX) { continue; }
-            sampling_insert_candidate(cand_val, cand_idx, fast_cap, merge_val[p], idx);
-        }
+    if (warp == 0) {
+        sampling_merge_sorted_lists(&storage.list[0][0][0], warps, kSamplerCandidateCap, cap,
+                                    storage.merged);
     }
     __syncthreads();
-    sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, fast_cap);
+    for (int rank = static_cast<int>(threadIdx.x); rank < cap;
+         rank += static_cast<int>(blockDim.x)) {
+        cand_val[rank] = sampling_key_float(storage.merged[rank]);
+        cand_idx[rank] = sampling_key_index(storage.merged[rank]);
+    }
+    __syncthreads();
+    sampling_normalize_support(cfg, cand_val, cand_idx, prob, n_support, cap);
 }
 
 // thread-0 helper: the inverse-CDF draw of every keyed sample -- the rank of the first candidate

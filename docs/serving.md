@@ -1195,11 +1195,11 @@ The endpoint supports:
   processing without generation; llama.cpp's `-1` ("no limit", the WebUI's default) and omitting
   both apply the [default output limit](#default-output-limit); llama.cpp's `n_predict` overrides
   both, as on llama.cpp's server, and any negative `n_predict` is no limit;
-- `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
+- `temperature` (any value from `0`, with no upper bound), `top_p`, presence/frequency penalties
+  (any finite value), and signed integer `seed`;
 - the compatible `top_k` and `min_p` (`0..1`) sampler extensions; `top_k` is a non-negative
-  integer, and a value above the sampler's 20-candidate domain is clamped to 20 rather than
-  rejected (llama.cpp and Ollama default to 40), on every endpoint and in `post_thinking`; the
-  request log records the effective value;
+  integer, and a value above the sampler's 64-candidate domain is clamped to 64 rather than
+  rejected, on every endpoint and in `post_thinking`; the request log records the effective value;
 - the `post_thinking` extension object (see [post-thinking sampling](#post-thinking-sampling));
 - up to four non-empty stop strings, applied to both reasoning and answer output;
 - the `ignore_eos` benchmarking extension shared with vLLM, SGLang and llama.cpp: a boolean,
@@ -1746,7 +1746,7 @@ curl http://127.0.0.1:8080/v1/completions -d '{"prompt": "The capital of France 
 ```
 
 Both accept `temperature` (below zero samples greedily), `top_k` (zero or below is the widest
-candidate set, 20), `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `seed` (negative for
+candidate set, 64), `top_p`, `min_p`, `presence_penalty`, `frequency_penalty`, `seed` (negative for
 a random one), `stop` (a string or up to 32 strings), [`bad_words`](#banned-words), `ignore_eos`,
 `stream`, `timings_per_token`,
 `response_format`, the vLLM and llama.cpp constraint fields of [Structured
@@ -2102,7 +2102,7 @@ wire response contains typed `output` Items.
 | `max_output_tokens` | non-negative integer; omission executes with the [default output limit](#default-output-limit) but remains `null` in the Response object |
 | `stream` | boolean; `true` selects Responses SSE rather than a JSON body |
 | `store` | boolean, default `true`; controls local retrieval and continuation state |
-| `temperature` | finite number in `[0,2]` |
+| `temperature` | finite number, `0` or more |
 | `top_p` | finite number in `[0,1]` |
 | `metadata` | at most 16 string pairs; keys at most 64 characters and values at most 512 |
 | `client_metadata` | Codex client extension; an object or `null`, accepted as opaque tracing metadata with no generation effect |
@@ -2416,8 +2416,8 @@ explicitly.
 `max_tokens` is optional for local clients and otherwise uses the
 [default output limit](#default-output-limit); a positive
 value is the complete output budget. `max_tokens:0` is rejected because NInfer does not expose a
-completed zero-output cache-prewarm lifecycle. `temperature`, `top_p`, `top_k` (clamped to 20
-like the OpenAI endpoints), `stop_sequences` and vLLM's [`bad_words`](#banned-words) enter Engine
+completed zero-output cache-prewarm lifecycle. `temperature` (`0` or more, past Anthropic's `1`),
+`top_p`, `top_k` (clamped to 64 like the OpenAI endpoints), `stop_sequences` and vLLM's [`bad_words`](#banned-words) enter Engine
 execution. A matched custom stop is returned as
 `stop_reason:"stop_sequence"` together with the actual `stop_sequence`; context exhaustion returns
 `model_context_window_exceeded`.
@@ -2833,7 +2833,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
-| `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |
+| `--top-k N` | process-level top-k override (`0..64`; zero selects the top-64 cap) | unset |
 | `--min-p F` | process-level min-p override | unset |
 | `--presence-penalty F` | process-level presence-penalty override | unset |
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
@@ -2876,7 +2876,7 @@ request enables it with a `post_thinking` object on Chat Completions, Responses 
 {"post_thinking": {"temperature": 0.1, "top_k": 10}}
 ```
 
-The object accepts `temperature` (`0..2`; `0..1` on Messages), `top_p`, `top_k`, `min_p`,
+The object accepts `temperature` (`0` or more), `top_p`, `top_k`, `min_p`,
 `presence_penalty`, `frequency_penalty` and `seed`; an empty object selects the preset. Request
 fields override the server's post-thinking flags, omitted fields come from the preset, an omitted
 seed continues the request's seed, and `--greedy` forces temperature `0` in both phases. A request

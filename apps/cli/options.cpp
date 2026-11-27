@@ -358,12 +358,12 @@ std::string usage_text(const char* argv0) {
            "                                memory, committing arenas at startup\n"
            "\n"
            "SAMPLING\n"
-           "  --temperature F               0..2\n"
+           "  --temperature F               0 or more\n"
            "  --top-p F                     0..1\n"
-           "  --top-k N                     0..20\n"
+           "  --top-k N                     0..64\n"
            "  --min-p F                     0..1\n"
-           "  --presence-penalty F          -2..2\n"
-           "  --frequency-penalty F         -2..2\n"
+           "  --presence-penalty F          any finite value\n"
+           "  --frequency-penalty F         any finite value\n"
            "  --seed N                      fixed random seed\n"
            "  --greedy                      force temperature 0 (exact argmax)\n"
            "  --gumbel-sampling             draw sampled tokens by Gumbel-max over keyed\n"
@@ -374,9 +374,9 @@ std::string usage_text(const char* argv0) {
            "  --post-thinking               sample the answer of a thinking request with the\n"
            "                                post-thinking preset (temperature 0.2) from the\n"
            "                                token after its reasoning closes (default off)\n"
-           "  --post-thinking-temperature F 0..2; implies --post-thinking\n"
+           "  --post-thinking-temperature F 0 or more; implies --post-thinking\n"
            "  --post-thinking-top-p F       0..1; implies --post-thinking\n"
-           "  --post-thinking-top-k N       0..20; implies --post-thinking\n"
+           "  --post-thinking-top-k N       0..64; implies --post-thinking\n"
            "  --post-thinking-sampler temp=F,top_p=F,top_k=N[,min_p=F,presence=F,frequency=F]\n"
            "                                the same fields in one flag\n"
            "  --stop-token-id N             stop on this token id; repeatable\n"
@@ -721,21 +721,27 @@ Options parse_arguments(const std::vector<std::string>& arguments,
                 .channel = arg == "--stop" ? OutputChannel::Content : OutputChannel::Reasoning,
             });
         } else if (arg == "--temperature") {
-            options.sampling.temperature = parse_float(value(arg), "temperature", 0.0F, 2.0F);
+            options.sampling.temperature = parse_float(value(arg), "temperature", 0.0F,
+                                                       std::numeric_limits<float>::max());
         } else if (arg == "--top-p") {
             options.sampling.top_p = parse_float(value(arg), "top-p", 0.0F, 1.0F);
         } else if (arg == "--top-k") {
             const std::uint32_t top_k = parse_u32(value(arg), "top-k", true);
-            if (top_k > 20) { throw std::invalid_argument("--top-k must be in [0,20]"); }
+            if (top_k > static_cast<std::uint32_t>(kSamplingTopKCap)) {
+                throw std::invalid_argument("--top-k must be in [0," +
+                                            std::to_string(kSamplingTopKCap) + "]");
+            }
             options.sampling.top_k = static_cast<std::int32_t>(top_k);
         } else if (arg == "--min-p") {
             options.sampling.min_p = parse_float(value(arg), "min-p", 0.0F, 1.0F);
         } else if (arg == "--presence-penalty") {
             options.sampling.presence_penalty =
-                parse_float(value(arg), "presence-penalty", -2.0F, 2.0F);
+                parse_float(value(arg), "presence-penalty", -std::numeric_limits<float>::max(),
+                            std::numeric_limits<float>::max());
         } else if (arg == "--frequency-penalty") {
             options.sampling.frequency_penalty =
-                parse_float(value(arg), "frequency-penalty", -2.0F, 2.0F);
+                parse_float(value(arg), "frequency-penalty", -std::numeric_limits<float>::max(),
+                            std::numeric_limits<float>::max());
         } else if (arg == "--seed") {
             options.sampling.seed = parse_u64(value(arg), "seed");
         } else if (product::switch_option(arg, "greedy", [&](bool on) { options.greedy = on; })) {

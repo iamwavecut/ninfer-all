@@ -5,6 +5,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -25,8 +26,8 @@ inline void set_post_thinking_field(SamplingOverrides& out, std::string_view key
         std::int32_t value      = 0;
         const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
         if (text.empty() || error != std::errc{} || end != text.data() + text.size() || value < 0 ||
-            value > 20) {
-            throw invalid("[0,20]");
+            value > kSamplingTopKCap) {
+            throw invalid("[0,64]");
         }
         out.top_k = value;
         return;
@@ -39,12 +40,13 @@ inline void set_post_thinking_field(SamplingOverrides& out, std::string_view key
         std::optional<float> SamplingOverrides::* member;
     };
 
+    static constexpr double kLargest = std::numeric_limits<float>::max();
     static constexpr Field kFields[] = {
-        {"temp", 0.0, 2.0, "[0,2]", &SamplingOverrides::temperature},
+        {"temp", 0.0, kLargest, "[0,inf)", &SamplingOverrides::temperature},
         {"top_p", 0.0, 1.0, "[0,1]", &SamplingOverrides::top_p},
         {"min_p", 0.0, 1.0, "[0,1]", &SamplingOverrides::min_p},
-        {"presence", -2.0, 2.0, "[-2,2]", &SamplingOverrides::presence_penalty},
-        {"frequency", -2.0, 2.0, "[-2,2]", &SamplingOverrides::frequency_penalty},
+        {"presence", -kLargest, kLargest, "(-inf,inf)", &SamplingOverrides::presence_penalty},
+        {"frequency", -kLargest, kLargest, "(-inf,inf)", &SamplingOverrides::frequency_penalty},
     };
     for (const Field& field : kFields) {
         if (field.key != key) { continue; }

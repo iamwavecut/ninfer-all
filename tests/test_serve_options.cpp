@@ -1319,7 +1319,7 @@ int main() {
                       "server sampling flags did not preserve explicit values and zeros");
     bool oversized_top_k_rejected = false;
     try {
-        (void)parse({"ninfer-serve", "model.ninfer", "--top-k", "21"});
+        (void)parse({"ninfer-serve", "model.ninfer", "--top-k", "65"});
     } catch (const std::invalid_argument&) { oversized_top_k_rejected = true; }
     failures += check(oversized_top_k_rejected,
                       "server accepted top_k beyond the executable candidate domain");
@@ -2049,8 +2049,8 @@ int main() {
                                   !fields.post_thinking_overrides->min_p,
                               "--post-thinking-* fields were not parsed");
             for (const std::vector<std::string>& bad :
-                 {std::vector<std::string>{"--post-thinking-temperature", "2.5"},
-                  std::vector<std::string>{"--post-thinking-top-k", "21"},
+                 {std::vector<std::string>{"--post-thinking-temperature", "-0.5"},
+                  std::vector<std::string>{"--post-thinking-top-k", "65"},
                   std::vector<std::string>{"--post-thinking-sampler", "temp"},
                   std::vector<std::string>{"--post-thinking-sampler", "seed=1"},
                   std::vector<std::string>{"--post-thinking-sampler", "top_p=nan"}}) {

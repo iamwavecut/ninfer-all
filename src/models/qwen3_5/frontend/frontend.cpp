@@ -968,9 +968,9 @@ ModelSamplingDefaults default_sampling(Architecture architecture) {
     }
     if (architecture == Architecture::Inkling2) {
         // Inkling 2's generation_config.json (temperature 1.0, no truncation), thinking or not,
-        // with top_k held at the 20 candidates the sampler keeps.
+        // with top_k held at the 64 candidates the sampler keeps.
         sampling.thinking      = {.temperature       = 1.0F,
-                                  .top_k             = 20,
+                                  .top_k             = kSamplingTopKCap,
                                   .top_p             = 1.0F,
                                   .min_p             = 0.0F,
                                   .presence_penalty  = 0.0F,
@@ -981,9 +981,9 @@ ModelSamplingDefaults default_sampling(Architecture architecture) {
     }
     if (architecture == Architecture::DeepSeekV41) {
         // DeepSeek-V4.1's recommended sampling (temperature 1.0, top_p 1.0), thinking or not,
-        // with top_k held at the 20 candidates the sampler keeps.
+        // with top_k held at the 64 candidates the sampler keeps.
         sampling.thinking      = {.temperature       = 1.0F,
-                                  .top_k             = 20,
+                                  .top_k             = kSamplingTopKCap,
                                   .top_p             = 1.0F,
                                   .min_p             = 0.0F,
                                   .presence_penalty  = 0.0F,
@@ -993,10 +993,9 @@ ModelSamplingDefaults default_sampling(Architecture architecture) {
         return sampling;
     }
     if (architecture == Architecture::Gemma4) {
-        // generation_config.json of the Gemma 4 releases (top_k 64), thinking or not, with
-        // top_k held at the 20 candidates the sampler keeps.
+        // generation_config.json of the Gemma 4 releases, thinking or not.
         sampling.thinking      = {.temperature       = 1.0F,
-                                  .top_k             = 20,
+                                  .top_k             = 64,
                                   .top_p             = 0.95F,
                                   .min_p             = 0.0F,
                                   .presence_penalty  = 0.0F,
