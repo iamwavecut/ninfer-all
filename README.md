@@ -26,6 +26,7 @@ carries the work of several forks; [CONTRIBUTORS.md](CONTRIBUTORS.md) credits ea
 
 <!-- Novelties only: a new model, family, artifact, platform, option, endpoint, format or mode, or a measured speedup of a path that worked. No fixes of any kind (crashes, wrong output, failed starts, missed cases, regressions and the speedups that win them back, the options and defaults they bring), no guards, diagnostics, internal, CI, build, test or documentation changes, and no chronicle: a date without a novelty gets no line. One line per date, a few words per item, each linked to the document with its details; no descriptions, mechanisms, measurements or hardware. Full rule: CONTRIBUTING.md, "Documentation describes the current state". -->
 
+- **2026-11-27:** artifacts named by their [Hugging Face repository](docs/cli.md#artifacts-from-the-hugging-face-hub) (`OWNER/REPO` or `OWNER/REPO:FILE`) in place of a path.
 - **2026-11-26:** ISTA-DASLab's [GSQ-RCO IQ2_S and IQ3_S](docs/inkling2.md#gsq-rco) of Inkling 2 Mini, [published](#inkling-2-mini); IQ2_XS expert banks in the [CPU share](docs/qwen3-8-flash-next.md#the-cpu-share) of host and disk experts; the WebUI's [MCP relay](docs/serving.md#webui) reaching `https://` MCP servers.
 - **2026-11-25:** Inkling 2's [MXFP8 expert banks](docs/inkling2.md#ud-q8_k_xl) (`mxfp8`) in UD-Q8_K_XL; [Ternary Bonsai 2.5 27B](docs/performance/bonsai-2-5-2026-11.md) in both of PrismML's forms, PTQ1_0 and PQ2_0, with its MTP head and vision tower, [published](#supported-models); PrismML's [PTQ1_0 ternary blocks](docs/gguf.md#formats), multiplied as stored.
 - **2026-11-24:** Inkling 2 [drafting with DSpark faster](docs/inkling2.md#what-runs): its Markov head scores each draft row's 16,384 likeliest tokens; every MoE family with host or disk experts [decoding faster](docs/qwen3-8-flash-next.md#the-expert-cache) (Qwen3.6-35B-A3B 15%, Flint 4.5%): the device cache's tier trades an expert only for 1.5 times its routes and places the experts a prompt calls for; Inkling 2 [prefilling long prompts faster](docs/inkling2.md#long-contexts); Inkling 2's [shared loop KV](docs/inkling2.md#shared-loop-kv) (`--loop-kv`), an opt-in, lossy mode; Inkling 2 [drafting with incoai's DFlash2 drafter](docs/inkling2.md#dflash2) (`--spec dflash2`), in its six [published artifacts](#inkling-2-mini).
@@ -115,6 +116,11 @@ ninfer-serve models/Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b
 
 # The same options from the repository's configuration file.
 ninfer-serve --config configs/bonsai2-27b-dflash2.ini
+
+# The repository in place of the path: the file is fetched into the Hugging Face cache first.
+ninfer-serve WaveCut/Ternary-Bonsai-2-27B-NInfer-v3 --model-id bonsai2-27b \
+  --max-context 262144 --kv-capacity 262144 --kv-dtype rk8v4 --gdn-state-fp16 \
+  --spec dflash2 --draft-tokens 5
 ```
 
 A build listens on 127.0.0.1:8080 unless `--host` and `--port` say otherwise. [Building](#building) shows
@@ -194,7 +200,8 @@ Every card by name, with what has run on it:
 
 ## Supported Models
 
-Each name links to its Hugging Face card. `hf download REPO FILE.ninfer --local-dir models` fetches a file.
+Each name links to its Hugging Face card. `hf download REPO FILE.ninfer --local-dir models` fetches a file, and the
+programs also take the repository itself in place of a path ([artifacts from the Hub](docs/cli.md#artifacts-from-the-hugging-face-hub)).
 The Bonsai, GSQ-RCO, Flash-Next, Edge0, Gemma 4, Flint, DeepSeek-V4.1-Flash and Inkling 2 artifacts use formats that only this engine reads.
 Rows go from the fewest bits per weight to the most.
 ✓ means the artifact carries the component, — that it does not.

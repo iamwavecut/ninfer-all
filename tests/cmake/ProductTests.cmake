@@ -28,6 +28,12 @@ ninfer_add_test(ninfer_launch_config_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_launch_config.cpp"
   LIBRARIES ninfer_product_launch_config)
 
+# Artifacts named by their Hugging Face repository (product/hub): references, the cache's
+# location and the cache-only resolution; downloads need the network and are not tested here.
+ninfer_add_test(ninfer_hub_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_hub.cpp"
+  LIBRARIES ninfer_product_hub ninfer::httplib)
+
 ninfer_add_test(ninfer_cli_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
   LIBRARIES ninfer_runtime_support ninfer_product_logging ninfer_product_launch_config ninfer_text)

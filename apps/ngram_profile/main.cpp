@@ -7,6 +7,7 @@
 #include "models/qwen3_5/frontend/tokenizer.h"
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen3_5/frontend/resources.h"
+#include "product/hub/hub.h"
 #include "product/launch_config/launch_config.h"
 #include "product/option_layers.h"
 #include "product/prompt_input/prompt_input.h"
@@ -51,6 +52,8 @@ constexpr const char* kUsage =
     "Counts the n-gram table rows (Qwen3.8-Flash-Next) or Engram table rows (DeepSeek-V4.1) a\n"
     "corpus addresses, from its tokens alone (no model runs), and writes them, the most frequent\n"
     "first, as a hot-row profile for --ngram-residency ram-hot.\n"
+    "<model.ninfer> may also be OWNER/REPO or OWNER/REPO:FILE, a Hugging Face repository's\n"
+    "artifact, fetched once into the Hub's cache.\n"
     "A TEXT file is one document, or a .jsonl file one document per line: its \"text\", or its\n"
     "\"messages\" rendered by the model's Frontend, including tools and the generation prompt.\n"
     "Message documents may set \"enable_thinking\"; absent uses the template's default.\n"
@@ -388,7 +391,11 @@ int evaluate(const Options& options, const Hash& hash) {
 
 int main(int argc, char** argv) {
     try {
-        const Options options = parse(argc, argv);
+        Options options = parse(argc, argv);
+        // OWNER/REPO[:FILE] names an artifact on the Hugging Face Hub, fetched into its cache.
+        options.model = ninfer::product::hub::resolve_artifact(
+            options.model.string(),
+            [](const std::string& line) { std::fprintf(stderr, "%s\n", line.c_str()); });
         const auto start      = std::chrono::steady_clock::now();
         const Hash hash(options.model);
         const int result = options.out.empty() ? evaluate(options, hash) : profile(options, hash);

@@ -1,4 +1,5 @@
 #include "options.h"
+#include "product/hub/hub.h"
 #include "product/kv_resident_options.h"
 #include "product/loop_kv_options.h"
 #include "product/launch_config/launch_config.h"
@@ -172,7 +173,8 @@ std::string usage_text(const char* argv0) {
            " <model.ninfer> (--prompt <text>|--messages <messages.json>) [options]\n"
            "\n"
            "Runs one generation: the answer streams to stdout, reasoning and diagnostics\n"
-           "to stderr.\n"
+           "to stderr.\n" +
+           std::string(ninfer::product::hub::kArtifactReferenceHelp) +
            "  --help, -h                    show this help and exit\n"
            "  --version                     print the build version and exit\n"
            "  --config FILE                 read options from a launch configuration file\n"

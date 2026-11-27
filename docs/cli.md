@@ -543,6 +543,43 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
 The container's address (`NINFER_HOST`, `NINFER_PORT`) is the first layer, so a file's or the command
 line's `host` and `port` override it.
 
+## Artifacts from the Hugging Face Hub
+
+`ninfer`, `ninfer-serve`, `ninfer-perplexity` and `ninfer-ngram-profile` also take a Hugging Face
+repository where they take the artifact's path, on the command line or as a launch file's `model`:
+
+```bash
+# The repository's one .ninfer file.
+./build/apps/ninfer-serve WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3 --kv-dtype rk8v4
+# A named file, for a repository that holds several.
+./build/apps/ninfer WaveCut/Qwen3.8-27B-DSpine-b16-NInfer-v3:Qwen3.8-27B-DSpine-b16-ninfer-v3.ninfer \
+  --prompt "Hello"
+```
+
+`OWNER/REPO` names the repository's `.ninfer` file and fails, listing them, when it holds several;
+`OWNER/REPO:FILE` names one. An argument is a repository only when nothing exists at that path and it
+is two names of letters, digits, `-`, `_` and `.`; a missing path that ends in `.ninfer` stays a missing
+file.
+
+The program asks the Hub for the repository's `main` revision and runs the file from the Hub's cache,
+in the layout `hf download` writes: `HF_HUB_CACHE`, else `HF_HOME/hub`, else
+`~/.cache/huggingface/hub`, so either tool uses what the other fetched. A file the cache lacks at that
+revision is downloaded first over 16 connections in 64 MiB pieces; an interrupted download resumes
+from the pieces it finished (the `.pieces` file beside the blob), and the finished file is checked
+against the SHA-256 the Hub records for it. A file that fails the check is deleted.
+
+- `HF_TOKEN`, else the token file of `hf auth login` (`HF_TOKEN_PATH`, else `HF_HOME/token`), reaches
+  gated and private repositories. The token goes to `huggingface.co` only, not to the storage host
+  a download is redirected to.
+- `HF_HUB_OFFLINE=1`, or a Hub that cannot be reached, runs the file of the revision the cache
+  recorded last.
+- Windows without developer mode cannot make links: the file is then moved into the snapshot folder
+  itself, as `hf download` does.
+- Run one download of a file at a time: two programs downloading the same file at once write the
+  same pieces.
+
+`--draft-model`, `--ngram-table`, `--models-dir` and `--models-preset` take paths only.
+
 ## CUDA synchronization
 
 `NINFER_CUDA_SYNC` selects the CUDA device synchronization schedule at startup for both the CLI
