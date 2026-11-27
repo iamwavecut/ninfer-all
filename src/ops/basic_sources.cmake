@@ -102,6 +102,8 @@ endif()
 set_source_files_properties(
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_avx2.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_avx_vnni.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_avx512_vnni.cpp"
   PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
 set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
   PROPERTIES COMPILE_OPTIONS "${gguf_cpu_no_contract}")
@@ -111,19 +113,51 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
   target_sources(ninfer_ops PRIVATE
     "${cpu_expert_dir}/moe_expert_cpu_avx2.cpp"
     "${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
-    "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp")
-  set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu.cpp" "${cpu_expert_dir}/gguf_expert_cpu.cpp"
-    PROPERTIES COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+    "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
+    "${cpu_expert_dir}/gguf_expert_cpu_avx512_vnni.cpp")
+  # The GGUF rows' AVX-VNNI unit only where the compiler has the intrinsic (GCC 11, Clang 12).
   if(MSVC)
-    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx2.cpp" "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
+    set(gguf_cpu_avx2_flags /arch:AVX2)
+    set(gguf_cpu_avx_vnni_flags /arch:AVX2)
+    set(gguf_cpu_avx512_vnni_flags /arch:AVX512)
+  else()
+    set(gguf_cpu_avx2_flags -mavx2 -mfma -mf16c -ffp-contract=off)
+    set(gguf_cpu_avx_vnni_flags ${gguf_cpu_avx2_flags} -mavxvnni)
+    set(gguf_cpu_avx512_vnni_flags ${gguf_cpu_avx2_flags} -mavx512f -mavx512vl -mavx512vnni)
+  endif()
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_FLAGS ${gguf_cpu_avx_vnni_flags})
+  list(JOIN CMAKE_REQUIRED_FLAGS " " CMAKE_REQUIRED_FLAGS)
+  check_cxx_source_compiles([=[
+#include <immintrin.h>
+int main() {
+    const __m256i z = _mm256_setzero_si256();
+    return _mm256_extract_epi32(_mm256_dpbusd_avx_epi32(z, z, z), 0);
+}]=] NINFER_HAVE_AVX_VNNI_INTRINSICS)
+  unset(CMAKE_REQUIRED_FLAGS)
+  set(gguf_cpu_definitions NINFER_CPU_EXPERT_X86=1)
+  if(NINFER_HAVE_AVX_VNNI_INTRINSICS)
+    target_sources(ninfer_ops PRIVATE "${cpu_expert_dir}/gguf_expert_cpu_avx_vnni.cpp")
+    set_source_files_properties("${cpu_expert_dir}/gguf_expert_cpu_avx_vnni.cpp"
+      PROPERTIES COMPILE_OPTIONS "${gguf_cpu_avx_vnni_flags}" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+    list(APPEND gguf_cpu_definitions NINFER_GGUF_CPU_AVX_VNNI_BUILT=1)
+  endif()
+  set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu.cpp"
+    PROPERTIES COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+  set_source_files_properties("${cpu_expert_dir}/gguf_expert_cpu.cpp"
+    PROPERTIES COMPILE_DEFINITIONS "${gguf_cpu_definitions}")
+  set_source_files_properties("${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
+    PROPERTIES COMPILE_OPTIONS "${gguf_cpu_avx2_flags}" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+  set_source_files_properties("${cpu_expert_dir}/gguf_expert_cpu_avx512_vnni.cpp"
+    PROPERTIES COMPILE_OPTIONS "${gguf_cpu_avx512_vnni_flags}" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+  if(MSVC)
+    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx2.cpp"
       PROPERTIES COMPILE_OPTIONS /arch:AVX2 COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
     set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
       PROPERTIES COMPILE_OPTIONS /arch:AVX512 COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
   else()
     set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx2.cpp"
       PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
-    set_source_files_properties("${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
-      PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
     set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
       PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx512dq;-mf16c;-mfma"
       COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)

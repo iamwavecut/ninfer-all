@@ -188,7 +188,7 @@ void stream_cpu_rows(const StreamCpuPlane& w, const StreamCpuInput& x, int row_b
         throw std::invalid_argument("streamed SparseMoe CPU rows: invalid operands");
     }
 #if defined(NINFER_CPU_EXPERT_X86)
-    if (gguf_cpu_backend_selected(backend) == GgufCpuBackend::Avx2) {
+    if (gguf_cpu_backend_avx2(backend)) {
         stream_cpu_detail::rows_avx2(w, x, row_begin, row_end, coefficients, y);
         return;
     }
