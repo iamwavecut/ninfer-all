@@ -3,6 +3,8 @@
 // A test CA, an HTTPS server on a loopback port that presents a certificate the CA signed for
 // "localhost" alone, and the environment that makes product/https_client.h trust the CA.
 
+#include "product/https_client.h"
+
 #include <httplib.h>
 
 #include <cstdlib>
@@ -85,7 +87,7 @@ private:
 };
 
 // An HTTPS server on 127.0.0.1. Routes go on server() before start(); it listens on its own thread
-// until destroyed.
+// until destroyed, beside the clients of the test.
 class Server {
 public:
     Server() : server_(httplib::SSLServer::PemMemory{kServerCertificate, 0, kServerKey, 0, nullptr, 0,
@@ -118,6 +120,8 @@ public:
     }
 
 private:
+    // Mbed TLS's threading layer precedes the server's first TLS call.
+    bool threading_ = (product::start_tls_threading(), true);
     httplib::SSLServer server_;
     std::thread thread_;
     int port_ = 0;

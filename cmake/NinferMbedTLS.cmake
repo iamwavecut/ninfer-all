@@ -2,9 +2,11 @@ include_guard(GLOBAL)
 include(${CMAKE_CURRENT_LIST_DIR}/MediaSources.cmake)
 
 # Every platform compiles Mbed TLS from its pinned release (cmake/MediaSources.cmake) and links it
-# statically, as the TLS backend of cpp-httplib: media URL fetches (src/product/media_acquire) verify
-# HTTPS servers with it, and no binary depends on a system TLS or HTTP library. Its configuration is
-# the release's default (TLS 1.2 and 1.3, X.509) without programs or tests.
+# statically, as the TLS backend of cpp-httplib: media URL fetches (src/product/media_acquire), the
+# WebUI's MCP relay and Hub downloads verify HTTPS servers with it, and no binary depends on a system
+# TLS or HTTP library. Its configuration is the release's default (TLS 1.2 and 1.3, X.509) without
+# programs or tests, plus the threading layer (cmake/mbedtls/ninfer_crypto_config.h), since several
+# threads make requests at once.
 set(NINFER_MEDIA_SOURCES_DIR "${PROJECT_SOURCE_DIR}/third_party/media-sources" CACHE PATH
     "Directory with the release archives cmake/MediaSources.cmake pins (scripts/fetch-media-sources.sh)")
 set(_ninfer_mbedtls_archive "${NINFER_MEDIA_SOURCES_DIR}/${NINFER_MBEDTLS_ARCHIVE}")
@@ -30,6 +32,14 @@ endif()
 # the archive (scripts/package-linux-release.py).
 file(COPY_FILE "${_ninfer_mbedtls_source}/LICENSE" "${_ninfer_mbedtls_root}/LICENSE" ONLY_IF_DIFFERENT)
 
+# threading.h includes "threading_alt.h" from its own directory first, so every compilation that
+# sees the threading layer, the library's and its users', finds this one.
+file(COPY_FILE "${CMAKE_CURRENT_LIST_DIR}/mbedtls/threading_alt.h"
+     "${_ninfer_mbedtls_source}/tf-psa-crypto/include/mbedtls/threading_alt.h" ONLY_IF_DIFFERENT)
+# A normal variable, not a cache entry, so a build tree that later configures a tree without this
+# file does not keep its path; CMP0126 keeps the release's empty cache default from replacing it.
+set(TF_PSA_CRYPTO_USER_CONFIG_FILE "${CMAKE_CURRENT_LIST_DIR}/mbedtls/ninfer_crypto_config.h")
+
 foreach(_ninfer_option IN LISTS NINFER_MBEDTLS_OPTIONS)
   string(REPLACE "=" ";" _ninfer_pair "${_ninfer_option}")
   list(GET _ninfer_pair 0 _ninfer_name)
@@ -39,7 +49,9 @@ endforeach()
 # The shared runtime may link the fetcher, so the archives are position-independent.
 set(_ninfer_pic ${CMAKE_POSITION_INDEPENDENT_CODE})
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+set(CMAKE_POLICY_DEFAULT_CMP0126 NEW)
 add_subdirectory("${_ninfer_mbedtls_source}" "${_ninfer_mbedtls_root}/build" EXCLUDE_FROM_ALL SYSTEM)
+unset(CMAKE_POLICY_DEFAULT_CMP0126)
 set(CMAKE_POSITION_INDEPENDENT_CODE ${_ninfer_pic})
 
 add_library(ninfer_mbedtls INTERFACE)
