@@ -14,6 +14,12 @@ TTFT and processing time (TTFT less queue wait), GPU, CPU and RAM, KV and state 
 pressure events (evictions, demotions, degradations, fallbacks), cache-reuse paths, and the recent
 requests. `/api/samples` returns the same state as JSON and `/healthz` answers `ok`.
 
+The Decode and Prefill p50/p95 tiles are percentiles of the latest finished requests' own rates:
+generated tokens over decode time for requests of at least 16 generated tokens, and computed prompt
+tokens (the prompt less its reused prefix) over prefill time for at least 512 of them; the
+throughput charts plot the same percentiles over time. On start the monitor reads the request log's
+last 8 MiB again, so a restarted monitor keeps its request history.
+
 ```bash
 python3 tools/monitor/monitor.py --stats-url http://127.0.0.1:8081 \
   --jsonl /var/log/ninfer/requests.jsonl --port 8090
