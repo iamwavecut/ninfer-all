@@ -78,13 +78,18 @@ EngineOptions with_family_context_cache(EngineOptions options) {
 }
 
 // The host token embedding is a Qwen3.5 load placement; the other families bind their own tables.
+// The other families keep their tables on the device, which `auto` selects for them.
 EngineOptions with_family_embedding(EngineOptions options) {
-    if (options.embedding_residency != EmbeddingResidency::Device &&
-        own_family_artifact(options.artifact_path)) {
+    if (options.embedding_residency == EmbeddingResidency::Device ||
+        !own_family_artifact(options.artifact_path)) {
+        return options;
+    }
+    if (options.embedding_residency == EmbeddingResidency::Host) {
         throw std::invalid_argument(
             "--embedding-residency host applies to Qwen3_5ForCausalLM and "
             "Qwen3_5MoeForCausalLM artifacts");
     }
+    options.embedding_residency = EmbeddingResidency::Device;
     return options;
 }
 

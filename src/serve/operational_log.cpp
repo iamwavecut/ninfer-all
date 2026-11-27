@@ -604,6 +604,9 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                           : " | expert cache " +
                                 product::format_pretty_bytes(stage.expert_cache_bytes));
     }
+    if (engine.embedding_residency == ninfer::EmbeddingResidency::Host) {
+        logger_->info("embedding | pinned host memory, read in place");
+    }
 
     const std::string& architecture = service.load_summary().architecture;
     const bool own_cache = architecture == "Gemma4ForCausalLM" ||

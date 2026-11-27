@@ -252,8 +252,11 @@ std::string serve_usage_text(const char* argv0) {
            std::string(product::kInvariantAttentionHelp) +
            "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
            "                                host memory, or in artifact files\n"
-           "  --embedding-residency device|host  token embedding on GPU (default) or in\n"
-           "                                mapped pinned host memory, read in place\n"
+           "  --embedding-residency auto|device|host  token embedding on GPU or in mapped\n"
+           "                                pinned host memory, read in place; auto (default):\n"
+           "                                host where the hybrid cache sizes the KV pool from\n"
+           "                                free memory, nothing drafts and the table is\n"
+           "                                untied, on Linux\n"
            "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
            "                                Gemma, Flint and DeepSeek-V4.1 allow 0 (layer\n"
            "                                banks only).\n"
@@ -1581,12 +1584,14 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         }
         if (arg == "--embedding-residency") {
             const std::string residency = require_value("--embedding-residency");
-            if (residency == "device") {
+            if (residency == "auto") {
+                options.embedding_residency = EmbeddingResidency::Auto;
+            } else if (residency == "device") {
                 options.embedding_residency = EmbeddingResidency::Device;
             } else if (residency == "host") {
                 options.embedding_residency = EmbeddingResidency::Host;
             } else {
-                throw std::invalid_argument("--embedding-residency must be device or host");
+                throw std::invalid_argument("--embedding-residency must be auto, device or host");
             }
             continue;
         }

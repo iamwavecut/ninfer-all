@@ -650,8 +650,9 @@ docker run --rm --gpus all -p 8080:8080 --ulimit memlock=-1 -w / \
   ([Serving](docs/serving.md#context-cache-of-the-other-families)).
 - Precision trades that buy context: `--embedding-q4`, `--lm-head-q6`, `--gdn-state-fp16`
   ([quality trades](docs/maintainer/quality-trade-experiments.md)).
-- A token embedding kept in mapped host memory (`--embedding-residency host`), which frees its
-  VRAM for context with no change to the output.
+- A token embedding kept in mapped host memory, which frees its VRAM for context with no change to
+  the output: the server's default for Qwen3.5-family models on Linux whose KV pool takes free
+  memory and that run without drafting (`--embedding-residency auto`), or `host` explicitly.
 
 </details>
 

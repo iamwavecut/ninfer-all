@@ -56,6 +56,11 @@ enum class EmbeddingResidency : std::uint8_t {
     // In page-locked host RAM mapped into the primary device's address space: the gather reads
     // each step's rows over the bus, and the table's device memory goes to the KV cache.
     Host,
+    // Host where the freed device memory goes to a KV pool that takes all free memory (automatic
+    // capacity with the hybrid prefix cache), no drafter reads the table and the table is the
+    // gather's alone (untied, not transcoded), on a Linux driver with the host's pinning headroom
+    // left; Device otherwise. Startup resolves it.
+    Auto,
 };
 
 // Where supported MoE families keep routed expert banks (see each family guide).
