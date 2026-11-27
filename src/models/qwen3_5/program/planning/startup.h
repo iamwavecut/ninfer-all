@@ -139,6 +139,9 @@ struct SequencePlanningInputs {
     bool use_cuda_graph    = true;
     // Nonzero replaces the computed per-profile CUDA Graph allowance in total.
     std::size_t cuda_graph_allowance_bytes = 0;
+    // Every device's compute capability has a measured price for a drafting graph class
+    // (kMeasuredDraftGraphClassBytes): 8.6 and 12.0.
+    bool measured_graph_price = false;
     bool causal_scoring    = false;
     bool structured_output = false;
     // EngineOptions::gumbel_sampling: a sampling row's MTP proposals draw from the drafter's

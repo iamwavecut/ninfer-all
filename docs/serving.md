@@ -109,8 +109,11 @@ two every 96 rounds. A width changes after it has led by 2% for four rounds in a
 request starts from the pooled averages of the requests before it. The Engine captures CUDA Graphs
 for both widths, and the KV sizing reserves graph memory for both: on an RTX 5090 with eight
 requests and an 8,192-token window, DSpine's graphs measured 264 MiB against 186 MiB with one width,
-but the reservation doubled to 4.5 GiB and the KV pool fell from 52,544 tokens to 15,680;
-`--cuda-graph-allowance-mib 2304` keeps the one-width pool. On that card with Qwen3.8-27B
+but the reservation doubled to 4.5 GiB and the KV pool fell from 52,544 tokens to 15,680, which
+`--cuda-graph-allowance-mib 2304` restored. Compute 8.6 and 12.0 now reserve the measured 24 MiB a
+graph class instead of 96 MiB ([context and memory](cli.md#context-and-memory)), 1,152 MiB for these
+classes, so the two widths no longer cost that card its one-width pool; on other cards the option
+still keeps it. On that card with Qwen3.8-27B
 (`ninfer-serve`, `bf16` KV, no copy rounds), in decode tok/s:
 
 | Workload | Drafter | 7 drafts | 15 drafts | `--adaptive-mtp`, 15 |
