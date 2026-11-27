@@ -97,7 +97,7 @@ __launch_bounds__(256, resident_ctas_bound(256, MinBlocks)) __global__
     const int code_row_bytes    = hidden / 2;
     constexpr int kTileCols     = TileCols;
     constexpr int kNt           = kTileCols / 8;
-    static_assert(kTileCols >= 8 && kTileCols <= 32 && (kTileCols % 8) == 0);
+    static_assert(kTileCols >= 8 && kTileCols <= 64 && (kTileCols % 8) == 0);
     static_assert(ActiveCols >= 1 && ActiveCols <= kTileCols && ActiveCols > kTileCols - 8);
     static_assert((Geometry::kInputRows % kGroupK) == 0);
     static_assert(RowPolicy::kOutputRowsPerTile <= 16);

@@ -34,7 +34,7 @@ struct RouteSpec {
 
 constexpr Q4LinearSwiGluProblem kShape{34816, 17408, 5120, 5120, 1};
 
-constexpr std::array<RouteSpec, 5> kRoutes{{
+constexpr std::array<RouteSpec, 3> kRoutes{{
     {{1, 1}, Q4LinearSwiGluScheduleId::GemvPair},
     // Re-measured 2026-09-11 on an RTX 3090 under Linux after the small-T MMA's rewrite (padded code
     // rows, then a permuted k order with 64-bit code loads and no int-to-float decode -- see
@@ -54,9 +54,12 @@ constexpr std::array<RouteSpec, 5> kRoutes{{
     //   T            9     16     17     24     32
     //   small_t  145.4  152.6  167.9  178.2  208.9     (24 then two tiles per warp: ~164)
     //   c40      452.6  444.4  451.6  445.4  447.5
-    {{2, 32}, Q4LinearSwiGluScheduleId::SmallTTiled},
-    {{33, 40}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C40},
-    {{41, 48}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C48},
+    //
+    // The tile then grew to 64 columns (two K warps, eight column fragments), for decode rounds of
+    // 33 to 64 requests, and took 33..64 from the folded c40, c48 and c128 tiles; the 3090 and 5090
+    // measurements are in docs/performance.md, "Up to 64 requests at once". c40 and c48 stay
+    // executable for device profiles.
+    {{2, 64}, Q4LinearSwiGluScheduleId::SmallTTiled},
     // Measured on sm_86 by bench/ops/q4_linear_swiglu_schedule_bench.cu, cold, median of 9-15,
     // repeated three to four times per width because this Op is noisier than the others here.
     //
@@ -114,7 +117,7 @@ constexpr std::array<RouteSpec, 5> kRoutes{{
     // Upstream's 5b4303c0 (RTX 5090) re-split 33..end around its retuned Q4 linear routes, adding
     // MmaSplitHalfPairR32C128Tail for 129..168. That schedule is kept executable but is not routed
     // here: it has not been measured on sm_86.
-    {{49, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
+    {{65, kAnyCols}, Q4LinearSwiGluScheduleId::MmaSplitHalfPairR32C128},
 }};
 
 constexpr bool catalog_is_closed() noexcept {
@@ -191,7 +194,7 @@ Q4LinearSwiGluPlan q4_linear_swiglu_resolve_plan(const Q4LinearSwiGluProblem& pr
     using Id = Q4LinearSwiGluScheduleId;
     static constexpr std::array<DeviceRouteCandidate<Id>, 6> kCandidates{{
         {"gemv_pair", Id::GemvPair, 1},
-        {"small_t_tiled", Id::SmallTTiled, 32},
+        {"small_t_tiled", Id::SmallTTiled, kQ4LinearSwiGluSmallTMaxCols},
         {"split_half_pair_c40", Id::MmaSplitHalfPairR32C40, 0},
         {"split_half_pair_c48", Id::MmaSplitHalfPairR32C48, 0},
         {"split_half_pair_c128", Id::MmaSplitHalfPairR32C128, 0},

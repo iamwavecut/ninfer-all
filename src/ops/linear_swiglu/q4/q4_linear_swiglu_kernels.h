@@ -29,6 +29,9 @@ void q4_linear_swiglu_mma_split_half_pair_r32_c48_launch(const Tensor& x, const 
 // Wide folded tiles for the leading column blocks plus a narrow route for a small remainder.
 void q4_linear_swiglu_mma_split_half_pair_r32_c128_tail_launch(const Tensor& x, const Weight& w,
                                                                Tensor& out, cudaStream_t stream);
+// The k-split small-T MMA (ops/linear/q4/q4_ksplit_mma.cuh), T=2..64: one pass over the weights
+// for up to 64 columns, the width of a decode round of 64 requests.
+inline constexpr std::int32_t kQ4LinearSwiGluSmallTMaxCols = 64;
 void q4_linear_swiglu_small_t_tiled_launch(const Tensor& x, const Weight& w, Tensor& out,
                                            cudaStream_t stream);
 // Upstream's small-T route over the unified sliced-K MMA (eight K warps, pairwise reduction, launch
