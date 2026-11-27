@@ -301,7 +301,9 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 *builder_pointers[part.rank],
                 GdnReplayRecordSpec{
                     .layers          = static_cast<std::int32_t>(part.layers),
-                    .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
+                    // Only a speculative round, of at most kMaximumSpeculativeRows rows, keeps them.
+                    .record_capacity = static_cast<std::int32_t>(
+                        std::min(plan.max_concurrency, kMaximumSpeculativeRows)),
                     .width           = static_cast<std::int32_t>(widest_verify_window(plan) + 1U),
                     .conv_channels =
                         part.conv_channels != 0
@@ -1028,10 +1030,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         out.mtp_round = std::max({accept, finish(mtp_batch), finish(mtp_ar), finish(mtp_proposal)});
         out.ordinary_round = std::max(out.ordinary_round, finish(mtp_align));
 
+        // Speculative rounds take at most kMaximumSpeculativeRows rows; the wider ordinary rounds
+        // add the MTP layer's alignment, one column per row.
+        const auto speculative_rows =
+            static_cast<std::int32_t>(std::min(plan.max_concurrency, kMaximumSpeculativeRows));
         for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
              ++batch) {
             std::size_t target_bytes = 0;
             for (const std::int32_t width : round_widths) {
+                if (batch > speculative_rows) { break; }
                 const std::int32_t aggregate = batch * width;
                 WorkspaceLayoutBuilder target;
                 matrix(target, DType::BF16, dimension(config.hidden_size), aggregate);
@@ -1065,6 +1072,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                 mtp_post_mixer(layout, tokens, tokens);
             };
 
+            if (batch > speculative_rows) {
+                WorkspaceLayoutBuilder ordinary_alignment;
+                mtp_decode_core(ordinary_alignment, 1);
+                out.ordinary_round = std::max(out.ordinary_round, finish(ordinary_alignment));
+                continue;
+            }
             WorkspaceLayoutBuilder alignment;
             mtp_decode_core(alignment, verify);
             WorkspaceLayoutBuilder ar;
@@ -1462,9 +1475,11 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     }
     // Speculative rounds keep at most kMaximumSpeculativeRows rows: past eight requests a round of
     // drafts costs more than the tokens it saves (docs/performance.md, "Several requests at once").
-    if (options.speculative.backend != SpeculativeBackend::None &&
+    // MTP runs the wider rounds as ordinary rounds that keep its KV aligned; a masked drafter's
+    // context and slots serve at most that many requests.
+    if (is_masked_draft_backend(options.speculative.backend) &&
         options.max_concurrency > kMaximumSpeculativeRows) {
-        throw std::invalid_argument("a speculative backend runs at most " +
+        throw std::invalid_argument("a block drafter (DFlash2, DSpine) runs at most " +
                                     std::to_string(kMaximumSpeculativeRows) +
                                     " requests at once; max_concurrency is " +
                                     std::to_string(options.max_concurrency));

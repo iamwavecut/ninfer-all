@@ -354,8 +354,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         throw std::invalid_argument("Engine max_concurrency must be in [1," +
                                     std::to_string(kMaximumConcurrency) + "]");
     }
-    // An automatic count with a drafter looks no further than a speculative round's rows.
-    if (options.max_concurrency_auto && options.speculative.backend != SpeculativeBackend::None) {
+    // An automatic count with a block drafter looks no further than a speculative round's rows;
+    // MTP runs ordinary rounds past them.
+    if (options.max_concurrency_auto && options.speculative.backend != SpeculativeBackend::None &&
+        options.speculative.backend != SpeculativeBackend::Mtp) {
         options.max_concurrency = std::min(options.max_concurrency, kMaximumSpeculativeRows);
     }
     ContextCacheOptions& cache = options.context_cache;

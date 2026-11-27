@@ -321,8 +321,9 @@ int main() {
     }
     failures += check(serve_usage_text("ninfer-serve").find("--loop-kv") != std::string::npos,
                       "serve help omits --loop-kv");
-    // --max-concurrency: one request by default, up to 64, or `auto` for as many as fit; --spec
-    // keeps eight, and the queue holds at least as many requests as run.
+    // --max-concurrency: one request by default, up to 64, or `auto` for as many as fit; MTP takes
+    // every count, a block drafter keeps eight, and the queue holds at least as many requests as
+    // run.
     {
         const auto single = parse({"ninfer-serve", "model.ninfer"});
         failures += check(single.max_concurrency == 1 && !single.max_concurrency_auto &&
@@ -343,18 +344,26 @@ int main() {
                           "--max-concurrency auto did not reach the Engine as a bound of 64");
         const auto drafted = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp",
                                     "--draft-tokens", "3", "--max-concurrency", "auto"});
-        failures += check(drafted.max_concurrency_auto && drafted.max_concurrency == 8,
-                          "--spec did not bound --max-concurrency auto to eight requests");
+        failures += check(drafted.max_concurrency_auto && drafted.max_concurrency == 64,
+                          "--spec mtp bounded --max-concurrency auto below 64");
         failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
-                                 "3", "--max-concurrency", "8"})
+                                 "3", "--max-concurrency", "64"})
+                                  .max_concurrency == 64,
+                          "--spec mtp refused 64 requests");
+        const auto blocked = parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                    "--draft-tokens", "4", "--max-concurrency", "auto"});
+        failures += check(blocked.max_concurrency_auto && blocked.max_concurrency == 8,
+                          "--spec dflash2 did not bound --max-concurrency auto to eight requests");
+        failures += check(parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2",
+                                 "--draft-tokens", "4", "--max-concurrency", "8"})
                                   .max_concurrency == 8,
-                          "--spec refused eight requests");
+                          "--spec dflash2 refused eight requests");
         bool refused = false;
         try {
-            (void)parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens", "3",
+            (void)parse({"ninfer-serve", "model.ninfer", "--spec", "dflash2", "--draft-tokens", "4",
                          "--max-concurrency", "9"});
         } catch (const std::invalid_argument&) { refused = true; }
-        failures += check(refused, "--spec accepted nine requests");
+        failures += check(refused, "--spec dflash2 accepted nine requests");
         for (const auto* value : {"0", "65", "Auto", "auto64", ""}) {
             bool rejected = false;
             try { (void)parse({"ninfer-serve", "model.ninfer", "--max-concurrency", value}); }

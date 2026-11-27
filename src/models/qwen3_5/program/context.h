@@ -117,6 +117,8 @@ struct OrdinaryBatchContext {
     const qwen3_5::OrdinaryDecodeIngress& host_ingress;
     qwen3_5::OrdinaryDecodeEgress& host_egress;
     Tensor& continuation_hidden_store;
+    // Under MTP: its cache, where the MTP layer writes each row's KV at the round's position.
+    const qwen3_5::PagedKVCache* mtp_cache = nullptr;
 };
 
 struct MtpBatchContext {

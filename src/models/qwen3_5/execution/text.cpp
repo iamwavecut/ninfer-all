@@ -11,6 +11,7 @@
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
+#include "ninfer/ops/batch_rows.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -1462,8 +1463,10 @@ void TextContext::mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidd
     if (batch_mtp_kv_ == nullptr) { throw std::runtime_error("MTP forward is not enabled"); }
     const std::int32_t width = ids.ne[0];
     const std::int32_t batch = ids.ne[1];
-    if (width <= 0 || width > static_cast<std::int32_t>(kMtpVerifyMaximumWidth) || batch <= 0 ||
-        batch > static_cast<std::int32_t>(kMaximumSpeculativeRows)) {
+    // One column per row aligns an ordinary round of up to ops::kMaximumDecodeRows rows; wider
+    // rows belong to a speculative round.
+    if (width <= 0 || width > static_cast<std::int32_t>(kMtpVerifyMaximumWidth) ||
+        !ops::batch_rows_admitted(width, batch)) {
         throw std::invalid_argument("MTP decode batch shape is outside the supported domain");
     }
     require_tensor_shape(ids, DType::I32, {width, batch}, "MTP decode batch ids");

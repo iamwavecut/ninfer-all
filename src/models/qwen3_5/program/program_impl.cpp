@@ -352,7 +352,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                                                     kCausalScoreMaximumTile * sizeof(float))
                                               : std::nullopt),
       ordinary_host(
-          !plan.causal_scoring && plan.speculative_backend == SpeculativeBackend::None
+          !plan.causal_scoring && (plan.speculative_backend == SpeculativeBackend::None ||
+                                   (plan.speculative_backend == SpeculativeBackend::Mtp &&
+                                    plan.max_concurrency > kMaximumSpeculativeRows))
               ? std::make_optional<PinnedHostBuffer>(sizeof(qwen3_5::OrdinaryDecodeIngress) +
                                                      sizeof(qwen3_5::OrdinaryDecodeEgress))
               : std::nullopt),
@@ -762,7 +764,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         throw std::logic_error("MTP decode frame does not match the sequence plan");
     }
     if (io.ordinary.has_value() !=
-        (!causal_scoring && speculative_backend == SpeculativeBackend::None)) {
+        (!causal_scoring && (speculative_backend == SpeculativeBackend::None ||
+                             (speculative_backend == SpeculativeBackend::Mtp &&
+                              max_concurrency > kMaximumSpeculativeRows)))) {
         throw std::logic_error("ordinary decode frame does not match the sequence plan");
     }
     if (io.dflash_prefill.has_value() != is_masked_draft_backend(speculative_backend)) {

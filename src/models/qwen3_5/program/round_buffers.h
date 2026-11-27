@@ -26,6 +26,8 @@ inline constexpr std::uint32_t kDFlashVerifyMaximumWidth  = kDFlashVerifyMaximum
 struct RoundStateSpec {
     std::int32_t hidden          = 0;
     std::int32_t output_rows     = 0;
+    // Rows of a round. A speculative round holds at most kMaximumSpeculativeRows of them; under
+    // MTP the wider rounds are ordinary rounds that keep the MTP KV aligned.
     std::uint32_t batch_capacity = 1;
     // Drafts the neural drafter proposes per round.
     std::uint32_t draft_window = 0;
@@ -51,6 +53,10 @@ struct OrdinaryDecodeIngress {
     // speculative verification draws that position with too (speculative_accept_coupled_drafts).
     std::array<std::int32_t, kMaximumConcurrency> sample_positions{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
+    // Under MTP: each row's MTP KV row and a valid column count of one, for the MTP layer's
+    // column at the round's position.
+    std::array<std::int32_t, kMaximumConcurrency> mtp_kv_table_rows{};
+    std::array<std::int32_t, kMaximumConcurrency> mtp_valid_columns{};
 };
 
 struct OrdinaryDecodeEgress {
@@ -134,6 +140,8 @@ struct OrdinaryDecodeStateLayout {
     LayoutRegion egress;
     TensorRegion logits;
     TensorRegion hidden;
+    // Under MTP: the MTP layer's output of the aligning column, which no proposal reads.
+    std::optional<TensorRegion> mtp_hidden;
 };
 
 struct MtpPrefillStateLayout {
@@ -222,6 +230,10 @@ struct OrdinaryDecodeState {
     Tensor sampled_tokens;
     Tensor logits;
     Tensor hidden;
+    // Under MTP (mtp_hidden.data set): the MTP layer writes each row's KV at the round's position.
+    Tensor mtp_kv_table_rows;
+    Tensor mtp_valid_columns;
+    Tensor mtp_hidden;
 
     OrdinaryDecodeState() = default;
     OrdinaryDecodeState(DeviceSpan backing, const OrdinaryDecodeStateLayout& layout,
@@ -233,6 +245,8 @@ struct OrdinaryDecodeState {
 // address without making that activation part of the family round contract.
 [[nodiscard]] RoundStateLayout begin_round_state_layout(LayoutBuilder& builder,
                                                         const RoundStateSpec& spec);
+// The rows of a speculative round's frames: at most kMaximumSpeculativeRows.
+[[nodiscard]] std::uint32_t speculative_round_rows(const RoundStateSpec& spec) noexcept;
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout);
 
 struct MtpPrefillState {
