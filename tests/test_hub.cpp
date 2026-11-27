@@ -1,7 +1,10 @@
 // Artifacts named by their Hugging Face repository (product/hub): which arguments are references,
-// where the Hub's cache lives, and the cache-only resolution that serves offline.
+// where the Hub's cache lives, the cache-only resolution that serves offline, and HTTPS requests on
+// as many threads at once as a download opens.
 
 #include "product/hub/hub.h"
+#include "product/https_client.h"
+#include "tls_fixture.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -10,6 +13,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -145,6 +150,37 @@ void offline() {
     fs::remove_all(root);
 }
 
+// Without Mbed TLS's threading layer, concurrent handshakes corrupt the PSA core's key slots and
+// random generator: a 16-connection download crashed within its first second.
+void concurrent_requests() {
+    namespace tls = ninfer::test_tls;
+    std::string body(1U << 20, '\0');
+    for (std::size_t i = 0; i < body.size(); ++i) { body[i] = static_cast<char>(i * 131 % 251); }
+    tls::Server server;
+    server.server().Get("/piece", [&body](const httplib::Request&, httplib::Response& response) {
+        response.set_content(body, "application/octet-stream");
+    });
+    server.start();
+    const tls::TrustedCa ca("hub-" + std::to_string(server.port()));
+    constexpr int kThreads = 16;
+    constexpr int kRequests = 4;
+    std::vector<int> good(kThreads, 0);
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+        threads.emplace_back([&, t] {
+            for (int r = 0; r < kRequests; ++r) {
+                const auto client = ninfer::product::verifying_https_client("localhost", server.port());
+                const auto result = client->Get("/piece");
+                if (result && result->status == 200 && result->body == body) { ++good[t]; }
+            }
+        });
+    }
+    for (std::thread& thread : threads) { thread.join(); }
+    int total = 0;
+    for (const int count : good) { total += count; }
+    expect(total == kThreads * kRequests, "concurrent HTTPS requests lost or garbled a response");
+}
+
 } // namespace
 
 int main() {
@@ -152,6 +188,7 @@ int main() {
     cache_location();
     pieces();
     offline();
+    concurrent_requests();
     if (failures != 0) {
         std::cerr << failures << " hub expectation(s) failed\n";
         return 1;

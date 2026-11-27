@@ -434,6 +434,7 @@ void download(const Reference& reference, const std::string& commit, const std::
         }
     };
 
+    start_tls_threading();
     if (psa_crypto_init() != PSA_SUCCESS) { throw std::runtime_error("cannot start PSA Crypto"); }
     psa_hash_operation_t hash = PSA_HASH_OPERATION_INIT;
     if (remote.sha256 && psa_hash_setup(&hash, PSA_ALG_SHA_256) != PSA_SUCCESS) {

@@ -32,7 +32,7 @@ ninfer_add_test(ninfer_launch_config_test
 # location and the cache-only resolution; downloads need the network and are not tested here.
 ninfer_add_test(ninfer_hub_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_hub.cpp"
-  LIBRARIES ninfer_product_hub)
+  LIBRARIES ninfer_product_hub ninfer::httplib)
 
 ninfer_add_test(ninfer_cli_options_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp" ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp
