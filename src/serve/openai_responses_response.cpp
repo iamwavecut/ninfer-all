@@ -139,6 +139,42 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"truncation", "disabled"}};
 }
 
+// One output Item a stream published: a reasoning or a message Item with the text of its deltas, in
+// output_index order. Reasoning the model writes after content gets an Item of its own after the
+// message, and content after that a new message Item, so every Item holds what the model wrote
+// there; a client that returns them gets the reasoning and the content back by concatenation.
+struct StreamedItem {
+    bool reasoning   = false;
+    std::string id;
+    int output_index = -1;
+    std::string text;
+    std::vector<ninfer::TokenLogprob> logprobs;
+    std::string status;
+};
+
+Json reasoning_item_json(const std::string& id, const std::string& status,
+                         const OpenAIResponsesCreateRequest& request, const std::string& text) {
+    Json item = {{"id", id},
+                 {"type", "reasoning"},
+                 {"status", status},
+                 {"summary", reasoning_summary(request)},
+                 {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", text}}})}};
+    add_reasoning_encrypted_content(item, request, text);
+    return item;
+}
+
+Json message_item_json(const std::string& id, const std::string& status, const std::string& text,
+                       Json logprobs) {
+    return Json{{"id", id},
+                {"type", "message"},
+                {"status", status},
+                {"role", "assistant"},
+                {"content", Json::array({Json{{"type", "output_text"},
+                                              {"annotations", Json::array()},
+                                              {"text", text},
+                                              {"logprobs", std::move(logprobs)}}})}};
+}
+
 bool needs_message_item(const GenerationOutcome& outcome, const std::string& status) {
     if (!outcome.text.empty()) { return true; }
     if (!outcome.tool_calls.empty() || !outcome.reasoning.empty()) { return false; }
@@ -148,41 +184,38 @@ bool needs_message_item(const GenerationOutcome& outcome, const std::string& sta
 BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_at,
                                    const OpenAIResponsesCreateRequest& request,
                                    const OpenAIResponsesRuntimeValues& runtime,
-                                   const GenerationOutcome& outcome, ItemIds ids) {
+                                   const GenerationOutcome& outcome, ItemIds ids,
+                                   const std::vector<StreamedItem>& streamed = {}) {
     BuiltOpenAIResponse built;
     const std::string status      = response_status(outcome.finish_reason);
     const std::string item_status = status == "completed" ? "completed" : "incomplete";
 
-    if (!outcome.reasoning.empty()) {
-        if (ids.reasoning.empty()) { ids.reasoning = new_openai_response_item_id("rs"); }
-        const char* reasoning_status = (!outcome.text.empty() || !outcome.tool_calls.empty())
-                                           ? "completed"
-                                           : item_status.c_str();
-        Json reasoning_item = {
-            {"id", ids.reasoning},
-            {"type", "reasoning"},
-            {"status", reasoning_status},
-            {"summary", reasoning_summary(request)},
-            {"content",
-             Json::array({Json{{"type", "reasoning_text"}, {"text", outcome.reasoning}}})}};
-        add_reasoning_encrypted_content(reasoning_item, request, outcome.reasoning);
-        built.output_items.push_back(std::move(reasoning_item));
-    }
-
-    if (needs_message_item(outcome, status)) {
-        if (ids.message.empty()) { ids.message = new_openai_response_item_id("msg"); }
-        built.output_items.push_back(
-            Json{{"id", ids.message},
-                 {"type", "message"},
-                 {"status", item_status},
-                 {"role", "assistant"},
-                 {"content", Json::array({Json{{"type", "output_text"},
-                                               {"annotations", Json::array()},
-                                               {"text", outcome.text},
-                                               {"logprobs", openai_token_logprobs_json(
-                                                                outcome.content_logprobs,
-                                                                request.prompt.generation.top_logprobs,
-                                                                true)}}})}});
+    if (!streamed.empty()) {
+        for (const StreamedItem& item : streamed) {
+            built.output_items.push_back(
+                item.reasoning
+                    ? reasoning_item_json(item.id, item.status, request, item.text)
+                    : message_item_json(item.id, item.status, item.text,
+                                        openai_token_logprobs_json(
+                                            item.logprobs, request.prompt.generation.top_logprobs,
+                                            true)));
+        }
+    } else {
+        if (!outcome.reasoning.empty()) {
+            if (ids.reasoning.empty()) { ids.reasoning = new_openai_response_item_id("rs"); }
+            const char* reasoning_status = (!outcome.text.empty() || !outcome.tool_calls.empty())
+                                               ? "completed"
+                                               : item_status.c_str();
+            built.output_items.push_back(
+                reasoning_item_json(ids.reasoning, reasoning_status, request, outcome.reasoning));
+        }
+        if (needs_message_item(outcome, status)) {
+            if (ids.message.empty()) { ids.message = new_openai_response_item_id("msg"); }
+            built.output_items.push_back(message_item_json(
+                ids.message, item_status, outcome.text,
+                openai_token_logprobs_json(outcome.content_logprobs,
+                                           request.prompt.generation.top_logprobs, true)));
+        }
     }
 
     ids.function_calls.resize(outcome.tool_calls.size());
@@ -290,13 +323,16 @@ public:
         return fields;
     }
 
-    std::vector<std::string> ensure_reasoning() {
-        if (reasoning_started) { return {}; }
-        reasoning_started               = true;
-        ids.reasoning                   = new_openai_response_item_id("rs");
-        reasoning_index                 = next_output_index++;
+    // The Item receiving deltas, if one is open: Items open and close one after another.
+    StreamedItem* open_item() { return open < 0 ? nullptr : &items[static_cast<std::size_t>(open)]; }
+
+    std::vector<std::string> open_reasoning() {
+        StreamedItem item;
+        item.reasoning                  = true;
+        item.id                         = new_openai_response_item_id("rs");
+        item.output_index               = next_output_index++;
         const Json summary              = reasoning_summary(request);
-        const Json item                 = {{"id", ids.reasoning},
+        const Json added                = {{"id", item.id},
                                            {"type", "reasoning"},
                                            {"status", "in_progress"},
                                            {"summary", summary},
@@ -304,114 +340,157 @@ public:
         const Json part                 = {{"type", "reasoning_text"}, {"text", ""}};
         std::vector<std::string> events = {
             sse(event("response.output_item.added",
-                      Json{{"output_index", reasoning_index}, {"item", item}}))};
+                      Json{{"output_index", item.output_index}, {"item", added}}))};
         if (!summary.empty()) {
             const Json added_summary_part = {{"type", "summary_text"}, {"text", ""}};
             const Json& done_summary_part = summary.at(0);
             events.push_back(sse(event("response.reasoning_summary_part.added",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
+                                       Json{{"item_id", item.id},
+                                            {"output_index", item.output_index},
                                             {"summary_index", 0},
                                             {"part", added_summary_part}})));
             events.push_back(sse(event("response.reasoning_summary_text.delta",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
+                                       Json{{"item_id", item.id},
+                                            {"output_index", item.output_index},
                                             {"summary_index", 0},
                                             {"delta", kReasoningSummaryPlaceholder}})));
             events.push_back(sse(event("response.reasoning_summary_text.done",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
+                                       Json{{"item_id", item.id},
+                                            {"output_index", item.output_index},
                                             {"summary_index", 0},
                                             {"text", kReasoningSummaryPlaceholder}})));
             events.push_back(sse(event("response.reasoning_summary_part.done",
-                                       Json{{"item_id", ids.reasoning},
-                                            {"output_index", reasoning_index},
+                                       Json{{"item_id", item.id},
+                                            {"output_index", item.output_index},
                                             {"summary_index", 0},
                                             {"part", done_summary_part}})));
         }
         events.push_back(
-            sse(event("response.content_part.added", Json{{"item_id", ids.reasoning},
-                                                          {"output_index", reasoning_index},
+            sse(event("response.content_part.added", Json{{"item_id", item.id},
+                                                          {"output_index", item.output_index},
                                                           {"content_index", 0},
                                                           {"part", part}})));
+        open = static_cast<int>(items.size());
+        items.push_back(std::move(item));
         return events;
     }
 
-    std::vector<std::string> close_reasoning(const std::string& final_text,
-                                             const char* item_status = "completed") {
-        if (!reasoning_started || reasoning_done) { return {}; }
-        reasoning_done  = true;
-        reasoning_text  = final_text;
-        const Json part = {{"type", "reasoning_text"}, {"text", reasoning_text}};
-        Json item = {{"id", ids.reasoning},
-                     {"type", "reasoning"},
-                     {"status", item_status},
-                     {"summary", reasoning_summary(request)},
-                     {"content", Json::array({part})}};
-        add_reasoning_encrypted_content(item, request, reasoning_text);
-        return {sse(event("response.reasoning_text.done", Json{{"item_id", ids.reasoning},
-                                                               {"output_index", reasoning_index},
-                                                               {"content_index", 0},
-                                                               {"text", reasoning_text}})),
-                sse(event("response.content_part.done", Json{{"item_id", ids.reasoning},
-                                                             {"output_index", reasoning_index},
-                                                             {"content_index", 0},
-                                                             {"part", part}})),
-                sse(event("response.output_item.done",
-                          Json{{"output_index", reasoning_index}, {"item", item}}))};
+    std::vector<std::string> open_message() {
+        StreamedItem item;
+        item.id           = new_openai_response_item_id("msg");
+        item.output_index = next_output_index++;
+        const Json added  = {{"id", item.id},
+                             {"type", "message"},
+                             {"status", "in_progress"},
+                             {"role", "assistant"},
+                             {"content", Json::array()}};
+        const Json part   = {{"type", "output_text"},
+                             {"annotations", Json::array()},
+                             {"text", ""},
+                             {"logprobs", Json::array()}};
+        std::vector<std::string> events = {
+            sse(event("response.output_item.added",
+                      Json{{"output_index", item.output_index}, {"item", added}})),
+            sse(event("response.content_part.added", Json{{"item_id", item.id},
+                                                          {"output_index", item.output_index},
+                                                          {"content_index", 0},
+                                                          {"part", part}}))};
+        open = static_cast<int>(items.size());
+        items.push_back(std::move(item));
+        return events;
     }
 
-    std::vector<std::string> ensure_message() {
-        if (message_started) { return {}; }
-        message_started = true;
-        ids.message     = new_openai_response_item_id("msg");
-        message_index   = next_output_index++;
-        const Json item = {{"id", ids.message},
-                           {"type", "message"},
-                           {"status", "in_progress"},
-                           {"role", "assistant"},
-                           {"content", Json::array()}};
-        const Json part = {{"type", "output_text"},
-                           {"annotations", Json::array()},
-                           {"text", ""},
-                           {"logprobs", Json::array()}};
-        return {sse(event("response.output_item.added",
-                          Json{{"output_index", message_index}, {"item", item}})),
-                sse(event("response.content_part.added", Json{{"item_id", ids.message},
-                                                              {"output_index", message_index},
-                                                              {"content_index", 0},
-                                                              {"part", part}}))};
-    }
-
-    std::vector<std::string> close_message(const std::string& final_text,
-                                           const char* item_status = "completed") {
-        if (!message_started || message_done) { return {}; }
-        message_done    = true;
-        content_text    = final_text;
+    std::vector<std::string> close_open(const std::string& item_status) {
+        StreamedItem* item = open_item();
+        if (item == nullptr) { return {}; }
+        open         = -1;
+        item->status = item_status;
+        if (item->reasoning) {
+            const Json part = {{"type", "reasoning_text"}, {"text", item->text}};
+            return {sse(event("response.reasoning_text.done", Json{{"item_id", item->id},
+                                                                   {"output_index", item->output_index},
+                                                                   {"content_index", 0},
+                                                                   {"text", item->text}})),
+                    sse(event("response.content_part.done", Json{{"item_id", item->id},
+                                                                 {"output_index", item->output_index},
+                                                                 {"content_index", 0},
+                                                                 {"part", part}})),
+                    sse(event("response.output_item.done",
+                              Json{{"output_index", item->output_index},
+                                   {"item", reasoning_item_json(item->id, item_status, request,
+                                                                item->text)}}))};
+        }
         // Streamed events carry the event shape of a record, without bytes; the response object
         // carries them.
         const Json aggregate = openai_token_logprobs_json(
-            content_logprobs, request.prompt.generation.top_logprobs, false);
+            item->logprobs, request.prompt.generation.top_logprobs, false);
         const Json part = {{"type", "output_text"},
                            {"annotations", Json::array()},
-                           {"text", content_text},
+                           {"text", item->text},
                            {"logprobs", aggregate}};
-        const Json item = {{"id", ids.message},
-                           {"type", "message"},
-                           {"status", item_status},
-                           {"role", "assistant"},
-                           {"content", Json::array({part})}};
-        return {sse(event("response.output_text.done", Json{{"item_id", ids.message},
-                                                            {"output_index", message_index},
+        return {sse(event("response.output_text.done", Json{{"item_id", item->id},
+                                                            {"output_index", item->output_index},
                                                             {"content_index", 0},
-                                                            {"text", content_text},
+                                                            {"text", item->text},
                                                             {"logprobs", aggregate}})),
-                sse(event("response.content_part.done", Json{{"item_id", ids.message},
-                                                             {"output_index", message_index},
+                sse(event("response.content_part.done", Json{{"item_id", item->id},
+                                                             {"output_index", item->output_index},
                                                              {"content_index", 0},
                                                              {"part", part}})),
                 sse(event("response.output_item.done",
-                          Json{{"output_index", message_index}, {"item", item}}))};
+                          Json{{"output_index", item->output_index},
+                               {"item", message_item_json(item->id, item_status, item->text,
+                                                          aggregate)}}))};
+    }
+
+    // Reasoning goes to the open reasoning Item; after content it closes the message Item and
+    // opens a reasoning Item of its own.
+    std::vector<std::string> append_reasoning(const std::string& text) {
+        std::vector<std::string> events;
+        if (open_item() != nullptr && !open_item()->reasoning) { events = close_open("completed"); }
+        if (open_item() == nullptr) {
+            std::vector<std::string> added = open_reasoning();
+            events.insert(events.end(), std::make_move_iterator(added.begin()),
+                          std::make_move_iterator(added.end()));
+        }
+        StreamedItem& item = *open_item();
+        item.text += text;
+        reasoning_text += text;
+        events.push_back(sse(event("response.reasoning_text.delta",
+                                   Json{{"item_id", item.id},
+                                        {"output_index", item.output_index},
+                                        {"content_index", 0},
+                                        {"delta", text}})));
+        return events;
+    }
+
+    std::vector<std::string> append_content(const std::string& text,
+                                            std::span<const ninfer::TokenLogprob> logprobs) {
+        std::vector<std::string> events;
+        if (open_item() != nullptr && open_item()->reasoning) { events = close_open("completed"); }
+        if (open_item() == nullptr) {
+            std::vector<std::string> added = open_message();
+            events.insert(events.end(), std::make_move_iterator(added.begin()),
+                          std::make_move_iterator(added.end()));
+        }
+        StreamedItem& item = *open_item();
+        item.text += text;
+        item.logprobs.insert(item.logprobs.end(), logprobs.begin(), logprobs.end());
+        content_text += text;
+        events.push_back(sse(event(
+            "response.output_text.delta",
+            Json{{"item_id", item.id},
+                 {"output_index", item.output_index},
+                 {"content_index", 0},
+                 {"delta", text},
+                 {"logprobs", openai_token_logprobs_json(
+                                  logprobs, request.prompt.generation.top_logprobs, false)}})));
+        return events;
+    }
+
+    [[nodiscard]] bool has_message() const {
+        return std::any_of(items.begin(), items.end(),
+                           [](const StreamedItem& item) { return !item.reasoning; });
     }
 
     std::string id;
@@ -420,18 +499,14 @@ public:
     OpenAIResponsesRuntimeValues runtime;
     std::uint64_t sequence = 0;
     int next_output_index  = 0;
-    int reasoning_index    = -1;
-    int message_index      = -1;
+    int open               = -1;
     bool started           = false;
-    bool reasoning_started = false;
-    bool reasoning_done    = false;
-    bool message_started   = false;
-    bool message_done      = false;
     bool finish_built      = false;
     bool terminal_emitted  = false;
+    // The concatenations of the streamed reasoning and content: the outcome's prefixes.
     std::string reasoning_text;
     std::string content_text;
-    std::vector<ninfer::TokenLogprob> content_logprobs;
+    std::vector<StreamedItem> items;
     ItemIds ids;
 };
 
@@ -462,14 +537,7 @@ std::vector<std::string> OpenAIResponsesEventStream::reasoning_delta(const std::
         throw std::logic_error("invalid reasoning delta event state");
     }
     if (text.empty()) { return {}; }
-    std::vector<std::string> events = impl_->ensure_reasoning();
-    impl_->reasoning_text += text;
-    events.push_back(sse(
-        impl_->event("response.reasoning_text.delta", Json{{"item_id", impl_->ids.reasoning},
-                                                           {"output_index", impl_->reasoning_index},
-                                                           {"content_index", 0},
-                                                           {"delta", text}})));
-    return events;
+    return impl_->append_reasoning(text);
 }
 
 std::vector<std::string>
@@ -479,25 +547,7 @@ OpenAIResponsesEventStream::content_delta(const std::string& text,
         throw std::logic_error("invalid content delta event state");
     }
     if (text.empty() && logprobs.empty()) { return {}; }
-    std::vector<std::string> events = impl_->close_reasoning(impl_->reasoning_text);
-    std::vector<std::string> added  = impl_->ensure_message();
-    events.insert(events.end(), std::make_move_iterator(added.begin()),
-                  std::make_move_iterator(added.end()));
-    impl_->content_text += text;
-    impl_->content_logprobs.insert(impl_->content_logprobs.end(), logprobs.begin(),
-                                   logprobs.end());
-    events.push_back(
-        sse(impl_->event("response.output_text.delta", Json{{"item_id", impl_->ids.message},
-                                                            {"output_index", impl_->message_index},
-                                                            {"content_index", 0},
-                                                            {"delta", text},
-                                                            {"logprobs", openai_token_logprobs_json(
-                                                                             logprobs,
-                                                                             impl_->request.prompt
-                                                                                 .generation
-                                                                                 .top_logprobs,
-                                                                             false)}})));
-    return events;
+    return impl_->append_content(text, logprobs);
 }
 
 OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationOutcome& outcome) {
@@ -514,37 +564,31 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
                                                std::make_move_iterator(events.begin()),
                                                std::make_move_iterator(events.end()));
     };
-    if (!outcome.reasoning.empty() && !impl_->reasoning_started) {
-        append(impl_->ensure_reasoning());
-        impl_->reasoning_text = outcome.reasoning;
-        finished.events_before_terminal.push_back(sse(impl_->event(
-            "response.reasoning_text.delta", Json{{"item_id", impl_->ids.reasoning},
-                                                  {"output_index", impl_->reasoning_index},
-                                                  {"content_index", 0},
-                                                  {"delta", outcome.reasoning}})));
+    if (!outcome.reasoning.starts_with(impl_->reasoning_text)) {
+        throw std::logic_error("streamed reasoning does not match terminal reasoning");
     }
-    const char* reasoning_status =
-        (!outcome.text.empty() || !outcome.tool_calls.empty()) ? "completed" : item_status;
-    append(impl_->close_reasoning(outcome.reasoning, reasoning_status));
-
-    if (needs_message_item(outcome, status)) {
-        append(impl_->ensure_message());
-        if (outcome.text != impl_->content_text) {
-            if (!outcome.text.starts_with(impl_->content_text)) {
-                throw std::logic_error("streamed content does not match terminal content");
-            }
-            const std::string suffix = outcome.text.substr(impl_->content_text.size());
-            if (!suffix.empty()) {
-                impl_->content_text += suffix;
-                finished.events_before_terminal.push_back(sse(impl_->event(
-                    "response.output_text.delta", Json{{"item_id", impl_->ids.message},
-                                                       {"output_index", impl_->message_index},
-                                                       {"content_index", 0},
-                                                       {"delta", suffix},
-                                                       {"logprobs", Json::array()}})));
-            }
-        }
-        append(impl_->close_message(outcome.text, item_status));
+    if (!outcome.text.starts_with(impl_->content_text)) {
+        throw std::logic_error("streamed content does not match terminal content");
+    }
+    const std::string reasoning_suffix = outcome.reasoning.substr(impl_->reasoning_text.size());
+    const std::string content_suffix   = outcome.text.substr(impl_->content_text.size());
+    // The open Item's tail first, so text the output held back joins the Item it belongs to.
+    const bool content_first = impl_->open_item() != nullptr && !impl_->open_item()->reasoning;
+    if (content_first && !content_suffix.empty()) {
+        append(impl_->append_content(content_suffix, {}));
+    }
+    if (!reasoning_suffix.empty()) { append(impl_->append_reasoning(reasoning_suffix)); }
+    if (!content_first && !content_suffix.empty()) {
+        append(impl_->append_content(content_suffix, {}));
+    }
+    if (needs_message_item(outcome, status) && !impl_->has_message()) {
+        append(impl_->close_open("completed"));
+        append(impl_->open_message());
+    }
+    if (const StreamedItem* item = impl_->open_item()) {
+        const char* reasoning_status =
+            (!outcome.text.empty() || !outcome.tool_calls.empty()) ? "completed" : item_status;
+        append(impl_->close_open(item->reasoning ? reasoning_status : item_status));
     }
 
     impl_->ids.function_calls.reserve(outcome.tool_calls.size());
@@ -588,7 +632,7 @@ OpenAIResponsesStreamFinish OpenAIResponsesEventStream::finish(const GenerationO
     }
 
     finished.response = build_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime,
-                                       outcome, impl_->ids);
+                                       outcome, impl_->ids, impl_->items);
     return finished;
 }
 

@@ -1093,6 +1093,88 @@ int test_hidden_reasoning_signature() {
     return failures;
 }
 
+// Reasoning after text (a template that opens the text block in the prompt, Inkling 2): the text
+// block closes and another Thinking block opens, the blocks keep the model's order, each hidden
+// block's signature carries its own reasoning, and returning them restores it all.
+int test_stream_reasoning_after_text() {
+    int failures = 0;
+    const AnthropicResponseIdentity identity =
+        make_anthropic_response_identity("req_late", "claude-local");
+    GenerationOutcome outcome = sample_outcome();
+    outcome.reasoning         = "first, second";
+    outcome.text              = "answer, amended";
+    for (const bool hidden : {false, true}) {
+        AnthropicMessagesStream stream(identity, 100, hidden);
+        std::vector<std::string> events{stream.start()};
+        const auto append = [&](std::vector<std::string> values) {
+            events.insert(events.end(), std::make_move_iterator(values.begin()),
+                          std::make_move_iterator(values.end()));
+        };
+        append(stream.reasoning_delta("first"));
+        append(stream.content_delta("answer"));
+        append(stream.reasoning_delta(", second"));
+        append(stream.content_delta(", amended"));
+        append(stream.finish(outcome));
+
+        std::vector<Json> blocks;      // content_block_start blocks, by index
+        std::vector<std::string> text; // each block's streamed text or decoded signature
+        int open        = -1;
+        bool overlapped = false, ordered = true;
+        for (const std::string& wire : events) {
+            const Json event = parse_event(wire);
+            if (event.at("type") == "content_block_start") {
+                overlapped = overlapped || open >= 0;
+                open       = event.at("index").get<int>();
+                ordered    = ordered && open == static_cast<int>(blocks.size());
+                blocks.push_back(event.at("content_block"));
+                text.emplace_back();
+            } else if (event.at("type") == "content_block_stop") {
+                overlapped = overlapped || event.at("index") != open;
+                open       = -1;
+            } else if (event.at("type") == "content_block_delta") {
+                const Json& delta = event.at("delta");
+                auto& out         = text.at(event.at("index").get<std::size_t>());
+                if (delta.at("type") == "text_delta") { out += delta.at("text"); }
+                if (delta.at("type") == "thinking_delta") { out += delta.at("thinking"); }
+                if (hidden && delta.at("type") == "signature_delta") {
+                    out = decode_thinking_signature(delta.at("signature").get<std::string>())
+                              .value_or("<foreign>");
+                }
+            }
+        }
+        failures += check(!overlapped && ordered && blocks.size() == 4 &&
+                              blocks[0].at("type") == "thinking" &&
+                              blocks[1].at("type") == "text" && blocks[2].at("type") == "thinking" &&
+                              blocks[3].at("type") == "text" && text[0] == "first" &&
+                              text[1] == "answer" && text[2] == ", second" &&
+                              text[3] == ", amended",
+                          hidden ? "hidden reasoning after text did not stream as its own block"
+                                 : "reasoning after text did not stream as a new Thinking block");
+        if (!hidden) { continue; }
+        // The client returns the blocks it received; lowering restores the reasoning in order.
+        Json content = Json::array();
+        for (std::size_t i = 0; i < blocks.size(); ++i) {
+            content.push_back(blocks[i].at("type") == "thinking"
+                                  ? Json{{"type", "thinking"},
+                                         {"thinking", ""},
+                                         {"signature", encode_thinking_signature(text[i])}}
+                                  : Json{{"type", "text"}, {"text", text[i]}});
+        }
+        Json body        = base_request();
+        body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
+        body["messages"].push_back(Json{{"role", "assistant"}, {"content", content}});
+        body["messages"].push_back(Json{{"role", "user"}, {"content", "next"}});
+        const GenerationRequest lowered = parse(body).generation;
+        const auto assistant = std::ranges::find_if(lowered.messages, [](const ChatTurn& turn) {
+            return turn.role == ninfer::ChatRole::Assistant;
+        });
+        failures += check(assistant != lowered.messages.end() &&
+                              assistant->reasoning_content == outcome.reasoning,
+                          "returned Thinking blocks did not restore the reasoning");
+    }
+    return failures;
+}
+
 int test_hidden_reasoning_round_trip() {
     const AnthropicResponseIdentity identity =
         make_anthropic_response_identity("req_hidden", "claude-local");
@@ -1184,6 +1266,7 @@ int main() {
     failures += test_stream();
     failures += test_hidden_reasoning_signature();
     failures += test_hidden_reasoning_round_trip();
+    failures += test_stream_reasoning_after_text();
     if (failures != 0) {
         std::cerr << failures << " Anthropic adapter checks failed\n";
         return 1;

@@ -1485,6 +1485,30 @@ int test_stream_response() {
     return failures;
 }
 
+// Reasoning after content (a template that opens the text block in the prompt, Inkling 2) streams
+// as reasoning_content deltas after the content ones, live and as a terminal tail.
+int test_stream_reasoning_after_content() {
+    int failures = 0;
+    OpenAIChatStream stream(identity(), false);
+    (void)stream.start();
+    (void)stream.content_delta("answer");
+    const Json late = parse_sse(stream.reasoning_delta("checked"));
+    failures += check(late["choices"][0]["delta"]["reasoning_content"] == "checked" &&
+                          !late["choices"][0]["delta"].contains("content"),
+                      "reasoning after content did not stream as a reasoning_content delta");
+    GenerationOutcome outcome             = sample_outcome();
+    outcome.text                          = "answer";
+    outcome.reasoning                     = "checked twice";
+    const std::vector<std::string> events = stream.finish(outcome);
+    failures += check(events.size() == 3 &&
+                          parse_sse(events[0])["choices"][0]["delta"]["reasoning_content"] ==
+                              " twice" &&
+                          parse_sse(events[1])["choices"][0]["finish_reason"] == "stop" &&
+                          events[2] == "data: [DONE]\n\n",
+                      "a terminal reasoning tail after content was not emitted");
+    return failures;
+}
+
 int test_stream_observations() {
     int failures = 0;
     OpenAIChatStream stream(identity(), true, true, true);
@@ -1818,6 +1842,7 @@ int main() {
     failures += test_bad_words();
     failures += test_aggregate_response();
     failures += test_stream_response();
+    failures += test_stream_reasoning_after_content();
     failures += test_stream_observations();
     failures += test_common_objects();
     failures += test_assistant_continuation_mode();

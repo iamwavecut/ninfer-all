@@ -2149,11 +2149,13 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments`; `async` may only be `false` |
 | `function_call_output` | completed result with required `call_id` and optional matching name/namespace assertion; `output` may be a string or a non-empty array of `input_text`/`input_image` parts |
 
-Contiguous assistant-owned Items form one assistant history turn in the representable order
-`reasoning` -> assistant message content -> `function_call`. Multiple message Items append their
-content parts, multiple calls retain declaration order, and a reasoning-only turn is retained. A
-user, system, developer, or `function_call_output` Item ends the group; an order that would require
-rearranging assistant content fails with `invalid_assistant_history`. Results are validated by
+Contiguous assistant-owned Items form one assistant history turn: `reasoning` and assistant
+message content, then `function_call`. Multiple message Items append their content parts, multiple
+reasoning Items join in order, before or after content (a response whose model reasoned after its
+content streams its reasoning that way), multiple calls retain declaration order, and a
+reasoning-only turn is retained. A user, system, developer, or `function_call_output` Item ends the
+group; content or reasoning after a call, which the turn would render before it, fails with
+`invalid_assistant_history` unless `--lenient-assistant-history` joins it. Results are validated by
 `call_id` and reordered to call declaration order before prompt rendering; unknown, duplicate, or
 unrepresentable partial result sets fail with `invalid_tool_history`. Canonical input Items retain
 client order. Input Item IDs are preserved when supplied and generated otherwise; duplicate IDs
@@ -2315,6 +2317,13 @@ For `include:["reasoning.encrypted_content"]`, the in-progress
 `response.output_item.added` Item omits `encrypted_content` because the complete reasoning text is
 not available yet. `response.output_item.done` and the terminal Response output contain the same
 complete raw mirror. A response with no reasoning Item emits no encrypted placeholder.
+
+Items open and close one after another in the order the model writes them. A model that reasons
+after its content (Inkling 2 under a template that opens the text block in the prompt) gets a
+reasoning Item after the message, and content after that goes to a new message Item; the terminal
+Response output holds the same Items, and a request that returns them joins their reasoning and
+their content again. Chat Completions streams such reasoning as `reasoning_content` deltas after
+`content` ones, and Anthropic Messages as a new Thinking block after the text block.
 
 Function arguments use `response.function_call_arguments.delta` and `.done`. IDs, output indices,
 and content indices remain stable, and concatenated deltas equal the terminal Item. Responses SSE
