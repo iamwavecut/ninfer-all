@@ -12,8 +12,8 @@
 // are staged by cp.async; activations are read straight from global memory through L1. They arrive
 // quantised to s8 with one binary16 scale per (token, 64-k group), as in the integer prefill route:
 // codes [T, K] token-major, scales [K / 64, 192] group-major, so a lane's two output columns share
-// one 32-bit scale load. One launch covers up to 64 columns from column col0; wider T takes
-// several.
+// one 32-bit scale load. One launch covers up to 32 columns from column col0 (64 with an
+// eight-tile schedule a device profile names); wider T takes several.
 //
 // Lane lid owns k = 16 * lid + j (j = 0..15) of each 64-k group of its warp's slice. The m16n8k32
 // k slots may be any permutation shared by A and B, so the two k32 steps take j {0, 2, 4, 6 |
@@ -34,7 +34,8 @@
 namespace ninfer::ops::detail {
 
 inline constexpr int kT2I8MaxColumns    = 192;
-inline constexpr int kT2I8LaunchColumns = 64;
+inline constexpr int kT2I8LaunchColumns     = 32;
+inline constexpr int kT2I8WideLaunchColumns = 64;
 inline constexpr int kT2I8ActivationK   = 64;
 
 // WordsPerLane code words of a row per lane and slab: a warp's slice of a slab is 64 * WordsPerLane
