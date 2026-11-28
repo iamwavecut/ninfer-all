@@ -1085,6 +1085,19 @@ code, prose, Chinese) twice, 256 greedy tokens each; decode tok/s of the first /
 | MTP 4 | 111.1 / 105.9 | 101.9 / 96.2 | 74.6 / 78.5 |
 | disk experts, first run | 68.1 | 71.4 | |
 
+### Up to 64 requests with host experts
+
+`ninfer-serve --max-concurrency 64 --kv-dtype rk8v4 --expert-residency host --no-prefix-reuse --ngram-table <table>`, `serve_load.py --profile chat`: N
+short-chat requests of 256 tokens arrive together, EOS ignored; tok/s while all N decode at once
+(`steady_tps`).
+A round of more than eight requests decodes without drafts; eight or fewer verify MTP drafts.
+
+| Card | `--max-context` | 8 | 16 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| A40, UD-IQ2_XS, IQ4_NL table | 2,048 | 153.2 | 167.8 | 197.1 | 215.6 | 230.5 |
+
+At `--max-concurrency 8` eight requests decode 139.4 tok/s.
+
 ### Quality
 
 The first 72 KB of the WikiText sample in `perplexity-1m`, 2,560-token windows advancing by 1,024,
@@ -1186,6 +1199,16 @@ On the Tesla V100 (window 28,672 tokens), short chat decodes 164.3 tok/s without
 226.3 with MTP 2 (0.70, 2.40); after 1,024 and 8,192 tokens 155.6 and 149.5, with MTP 2 187.7 and
 167.0. Prompt time is 0.36 s at 1,024 tokens and 2.9 s at 8,192.
 
+### Up to 64 requests at once
+
+`ninfer-serve --max-concurrency 64 --kv-dtype rk8v4 --no-prefix-reuse`, `serve_load.py --profile chat`: N
+short-chat requests of 256 tokens arrive together, EOS ignored; tok/s while all N decode at once
+(`steady_tps`).
+
+| Card | `--max-context` | 8 | 16 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| RTX 3090, QAT Q4_0 | 1,024 | 515.1 | 598.7 | 962.4 | 1,247.9 | 1,528.5 |
+
 ## Flint
 
 Recursive's Flint from Unsloth's
@@ -1211,6 +1234,19 @@ llama.cpp keeps the experts of its first four blocks on the CPU (`-ncmoe 4`, the
 [Flint's measurements](flint.md#measurements) name the hosts and add disk experts and context
 lookup; [GGUF models across cards](performance/gguf-cards-2026-11.md) has eight cards from one
 release build.
+
+### Up to 64 requests at once
+
+`ninfer-serve --max-concurrency 64 --kv-dtype rk8v4 --no-prefix-reuse`, `serve_load.py --profile chat`: N
+short-chat requests of 256 tokens arrive together, EOS ignored; tok/s while all N decode at once
+(`steady_tps`).
+
+| Card | `--max-context` | 8 | 16 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| RTX 5090, UD-Q4_K_XL | 2,048 | 1,204.4 | 882.1 | 1,441.2 | 1,877.7 | 2,299.6 |
+
+Sixteen requests decode slower than eight: a round of 16 takes 18.1 ms against 6.6 ms for 8. Past
+eight columns the routed experts leave the vector kernel for the integer matrix kernel.
 
 ## DeepSeek-V4.1-Flash
 
@@ -1288,6 +1324,20 @@ DeepSeek-V4.1-Flash has no pipeline stages; several GPUs divide only its routed 
 [DeepSeek-V4.1-Flash's measurements](deepseek-v41.md#measurements) add the hosts, the device
 cache each card holds, context lookup, startup and what limits each engine.
 
+### Up to 64 requests with host experts
+
+`ninfer-serve --max-concurrency 64 --kv-dtype bf16 --expert-residency host --no-prefix-reuse --ngram-table <Engram table>`, `serve_load.py --profile chat`: N
+short-chat requests of 256 tokens arrive together, EOS ignored; tok/s while all N decode at once
+(`steady_tps`).
+
+| Card | `--max-context` | 8 | 16 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| A40, IQ1_M | 2,048 | 73.3 | 46.6 | 54.1 | 61.6 | 61.3 |
+
+More than eight requests decode slower than eight: the CPU share takes misses only of calls of
+at most eight tokens, so a round of 16 copies every miss over PCIe and takes 343 ms against
+109 ms for 8. With host experts `--max-concurrency 8` gives the most tok/s.
+
 ## Inkling 2 Mini
 
 Thinking Machines' looped Inkling 2 Mini from Unsloth's [UD-IQ4_XS
@@ -1343,6 +1393,16 @@ cache holds every expert and decodes at 100.3 tok/s, 117.8 with DSpark. [Inkling
 measurements](inkling2.md#measurements) add the prompt of 2,048 tokens, decode after 10,000, the
 drafter on each card, context lookup, concurrency, expert residency and expert parallelism over two
 cards.
+
+### Up to 64 requests at once
+
+`ninfer-serve --max-concurrency 64 --kv-dtype rk8v4 --no-prefix-reuse`, `serve_load.py --profile chat`: N
+short-chat requests of 256 tokens arrive together, EOS ignored; tok/s while all N decode at once
+(`steady_tps`).
+
+| Card | `--max-context` | 8 | 16 | 32 | 48 | 64 |
+|---|---:|---:|---:|---:|---:|---:|
+| RTX 5090, UD-IQ4_XS | 2,048 | 696.8 | 873.4 | 1,364.6 | 1,772.3 | 2,199.8 |
 
 ## Measurement pages
 

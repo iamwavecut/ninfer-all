@@ -1058,6 +1058,10 @@ struct Executor::Impl {
     // tokens read; wider calls read the rank's staging copy. Zero: every layer resident.
     std::uint32_t stream_slots = 0, stream_width = 0;
     std::uint32_t max_logit_rows = 0;
+    // A verification takes at most kMaximumSpeculativeRows sequences; more decode in plain steps.
+    [[nodiscard]] std::uint32_t speculative_rows() const noexcept {
+        return std::min(options.sequences, kMaximumSpeculativeRows);
+    }
     ExecutorMemory memory;
     std::vector<std::uint64_t> row_ids;
     std::vector<std::uint8_t> row_bytes_host;
@@ -1278,13 +1282,13 @@ struct Executor::Impl {
                                             "under tensor parallelism, not over pipeline stages");
             }
             verify_width = options.draft_tokens + 1;
-            if (verify_width * options.sequences > options.prefill_chunk) {
+            if (verify_width * speculative_rows() > options.prefill_chunk) {
                 throw std::invalid_argument(
-                    "qwen4_exp: the prefill chunk must hold a verification of every sequence, (" +
-                    std::to_string(verify_width) + " tokens) x " +
-                    std::to_string(options.sequences));
+                    "qwen4_exp: the prefill chunk must hold a verification of every speculative "
+                    "row, (" + std::to_string(verify_width) + " tokens) x " +
+                    std::to_string(speculative_rows()));
             }
-            max_logit_rows = std::max(max_logit_rows, verify_width * options.sequences);
+            max_logit_rows = std::max(max_logit_rows, verify_width * speculative_rows());
             domain         = static_cast<std::int32_t>(model.resources().public_token_count);
         }
         pages          = (options.max_context + kPagedKVPageSize - 1) / kPagedKVPageSize;
@@ -1646,7 +1650,7 @@ struct Executor::Impl {
         const std::uint32_t window = drafter_window();
         const std::uint32_t span   = planned_span_tokens();
         const std::uint32_t prompt = std::max(options.prefill_chunk, span);
-        return std::max({verify_width * options.sequences,
+        return std::max({verify_width * speculative_rows(),
                          std::min(prompt, window * options.sequences), std::min(span, 2 * window)});
     }
 
@@ -2437,7 +2441,7 @@ struct Executor::Impl {
     // projections, the PLE layer's normalised convolution input and scratch states; on the head
     // rank the MTP chain's tokens and positions.
     void allocate_speculation() {
-        const std::uint64_t columns = std::uint64_t(verify_width) * options.sequences;
+        const std::uint64_t columns = std::uint64_t(verify_width) * speculative_rows();
         const std::uint64_t index_rows =
             std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
         const std::uint64_t stack_width = std::uint64_t(config.hc_count) * config.hidden_size;
@@ -2458,7 +2462,7 @@ struct Executor::Impl {
                 const auto& pool = rank.gdn->spec();
                 const GdnReplayRecordSpec spec{
                     .layers          = static_cast<std::int32_t>(pool.layers),
-                    .record_capacity = static_cast<std::int32_t>(options.sequences),
+                    .record_capacity = static_cast<std::int32_t>(speculative_rows()),
                     .width           = static_cast<std::int32_t>(verify_width),
                     .conv_channels   = pool.conv_channels,
                     .qk_heads        = static_cast<std::int32_t>(
@@ -2494,7 +2498,7 @@ struct Executor::Impl {
         RankBinding bind(device, head);
         if (mtp) {
             const std::uint64_t cells = std::max<std::uint64_t>(
-                options.prefill_chunk, std::uint64_t(verify_width) * options.sequences);
+                options.prefill_chunk, std::uint64_t(verify_width) * speculative_rows());
             mtp_ids       = DeviceBuffer(cells * 4);
             mtp_positions = DeviceBuffer(cells * 4);
             mtp_rope      = DeviceBuffer(cells * 4);
@@ -2924,7 +2928,8 @@ struct Executor::Impl {
         miss.staging_bytes  = kStagingBytes;
         miss.tail_skip_rank = options.hybrid_experts.tail_skip_rank;
         miss.disk = ExpertDiskReads{options.hybrid_experts.mirror, options.hybrid_experts.direct};
-        const std::uint32_t joint = verify_width * options.sequences;
+        // A verification's tokens, or a plain step's one token per sequence.
+        const std::uint32_t joint = std::max(verify_width * speculative_rows(), options.sequences);
         const bool pooled = std::all_of(layers.begin(), layers.end(), [&](const auto& plan) {
             return plan.rank < slot_pools.size() && slot_pools[plan.rank].slots != 0;
         });
@@ -3836,7 +3841,7 @@ struct Executor::Impl {
         if (!verifying) { return nullptr; }
         const std::uint64_t rows =
             std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
-        const std::uint64_t columns = std::uint64_t(verify_width) * options.sequences;
+        const std::uint64_t columns = std::uint64_t(verify_width) * speculative_rows();
         return static_cast<std::byte*>(rank.index_records.p) +
                (qsa_local[index] * columns + std::uint64_t(column)) * rows * 2;
     }
@@ -6355,8 +6360,8 @@ struct Executor::Impl {
             }
         }
         // Batches of several sequences run eagerly: their first passes load the kernels of their
-        // widths now, a plain step of every batch size, then a verification of every sequence at
-        // the full width with the drafts before it.
+        // widths now, a plain step of every batch size, then a verification of the widest round
+        // (at most kMaximumSpeculativeRows sequences) at the full width with the drafts before it.
         std::vector<std::uint32_t> batch{sequence};
         for (std::uint32_t s = 1; s < options.sequences; ++s) {
             reset(s);
@@ -6366,15 +6371,19 @@ struct Executor::Impl {
                 decode(batch, std::vector<std::int32_t>(batch.size(), kToken));
             }
         }
-        const bool round = batch.size() > 1 && (mtp || drafter) &&
-                           std::all_of(batch.begin(), batch.end(), [&](std::uint32_t s) {
-                               return can_draft(s) && fits(s, verify_width);
-                           });
+        const std::span<const std::uint32_t> verified_batch =
+            std::span(batch).first(std::min<std::size_t>(batch.size(), speculative_rows()));
+        const bool round = verified_batch.size() > 1 && (mtp || drafter) &&
+                           std::all_of(verified_batch.begin(), verified_batch.end(),
+                                       [&](std::uint32_t s) {
+                                           return can_draft(s) && fits(s, verify_width);
+                                       });
         if (round) {
-            std::vector<std::int32_t> batch_drafts(batch.size() * options.draft_tokens);
-            draft(batch, std::vector<std::int32_t>(batch.size(), kToken), batch_drafts);
-            verify(batch, std::vector<std::int32_t>(batch.size() * verify_width, kToken));
-            commit(batch, std::vector<std::uint32_t>(batch.size(), 1));
+            const std::size_t rows = verified_batch.size();
+            std::vector<std::int32_t> batch_drafts(rows * options.draft_tokens);
+            draft(verified_batch, std::vector<std::int32_t>(rows, kToken), batch_drafts);
+            verify(verified_batch, std::vector<std::int32_t>(rows * verify_width, kToken));
+            commit(verified_batch, std::vector<std::uint32_t>(rows, 1));
         }
         for (const std::uint32_t s : batch) { reset(s); }
         for (auto& rank : ranks) {
@@ -7285,7 +7294,7 @@ struct Executor::Impl {
             total += width;
             w = std::max(w, width);
         }
-        if (b == 0 || b > sequences.size() || row_widths.size() != b || w > verify_width ||
+        if (b == 0 || b > speculative_rows() || row_widths.size() != b || w > verify_width ||
             tokens.size() != total ||
             std::find(row_widths.begin(), row_widths.end(), 0U) != row_widths.end()) {
             throw std::invalid_argument("qwen4_exp verify: an anchor and its drafts per sequence");
@@ -7368,7 +7377,7 @@ struct Executor::Impl {
         const auto di = static_cast<std::int32_t>(config.indexer_head_dim);
         const std::uint64_t index_rows =
             std::uint64_t(config.indexer_n_heads + 1) * config.indexer_head_dim;
-        const std::uint64_t columns = std::uint64_t(verify_width) * options.sequences;
+        const std::uint64_t columns = std::uint64_t(verify_width) * speculative_rows();
         const auto stack_width      = std::int32_t(config.hc_count * config.hidden_size);
         const auto advance = [&](std::size_t i, std::size_t r, const LayerPlan& plan,
                                  std::size_t j, LayerState& state) {

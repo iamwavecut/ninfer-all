@@ -34,3 +34,8 @@ ninfer_add_test(ninfer_gemma4_kv_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_kv.cpp"
   LIBRARIES ninfer_model_runtime)
 set_tests_properties(ninfer_gemma4_kv_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_gemma4_wide_decode_real_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_wide_decode_real.cpp"
+  LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_gemma4_wide_decode_real_test PROPERTIES SKIP_RETURN_CODE 77)

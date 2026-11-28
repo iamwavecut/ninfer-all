@@ -43,7 +43,7 @@ templates, output parsing and the serving protocols in a DeepSeek dialect.
   E8M0 scales (528 bytes), a compressed latent 256 bytes of E2M1 pairs and 32 E4M3 scales (288
   bytes), an indexer key 64 bytes of E2M1 pairs and 4 E8M0 scales. Attention and the indexer
   decode them to the same values.
-- **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
+- **Requests.** One to 64 concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens (`--prefill-chunk`, at most 4096; narrower on a card without room for them) run block by
   block in spans of up to eight chunks ([below](#prompt-spans)), the last 19 blocks only over the
   prompt rows the output depends on ([below](#the-prefill-tail)), prefix reuse across turns and

@@ -237,7 +237,7 @@ ConstructedGemma4 construct_gemma4(const EngineOptions& options, DeviceContext& 
     models::gemma4::ExecutorOptions executor;
     // One more position than the Engine admits: scoring puts <bos> in front of a window.
     executor.max_context   = options.max_context + 1;
-    executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
+    executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, kMaximumConcurrency);
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.draft_tokens  = mtp || block ? speculative.draft_tokens : 0;
     executor.dspine        = block;

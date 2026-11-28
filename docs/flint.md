@@ -27,7 +27,7 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   sinks in a second pass. The sliding blocks keep a ring of 768 positions per sequence in F16, the
   full-attention blocks every position, in F16 or in a quantized `--kv-dtype` format
   ([below](#kv-cache)).
-- **Requests.** One to eight concurrent sequences (`--max-concurrency`), prompt chunks of 2048
+- **Requests.** One to 64 concurrent sequences (`--max-concurrency`), prompt chunks of 2048
   tokens (1024 or 512 on a card without room for them), prefix reuse across turns and requests
   with host-memory images ([below](#prefix-reuse)), branched reads for
   [typed decisions](serving.md#typed-decisions) (a choice of at most 26 options and a box grid of

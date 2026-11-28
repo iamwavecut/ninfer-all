@@ -196,6 +196,13 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         throw std::invalid_argument("--spec mtp, dflash2 and dspine require --draft-tokens in "
                                     "[1,15]");
     }
+    // MTP verifies at most kMaximumSpeculativeRows sequences at once and steps the rest plainly;
+    // a block drafter keeps a slot of its own for every sequence.
+    if ((dflash2 || dspine) && options.max_concurrency > kMaximumSpeculativeRows) {
+        throw std::invalid_argument("Qwen3.8-Flash-Next's DFlash2 and DSpine drafters run at most " +
+                                    std::to_string(kMaximumSpeculativeRows) +
+                                    " requests at once; --spec mtp drafts past that");
+    }
     // The drafter predicts a block of eight positions, the last token and seven masks: incoai's
     // drafter was trained on such blocks (its config's block_size), and a wider round verifies
     // more than eight columns on a slower route.
@@ -357,10 +364,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const runtime::RopeScalingPlan rope = runtime::resolve_rope_scaling(
         options, text.max_position_embeddings, runtime::kQwen4ExpRopeScaling);
     executor.rope_yarn       = rope.yarn;
-    // A chunk also holds a verification of every sequence at once.
+    // A chunk also holds a verification of every speculative row at once.
     const auto chunk_of = [&](std::uint32_t requested) {
         return std::max(std::clamp<std::uint32_t>(requested, 64, 4096),
-                        (executor.draft_tokens + 1) * executor.sequences);
+                        (executor.draft_tokens + 1) *
+                            std::min(executor.sequences, kMaximumSpeculativeRows));
     };
     executor.prefill_chunk = chunk_of(options.prefill_chunk ? options.prefill_chunk : 1024);
     instance->ngram_table_digest = ngram ? ngram->table_digest : std::string();
@@ -2772,8 +2780,10 @@ struct Qwen4ExpCore::Impl {
     // The drafts each request of a round of `b` may verify: every draft, or with round_tokens as
     // many as keep the round's verification within it (with 64 tokens, seven each for eight
     // requests); 0 past that, where the requests decode without drafts. A wider verification
-    // copies every missing expert to the GPU, and its drafts cost more than they keep.
+    // copies every missing expert to the GPU, and its drafts cost more than they keep. More than
+    // kMaximumSpeculativeRows requests decode without drafts.
     [[nodiscard]] std::uint32_t round_drafts(std::size_t b) const {
+        if (b > kMaximumSpeculativeRows) { return 0; }
         if (round_tokens == 0 || b == 0) { return drafts; }
         const auto width = round_tokens / static_cast<std::uint32_t>(b);
         return width > 1 ? std::min(drafts, width - 1) : 0;

@@ -251,7 +251,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& options, DeviceConte
     StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
     models::inkling2::ExecutorOptions executor;
     executor.max_context   = options.max_context;
-    executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, 8);
+    executor.sequences     = std::clamp<std::uint32_t>(options.max_concurrency, 1, kMaximumConcurrency);
     executor.cuda_graphs   = options.use_cuda_graph;
     executor.kv_cache      = options.kv_cache;
     executor.loop_kv       = options.loop_kv;

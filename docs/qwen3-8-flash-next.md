@@ -35,7 +35,7 @@ The published conversions store the models without the table, which is published
 | [Unsloth UD-IQ2_XS](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-UD-IQ2_XS-NInfer-v3) | 47.43 GiB | Unsloth Dynamic v3.1, Vision, shared-Q8_0 MTP and the DFlash2 drafter |
 | [Unsloth UD-IQ3_XXS](https://huggingface.co/WaveCut/Qwen3.8-Flash-Next-UD-IQ3_XXS-NInfer-v3) | 54.66 GiB | Unsloth Dynamic v3.1, Vision, shared-Q8_0 MTP and the DFlash2 drafter |
 
-The model runs with up to eight concurrent requests, a context cache of prompt prefixes, structured
+The model runs with up to 64 concurrent requests, a context cache of prompt prefixes, structured
 output, images and video through its Vision tower (`--vision`, from an artifact converted with the
 tower), and MTP speculative decoding (`--spec mtp`). The three published NInfer models above now
 include Unsloth's shared-Q8_0 MTP block. The upstream GSQ-RCO GGUF sources omit it, so new
@@ -695,7 +695,7 @@ in `fp8`, 9.6 KiB in `rk8v4`, 9.4 KiB in `k8v4`, 6.8 KiB in `nvfp4`, 6.6 KiB in 
 rotated basis the cache stores them in. What the quantized formats cost in quality has not been
 measured on this model yet.
 
-`--max-concurrency N` (one to eight) runs that many requests at once, each on its own sequence with
+`--max-concurrency N` (one to 64) runs that many requests at once, each on its own sequence with
 its own KV and recurrent state, so every sequence costs device memory (the KV of `--max-context`
 positions, 24 KiB a position in BF16 and less in a quantized `--kv-dtype`, plus 74 MiB of recurrent
 state and 74 MiB for the snapshot of it that the context cache and branched reads take, allocated
