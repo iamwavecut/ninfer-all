@@ -796,7 +796,8 @@ The same server runs as for Bonsai 2, total generated tok/s:
 Server with `--max-concurrency 64 --kv-dtype rk8v4` and the hybrid cache's automatic KV capacity,
 `tools/bench/serve_load.py --profile chat`: N short-chat requests of 256 tokens arrive together,
 EOS ignored. tok/s while all N decode at once (`steady_tps`); without drafts unless the Drafter
-column names one. Rounds of more than eight requests run without a CUDA graph.
+column names one. Rounds of more than eight requests run without a CUDA graph. The RTX 3090
+pair has no peer access ([tensor parallelism](maintainer/pipeline-stages.md#tensor-parallelism)).
 
 | Card | Model | Drafter | `--max-context` | 8 | 16 | 32 | 48 | 64 |
 |---|---|---|---:|---:|---:|---:|---:|---:|
@@ -804,6 +805,7 @@ column names one. Rounds of more than eight requests run without a CUDA graph.
 | RTX 5090 | Qwen3.8-27B | MTP 3 | 2,048 | 898.5 | 986.7 | 1,229.1 | 1,264.5 | 1,388.6 |
 | RTX 5090 | Ternary Bonsai 2 27B | none | 4,096 | 1,080.3 | 1,646.2 | 1,780.6 | 1,839.9 | 1,982.9 |
 | RTX 3090 | Ternary Bonsai 2 27B | none | 2,048 | 549.0 | 744.8 | 862.7 | 838.6 | 903.0 |
+| 2x RTX 3090, `--tensor-parallel` | Ternary Bonsai 2 27B | none | 2,048 | 597.3 | 795.4 | 915.1 | 954.4 | 1,055.8 |
 
 With MTP 3 the same server decodes 207.7 tok/s for one request and 697.7 for four (92.0 and 335.6
 without drafts, 207.6 and 712.8 with MTP 3 at `--max-concurrency 8`). Past eight requests a round

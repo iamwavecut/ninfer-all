@@ -517,7 +517,9 @@ other MoE families](#expert-parallelism-of-the-other-moe-families)).
   small-T MMA of the full shapes, `bench/ops/tp_share_linear_bench.cu` comparing it with the other
   templates at a share's shape; on `120a` NVFP4 shares that allow A4 run W4A4 from 9 tokens and FP8 shares that allow A8
   run W8A8 from 17 tokens, A16 below, on the tile whose CTAs fill the fewest weighted waves of the
-  card's multiprocessors): the GDN input projection as parts,
+  card's multiprocessors; T2 shares take the T2 int8 small-T kernel inside its band, into FP32
+  partials as into BF16, and its prefill routes where the share keeps a registered input width,
+  as one card's projections do): the GDN input projection as parts,
   one Linear per piece into the q/k/v and z planes; gate and up as two FP32 products that SwiGLU
   rounds once; the output and down projections as FP32 partials. A rotated share turns its whole
   input, or its own 1024-column blocks of it, with its slice of the sign vector
@@ -669,6 +671,17 @@ repeats, not with one device's.
   shares divided on every tile and before the fence) is 6.0801 against one card's 6.0880 and 6.0666
   with the shares on A16; over 40 KB, two ranks on one card (`--devices 0,0`) give the two cards'
   6.18009 in three runs, where without the fence three runs gave 6.1586, 6.1827 and 6.1901.
+- **Ternary shares on the integer small-T route** (2026-11-28, against master's A16 runtime-shape
+  shares; Vast 2x RTX 3090, PCIe 4.0 x16 on one NUMA node, no peer access, so the host transport;
+  `--kv-capacity auto`, rk8v4 KV, 2,048-token context, chat clients of 256 greedy tokens, one run a
+  point). Ternary Bonsai 2 27B at 8, 16, 32, 48 and 64 clients generates 597.3, 795.4, 915.1, 954.4
+  and 1,055.8 tok/s against master's pair's 524.0, 623.5, 457.8, 528.6 and 665.3 (+14% to +100%;
+  master's rounds of 32 and more requests took 70 to 96 ms) and one card's 538.0, 715.9, 826.7,
+  809.1 and 869.6 (+11% to +21%). The target head keeps its A16 route with FP32 logits; a first
+  build that sent it through the integer route changed one card's answers. One card's answers stay
+  master's byte for byte (eight greedy answers, plain and with `--spec mtp --draft-tokens 3`).
+  Perplexity over 40 KB of the corpus (4,096-token windows, stride 2,048, rk8v4 KV) is 8.07406
+  against master's pair's 8.0729 and one card's 8.0702 on both builds.
 
 ### Attention by positions
 
