@@ -19,10 +19,14 @@ namespace ninfer::runtime {
 // the prefill cost model predicts to fit it. The model's static costs are scaled by the ratio of
 // observed to predicted step times, so the cap follows the card and model it runs on; a deeper
 // prefix, with more attention per token, is cut harder. The round budget is the decode rounds'
-// measured time instead, and its steps go down to 128 tokens: a step of a 27B that short is still
-// bound by its arithmetic rather than by reading the weights. Nothing here touches the GPU.
+// measured time instead, and its steps go down to 256 tokens. Each cut step adds a decode round
+// that reads the weights for the few requests then generating: with steps down to 128 tokens,
+// Ternary Bonsai 2 at 64 requests and Qwen3.8-27B at 32 delivered 10.7% and 12.5% fewer tokens
+// than with 256 on an RTX 3090 while new prompts arrived, and 384 gained under 3% more for a longer
+// pause. Nothing here touches the GPU.
 inline constexpr std::uint32_t kPacedPrefillAlignment     = 128;
 inline constexpr std::uint32_t kMinimumPacedPrefillTokens = 512;
+inline constexpr std::uint32_t kMinimumRoundPacedPrefillTokens = 256;
 inline constexpr std::uint32_t kMaximumPrefillStallBudgetMs = 60'000;
 
 // Predicted time of one prefill step of `tokens` after `prefix` tokens.
@@ -70,7 +74,7 @@ public:
     // would run (already clipped to the rest of the prompt) after `prefix` tokens.
     [[nodiscard]] std::uint32_t step_cap(std::uint64_t prefix, std::uint32_t planned) const noexcept {
         const std::uint32_t minimum =
-            round_budget_ ? kPacedPrefillAlignment : kMinimumPacedPrefillTokens;
+            round_budget_ ? kMinimumRoundPacedPrefillTokens : kMinimumPacedPrefillTokens;
         if (!enabled() || planned <= minimum) { return 0; }
         const double budget = this->budget();
         const auto fits     = [&](std::uint64_t tokens) {
