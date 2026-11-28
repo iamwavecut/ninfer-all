@@ -5,6 +5,8 @@
 #include "core/qtype.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/gguf/gguf_linear.h"
+#include "ops/linear/sm70/sm70_project.h"
+#include "ops/linear/t2/t2_a8.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -18,6 +20,19 @@ bool linear_part(QType format) { return !is_gguf(format) && linear_writes_fp32(f
 // Whether a part's rows of its output are one contiguous block: one column, or the whole output.
 bool contiguous_rows(const Tensor& out, const ProjectionPart& part) {
     return out.ne[1] == 1 || (part.row == 0 && part.weight.n == out.ne[0]);
+}
+
+// Every part ternary and on the integer route at this width (and none on the sm_70 routes, which
+// Linear would take first): the parts read one quantisation of x.
+bool t2_integer_parts(const PartProjectionWeights& weights, std::int32_t columns) {
+    if (!t2_a8_admits(weights.policy)) { return false; }
+    for (const auto& part : weights.parts) {
+        if (part.weight.qtype != QType::T2_G128_FP16 || sm70::covers(part.weight, columns) ||
+            !t2_a8_supported(part.weight, columns)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -51,6 +66,16 @@ void project_parts(const Tensor& x, const PartProjectionWeights& weights,
         return;
     }
     const std::int32_t columns = x.ne[1];
+    if (x.dtype == DType::BF16 && x.is_contiguous() && t2_integer_parts(weights, columns)) {
+        // Each part's rows go straight to their place in its output, whatever the width.
+        auto scope                = workspace.scope();
+        const T2A8Activations act = t2_a8_quantize(x, workspace, stream);
+        for (const auto& part : weights.parts) {
+            t2_a8_project_rows(act, part.weight, *outputs[static_cast<std::size_t>(part.output)],
+                               part.row, stream);
+        }
+        return;
+    }
     for (const auto& part : weights.parts) {
         Tensor& out = *outputs[static_cast<std::size_t>(part.output)];
         if (contiguous_rows(out, part)) {

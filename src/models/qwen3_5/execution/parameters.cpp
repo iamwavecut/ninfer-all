@@ -72,6 +72,56 @@ public:
 #endif
     }
 
+    // A tensor-parallel rank's share of a ternary projection -- its rows of gate and up, its
+    // columns of down and the mixer outputs -- or the whole projection. The small-T integer kernel
+    // reads both dimensions at launch time, so a share of whole 32-row tiles and 512-k slabs (the
+    // loader's cuts) takes it inside its band, and the prefill routes wherever the share keeps a
+    // registered input width; Linear picks per call. Into an FP32 partial or plane as into BF16.
+    void t2_share_route(LinearParameters& p, std::int32_t n, std::int32_t k) const {
+#if defined(NINFER_SM8X_COMPAT)
+        if (!model_.options().prefill_a8 || p.policy != ops::LinearPolicy::A16Only) { return; }
+        if (!t2_shape_or_share(p.weight, n, k)) { return; }
+        p.policy = model_.options().prefill_cublas ? ops::LinearPolicy::AllowPrefillCublas
+                                                   : ops::LinearPolicy::AllowA8Int;
+#else
+        (void)p;
+        (void)n;
+        (void)k;
+#endif
+    }
+
+    static bool t2_shape_or_share(const Weight& w, std::int32_t n, std::int32_t k) {
+        if (w.qtype != QType::T2_G128_FP16 || (w.n % 32) != 0 || (w.k % 512) != 0) { return false; }
+        const bool whole        = w.n == n && w.k == k;
+        const bool row_share    = w.k == k && w.n > 0 && w.n < n;
+        const bool column_share = w.n == n && w.k > 0 && w.k < k;
+        return whole || row_share || column_share;
+    }
+
+    // A rank's input projection bound as the parts its share is stored in (whole KV heads, or the
+    // GDN key heads with their value heads): ternary parts at the hidden width, in whole 32-row
+    // tiles, read one quantisation of the input (project_parts).
+    void t2_parts_route(ops::ProjectionWeights& projection, std::int32_t k) const {
+#if defined(NINFER_SM8X_COMPAT)
+        auto* parts = std::get_if<ops::PartProjectionWeights>(&projection);
+        if (parts == nullptr || parts->parts.empty() || !model_.options().prefill_a8 ||
+            parts->policy != ops::LinearPolicy::A16Only) {
+            return;
+        }
+        for (const auto& part : parts->parts) {
+            if (part.weight.qtype != QType::T2_G128_FP16 || part.weight.k != k ||
+                part.weight.n <= 0 || (part.weight.n % 32) != 0) {
+                return;
+            }
+        }
+        parts->policy = model_.options().prefill_cublas ? ops::LinearPolicy::AllowPrefillCublas
+                                                        : ops::LinearPolicy::AllowA8Int;
+#else
+        (void)projection;
+        (void)k;
+#endif
+    }
+
     // The NVFP4 int8 route is the W4A8 counterpart of the integer routes above: the stored E2M1
     // codes feed the s8 tensor cores with s8-quantised activations. --nvfp4-w4a8-int is its only
     // switch, and once registered the route serves every width (the wide mainloops pad their last
@@ -174,26 +224,30 @@ public:
                             [&] { return ops::prepare_linear_weight(model_.input(id)); });
     }
 
-    // A ternary output or proposal head takes the integer route at decode, verify and draft widths
-    // like the text projections (any row count of whole 64-row blocks at the hidden width).
-    LinearParameters head(WeightUseId id) const {
+    // A ternary proposal head takes the integer route at decode, verify and draft widths like the
+    // text projections (any row count of whole 64-row blocks at the hidden width): it writes BF16
+    // logits. The target's head writes FP32 logits (target_logits_dtype), the unrounded sums the
+    // sampler, argmax and scoring read, from activations as they are: `target` keeps its Use's
+    // policy.
+    LinearParameters head(WeightUseId id, bool target = false) const {
         LinearParameters out = rotated_linear(id);
-        integer_route(out, QType::T2_G128_FP16, out.weight.n, 5120);
+        if (!target) { integer_route(out, QType::T2_G128_FP16, out.weight.n, 5120); }
         return out;
     }
 
-    LinearParameters head(WeightId id) const {
+    LinearParameters head(WeightId id, bool target = false) const {
         LinearParameters out = rotated_linear(id);
-        integer_route(out, QType::T2_G128_FP16, out.weight.n, 5120);
+        if (!target) { integer_route(out, QType::T2_G128_FP16, out.weight.n, 5120); }
         return out;
     }
 
     // Each rank's rows of a divided head, read as the whole head is: through the Uses when the
     // weights name them, else as the parameters themselves.
-    HeadShares head_shares(const HeadShareWeights& w) const {
+    HeadShares head_shares(const HeadShareWeights& w, bool target = false) const {
         HeadShares out;
         for (std::size_t rank = 0; rank < w.shares.size(); ++rank) {
-            out.shares.push_back(w.uses.empty() ? head(w.shares[rank]) : head(w.uses[rank]));
+            out.shares.push_back(w.uses.empty() ? head(w.shares[rank], target)
+                                                : head(w.uses[rank], target));
         }
         out.rows.assign(w.rows.begin(), w.rows.end());
         return out;
@@ -258,6 +312,10 @@ public:
                 nvfp4_w4a16_route(out.down, 5120, 17408);
                 nvfp4_int8_route(out.gate_up, 17408, 5120);
                 nvfp4_int8_route(out.down, 5120, 17408);
+                if (out.up && out.up->weight.qtype == out.gate_up.weight.qtype) {
+                    t2_share_route(out.gate_up, 17408, 5120);
+                }
+                t2_share_route(out.down, 5120, 17408);
                 out.verify_gate_up_policy = out.gate_up.policy;
                 return out;
             });
@@ -396,6 +454,34 @@ public:
         });
     }
 
+    // The routes a mixer's projections take, the same for one device's layer and for every
+    // tensor-parallel rank's share of it.
+    void attention_routes(LinearParameters& output, ops::ProjectionWeights& projection) const {
+        integer_route(output, QType::Q4_G64_FP16, 5120, 6144);
+        integer_route(output, QType::Q5_G64_FP16, 5120, 6144);
+        t2_share_route(output, 5120, 6144);
+        nvfp4_w4a16_route(output, 5120, 6144);
+        nvfp4_int8_route(output, 5120, 6144);
+        nvfp4_w4a16_route_single(projection, 14336, 5120);
+        nvfp4_int8_route_single(projection, 14336, 5120);
+        integer_route_pair(projection, QType::Q4_G64_FP16, 7168, QType::Q5_G64_FP16, 7168, 5120);
+        integer_route_pair(projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16, 7168, 5120);
+        t2_parts_route(projection, 5120);
+    }
+
+    void gdn_routes(LinearParameters& output, ops::ProjectionWeights& projection) const {
+        integer_route(output, QType::Q4_G64_FP16, 5120, 6144);
+        integer_route(output, QType::Q5_G64_FP16, 5120, 6144);
+        t2_share_route(output, 5120, 6144);
+        nvfp4_w4a16_route(output, 5120, 6144);
+        nvfp4_int8_route(output, 5120, 6144);
+        nvfp4_w4a16_route_single(projection, 16384, 5120);
+        nvfp4_int8_route_single(projection, 16384, 5120);
+        integer_route_pair(projection, QType::Q4_G64_FP16, 4096, QType::Q5_G64_FP16, 12288, 5120);
+        integer_route_pair(projection, QType::T2_G128_FP16, 4096, QType::T2_G128_FP16, 12288, 5120);
+        t2_parts_route(projection, 5120);
+    }
+
     BlockParameters block(const BlockWeights& w) const {
         BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
@@ -403,20 +489,10 @@ public:
         out.ffn                 = ffn(w.ffn);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
             LinearParameters attention_output = rotated_linear(a->output);
-            integer_route(attention_output, QType::Q4_G64_FP16, 5120, 6144);
-            integer_route(attention_output, QType::Q5_G64_FP16, 5120, 6144);
-            integer_route(attention_output, QType::T2_G128_FP16, 5120, 6144);
-            nvfp4_w4a16_route(attention_output, 5120, 6144);
-            nvfp4_int8_route(attention_output, 5120, 6144);
             ops::ProjectionWeights attention_projection = ops::prepare_attn_input_proj_weights(
                 model_.rotated_input(a->query), model_.rotated_input(a->key),
                 model_.rotated_input(a->gate), model_.rotated_input(a->value));
-            nvfp4_w4a16_route_single(attention_projection, 14336, 5120);
-            nvfp4_int8_route_single(attention_projection, 14336, 5120);
-            integer_route_pair(attention_projection, QType::Q4_G64_FP16, 7168, QType::Q5_G64_FP16,
-                               7168, 5120);
-            integer_route_pair(attention_projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16,
-                               7168, 5120);
+            attention_routes(attention_output, attention_projection);
             out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
                                             tensor(a->key_norm), std::move(attention_output)};
             out.projection_prefetch =
@@ -424,20 +500,10 @@ public:
         } else {
             const auto& g              = std::get<GdnWeights>(w.mixer);
             LinearParameters gdn_output = rotated_linear(g.output);
-            integer_route(gdn_output, QType::Q4_G64_FP16, 5120, 6144);
-            integer_route(gdn_output, QType::Q5_G64_FP16, 5120, 6144);
-            integer_route(gdn_output, QType::T2_G128_FP16, 5120, 6144);
-            nvfp4_w4a16_route(gdn_output, 5120, 6144);
-            nvfp4_int8_route(gdn_output, 5120, 6144);
             ops::ProjectionWeights gdn_projection = ops::prepare_gdn_input_proj_weights(
                 model_.rotated_input(g.query), model_.rotated_input(g.key),
                 model_.rotated_input(g.value), model_.rotated_input(g.z));
-            nvfp4_w4a16_route_single(gdn_projection, 16384, 5120);
-            nvfp4_int8_route_single(gdn_projection, 16384, 5120);
-            integer_route_pair(gdn_projection, QType::Q4_G64_FP16, 4096, QType::Q5_G64_FP16, 12288,
-                               5120);
-            integer_route_pair(gdn_projection, QType::T2_G128_FP16, 4096, QType::T2_G128_FP16,
-                               12288, 5120);
+            gdn_routes(gdn_output, gdn_projection);
             out.mixer = GdnParameters{
                 std::move(gdn_projection),
                 ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
@@ -461,27 +527,31 @@ public:
         out.post_attention_norm = tensor(w.post_attention_norm);
         out.ffn                 = ffn(w.ffn);
         if (w.attention) {
-            const AttentionWeights& a = *w.attention;
-            out.mixer                 = AttentionParameters{
-                ops::prepare_attn_input_proj_weights(
-                    model_.rotated_input(a.query), model_.rotated_input(a.key),
-                    model_.rotated_input(a.gate), model_.rotated_input(a.value)),
-                tensor(a.query_norm), tensor(a.key_norm), rotated_linear(a.output)};
+            const AttentionWeights& a         = *w.attention;
+            LinearParameters output           = rotated_linear(a.output);
+            ops::ProjectionWeights projection = ops::prepare_attn_input_proj_weights(
+                model_.rotated_input(a.query), model_.rotated_input(a.key),
+                model_.rotated_input(a.gate), model_.rotated_input(a.value));
+            attention_routes(output, projection);
+            out.mixer = AttentionParameters{std::move(projection), tensor(a.query_norm),
+                                            tensor(a.key_norm), std::move(output)};
         }
         if (w.gdn) {
-            const GdnWeights& g = *w.gdn;
-            out.mixer           = GdnParameters{
-                ops::prepare_gdn_input_proj_weights(model_.rotated_input(g.query),
-                                                    model_.rotated_input(g.key),
-                                                    model_.rotated_input(g.value),
-                                                    model_.rotated_input(g.z)),
-                ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
-                                                     model_.input(g.b_projection)),
-                tensor(g.a_log),
-                tensor(g.dt_bias),
-                tensor(g.convolution),
-                tensor(g.norm),
-                rotated_linear(g.output)};
+            const GdnWeights& g               = *w.gdn;
+            LinearParameters output           = rotated_linear(g.output);
+            ops::ProjectionWeights projection = ops::prepare_gdn_input_proj_weights(
+                model_.rotated_input(g.query), model_.rotated_input(g.key),
+                model_.rotated_input(g.value), model_.rotated_input(g.z));
+            gdn_routes(output, projection);
+            out.mixer =
+                GdnParameters{std::move(projection),
+                              ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
+                                                                   model_.input(g.b_projection)),
+                              tensor(g.a_log),
+                              tensor(g.dt_bias),
+                              tensor(g.convolution),
+                              tensor(g.norm),
+                              std::move(output)};
         }
         return out;
     }
@@ -684,8 +754,8 @@ Parameters::Parameters(const Model& source) : model(source) {
     const Prepare prepare(model);
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
-    text.output_head        = prepare.head(w.text.output_head_use);
-    text.output_head_shares = prepare.head_shares(w.text.output_head_shares);
+    text.output_head        = prepare.head(w.text.output_head_use, true);
+    text.output_head_shares = prepare.head_shares(w.text.output_head_shares, true);
     if (text.token_embedding.qtype == QType::T2_G128_FP16 ||
         text.token_embedding.qtype == QType::GGUF_PTQ1_0) {
         // A ternary checkpoint (PrismML's T2 or PTQ1_0 rows) stores its token table rotated by the

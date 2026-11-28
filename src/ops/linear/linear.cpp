@@ -135,8 +135,8 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q8_dispatch(x, w, out, policy, stream);
         return;
     case QType::T2_G128_FP16:
-        if (workspace != nullptr && out.dtype == DType::BF16 && detail::t2_a8_admits(policy) &&
-            detail::t2_a8_supported(w, x.ne[1])) {
+        if (workspace != nullptr && (out.dtype == DType::BF16 || out.dtype == DType::FP32) &&
+            detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, x.ne[1])) {
             detail::t2_a8_linear(x, w, out, *workspace, stream);
             return;
         }

@@ -30,6 +30,9 @@ namespace bfw = test::direct_bf16_weight;
 // One BF16 storage step for the whole tensor and two for its worst element: both products are FP32
 // and SwiGLU rounds once.
 constexpr test::ReductionCriterion kCriterion{1.0 / 256.0, 0.0, test::kBf16GrossRelativeFloor};
+// The integer route quantises x to int8 per token and 64-k group: the A8 activation allowance of
+// the Linear suites.
+constexpr test::ReductionCriterion kA8Criterion{0.04, 0.0, 0.06};
 
 // A host matrix with its FP64 decode and a device copy.
 struct Parent {
@@ -89,11 +92,12 @@ const char* format(QType qtype) {
     }
 }
 
-int run_pair(QType gate_qtype, QType up_qtype, std::int32_t n, std::int32_t k,
-             std::uint32_t seed) {
+int run_pair(QType gate_qtype, QType up_qtype, std::int32_t n, std::int32_t k, std::uint32_t seed,
+             ops::LinearPolicy policy = ops::LinearPolicy::A16Only) {
+    const bool a8           = policy != ops::LinearPolicy::A16Only;
     const std::string label = std::string("LinearSwiGLU pair ") + format(gate_qtype) + "/" +
                               format(up_qtype) + " [" + std::to_string(n) + "," +
-                              std::to_string(k) + "]";
+                              std::to_string(k) + "]" + (a8 ? " A8" : "");
     constexpr std::int32_t kWidths[] = {1, 2, 5, 9, 17, 33, 65, 129};
     constexpr std::int32_t kMaxT     = 129;
     const Parent gate(gate_qtype, n, k, seed);
@@ -123,7 +127,7 @@ int run_pair(QType gate_qtype, QType up_qtype, std::int32_t n, std::int32_t k,
     x_device.copy_from_host(x_bits.data(), x_device.bytes);
     DeviceBuffer out_device(static_cast<std::size_t>(n) * kMaxT * sizeof(std::uint16_t));
     const std::size_t capacity = ops::linear_swiglu_pair_workspace_capacity_bytes(
-        gate_qtype, up_qtype, n, k, ops::LinearPolicy::A16Only, 1, kMaxT);
+        gate_qtype, up_qtype, n, k, policy, 1, kMaxT);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
 
     int failures = 0;
@@ -137,8 +141,8 @@ int run_pair(QType gate_qtype, QType up_qtype, std::int32_t n, std::int32_t k,
             workspace.reset_peak();
             DeviceContext context;
             const auto launch = [&] {
-                ops::linear_swiglu(x, gate.weight, up.weight, out, ops::LinearPolicy::A16Only,
-                                   workspace, context.stream);
+                ops::linear_swiglu(x, gate.weight, up.weight, out, policy, workspace,
+                                   context.stream);
             };
             test::cuda_check(cudaMemset(out_device.p, 0xff, out_device.bytes), "poison output");
             test::cuda_check(cudaDeviceSynchronize(), "finish setup");
@@ -153,7 +157,7 @@ int run_pair(QType gate_qtype, QType up_qtype, std::int32_t n, std::int32_t k,
             }
             test::cuda_check(cudaStreamSynchronize(context.stream), "run pair");
             const std::size_t exact = ops::linear_swiglu_pair_workspace_capacity_bytes(
-                gate_qtype, up_qtype, n, k, ops::LinearPolicy::A16Only, t, t);
+                gate_qtype, up_qtype, n, k, policy, t, t);
             if (workspace.used() != 0 || workspace.peak_used() > exact) {
                 std::cerr << case_label << ": workspace query/execution mismatch\n";
                 ++failures;
@@ -163,7 +167,8 @@ int run_pair(QType gate_qtype, QType up_qtype, std::int32_t n, std::int32_t k,
             std::vector<double> got(got_bits.size());
             for (std::size_t i = 0; i < got.size(); ++i) { got[i] = test::bf16_to_f32(got_bits[i]); }
             failures += test::verify_reduction(
-                case_label, got, std::span<const double>(reference.data(), got.size()), kCriterion);
+                case_label, got, std::span<const double>(reference.data(), got.size()),
+                a8 ? kA8Criterion : kCriterion);
         }
     }
     std::cout << (failures == 0 ? "OK " : "FAIL ") << label << '\n';
@@ -188,6 +193,12 @@ int main() {
         failures += run_pair(QType::Q6_G64_FP16, QType::BF16, 384, 1536, 719U);
         // Q4's one-column kernel at a row count that leaves its last block part empty.
         failures += run_pair(QType::Q4_G64_FP16, QType::Q4_G64_FP16, 330, 3072, 727U);
+        // Ternary rows on the integer route: one launch for both inside the small-T band, the
+        // prefill tile past it at whole 128-row blocks, the A16 route past it otherwise.
+        failures += run_pair(QType::T2_G128_FP16, QType::T2_G128_FP16, 640, 5120, 733U,
+                             ops::LinearPolicy::AllowA8Int);
+        failures += run_pair(QType::T2_G128_FP16, QType::T2_G128_FP16, 1056, 5120, 739U,
+                             ops::LinearPolicy::AllowA8Int);
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "LinearSwiGLU pair: " << error.what() << '\n';
