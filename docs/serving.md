@@ -2898,7 +2898,12 @@ without thinking, or one whose reasoning never closes, keeps its original sample
 `request_done` record reports `post_thinking_sampling` when the switch happened.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
-`C` slots guarantee active requests and `H` is a global checkpoint pool. A Qwen3.5-core model keeps
+`C` slots guarantee active requests and `H` is a global checkpoint pool. A running request keeps
+its own checkpoints (its prompt's rewrite checkpoint, its long anchors) until it finishes, so a
+capture that would leave fewer free images than free request lanes goes to Host State, or without
+Host State is skipped: with `H` smaller than `C` (the default past eight requests) every lane is
+still admitted, and a request that skipped its capture resumes its next turn from an earlier
+checkpoint. A Qwen3.5-core model keeps
 `min(C, 8)` more images beside the catalog: the state where a stop string's match began, which a
 turn returns to when the stop string ends it rounds later, so the next turn resumes there. Up to
 eight requests each have one; past eight a request takes a free one when a stop string's match

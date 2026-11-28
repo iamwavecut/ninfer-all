@@ -3782,6 +3782,55 @@ int verify_loaded_product(const ninfer::Engine& engine) {
 
 } // namespace
 
+// A running request keeps its private checkpoints until it finishes. With fewer cached images
+// than lanes (the legacy cache past eight requests) they use only the pool beyond one image per
+// lane, so every lane runs at once: with one cached image and four lanes, a rewrite checkpoint
+// for each running request would run three of the four and leave the fourth waiting (Qwen3.8-27B
+// on an RTX 3090: 124 rows in 63 decode rounds, against 37 with the reserve).
+int exercise_lane_reserve(const char* artifact) {
+    constexpr std::uint32_t kRequests     = 4;
+    constexpr std::uint32_t kOutputTokens = 32;
+    ninfer::EngineOptions options         = concurrent_engine_options(artifact);
+    options.max_concurrency               = kRequests;
+    options.max_pending_requests          = kRequests;
+    options.kv_capacity =
+        ninfer::KvCapacityPolicy::explicit_capacity(kRequests * options.max_context);
+    options.speculative.backend                     = ninfer::SpeculativeBackend::None;
+    options.speculative.draft_tokens                = 0;
+    options.speculative.proposal_head               = ninfer::ProposalHead::Full;
+    options.context_cache.device_state_slots        = 1;
+    options.context_cache.max_private_continuations = 2 * kRequests;
+    ninfer::Engine engine(std::move(options));
+
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    std::vector<ninfer::GenerationHandle> handles;
+    handles.reserve(kRequests);
+    for (std::uint32_t index = 0; index < kRequests; ++index) {
+        const std::string suffix = std::to_string(index);
+        handles.push_back(engine.submit(
+            engine.prepare(session_turn("lane-reserve-" + suffix,
+                                        "Count from one to forty, one number per line, for list " +
+                                            suffix + '.')),
+            fixed_output(kOutputTokens)));
+    }
+    for (ninfer::GenerationHandle& handle : handles) {
+        if (handle.wait().generated_token_ids.size() != kOutputTokens) {
+            std::cerr << "lane-reserve request did not reach its output length\n";
+            return 1;
+        }
+    }
+    const ninfer::RuntimeStats after = engine.runtime_stats();
+    const std::uint64_t rounds       = after.decode_rounds - before.decode_rounds;
+    const std::uint64_t rows         = after.decode_row_rounds - before.decode_row_rounds;
+    if (rounds == 0 || 2U * rows < 5U * rounds) {
+        std::cerr << "lane-reserve decode rounds carried " << rows << " rows in " << rounds
+                  << " rounds: the requests did not run together\n";
+        return 1;
+    }
+    std::cout << "lane-reserve: " << rows << " rows in " << rounds << " rounds\n";
+    return 0;
+}
+
 int exercise_artifact(const char* artifact) {
     {
         ninfer::EngineOptions options             = engine_options(artifact);
@@ -3843,6 +3892,7 @@ int exercise_artifact(const char* artifact) {
     if (const int result = exercise_concurrent_resource_settlement(artifact); result != 0) {
         return result;
     }
+    if (const int result = exercise_lane_reserve(artifact); result != 0) { return result; }
     return 0;
 }
 
@@ -4699,6 +4749,8 @@ int run() {
             result = exercise_disk_kv_shutdown_restore(artifact);
         } else if (scenario == "concurrent") {
             result = exercise_concurrent_resource_settlement(artifact);
+        } else if (scenario == "lane-reserve") {
+            result = exercise_lane_reserve(artifact);
         } else if (scenario == "anthropic-prefix-regression") {
             result = exercise_anthropic_prefix_regression(artifact);
         } else if (scenario == "shared-rewrite-materialization") {

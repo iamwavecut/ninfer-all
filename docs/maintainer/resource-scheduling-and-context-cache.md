@@ -375,6 +375,9 @@ Capacity_{DeviceState}=C+H
 \]
 
 前 \(C\) 份容量形成 active guarantee，全部 slots 仍由同一个 Program pool 管理，不与 lane 固定配对。
+running request 持有的 private checkpoint（rewrite checkpoint、long anchors）直到请求结束都不受 pressure
+回收；新增这样一份 Device image 的 capture 必须为每个空闲 lane 留出一份 image（\(held+1+free\_lanes\le C+H\)），
+否则改为 Host snapshot，没有 Host State 时跳过。\(H<C\) 时（catalog 默认超过 8 个请求）每个 lane 仍能被 admit。
 Host State 以完整 image 和独立 slot 容量计费。
 
 State transition 的语义只有：

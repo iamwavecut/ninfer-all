@@ -177,9 +177,34 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
     }
     const std::uint32_t device_state_after_preparation =
         state_store->device_occupied() - replaced_shared.device.state_slots;
+    // A running request keeps its private captures (its rewrite checkpoint, its long anchors) until
+    // it finishes, out of the reach of pressure. A capture that adds such a Device image leaves one
+    // image for every free request lane: with fewer cached images than lanes (the legacy cache past
+    // eight requests) running requests holding two images each would keep the other lanes empty.
+    // Past that reserve the checkpoint goes to the Host, or the capture is skipped.
+    const bool holds_device_image = publish_private && !publish_shared &&
+                                    !assessment.recycles_private_state &&
+                                    replaced_private.device.state_slots == 0;
+    bool lane_reserve_kept = true;
+    if (holds_device_image) {
+        std::uint64_t held_images = 1;
+        std::uint64_t busy_lanes  = 0;
+        for (const RequestControl& request : requests) {
+            held_images += request.active_resources.device.state_slots;
+            busy_lanes += request.active_resources.device.active_lanes;
+        }
+        const std::uint64_t free_lanes =
+            max_concurrency > busy_lanes ? max_concurrency - busy_lanes : 0U;
+        lane_reserve_kept = held_images + free_lanes <= state_store->device_capacity();
+    }
+    if (!lane_reserve_kept && host_state_images == nullptr) {
+        assessment.publishes_private = false;
+        return assessment;
+    }
     const bool device_destination_available =
-        assessment.recycles_private_state ||
-        device_state_after_preparation < state_store->device_capacity();
+        lane_reserve_kept &&
+        (assessment.recycles_private_state ||
+         device_state_after_preparation < state_store->device_capacity());
     if (device_destination_available || host_state_images == nullptr) {
         assessment.state_placement = qwen3_5::CaptureStatePlacement::DeviceFork;
         added.device.state_slots   = 1;
