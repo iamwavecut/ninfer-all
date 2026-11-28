@@ -2326,6 +2326,7 @@ __device__ __forceinline__ float4 product4(const ResidualArgs& a, int s, int i) 
     const std::int64_t row = std::int64_t(s) * a.hidden;
     if (a.fixed != nullptr) { return fixed4(a.fixed + row, i); }
     if (a.moe_rows != nullptr) {
+        if (a.moe_combined) { return ld4(a.moe_rows + row * a.top_k, i); }
         float4 y = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         for (int k = 0; k < a.top_k; ++k) {
             const std::int64_t pair = std::int64_t(s) * a.top_k + k;
@@ -2376,6 +2377,22 @@ __global__ void __launch_bounds__(kRowBlock) residual_kernel(ResidualArgs a) {
     const int t = blockIdx.x;
     const float4 cur = residual_quad(a, t, int(threadIdx.x));
     if (a.mix.query_count > 0) { mix_row(a.mix, t, true, cur); }
+}
+
+// Block per row, thread i its quad i: the row's weighted pair sum into its first pair's place. The
+// thread reads every pair of its quad before it writes, so the sum may replace the first pair.
+__global__ void __launch_bounds__(kRowBlock)
+    combine_moe_rows_kernel(float* __restrict__ rows, const float* __restrict__ weights, int top_k,
+                            int hidden) {
+    ninfer::pdl::arch_enter_glue();
+    const int s = blockIdx.x, i = threadIdx.x;
+    if (i >= (hidden >> 2)) { return; }
+    float4 y = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int k = 0; k < top_k; ++k) {
+        const std::int64_t pair = std::int64_t(s) * top_k + k;
+        y = fma4(ld4(rows + pair * hidden, i), weights[pair], y);
+    }
+    reinterpret_cast<float4*>(rows + std::int64_t(s) * top_k * hidden)[i] = y;
 }
 
 // Block (w, t) of a split call: the update of warp w's quads of row t and their sums of its mix,
@@ -3533,6 +3550,14 @@ void residual(const ResidualArgs& args, cudaStream_t stream) {
     }
     ninfer::pdl::launch_arch(args.rows.tokens, threads, 0, stream, residual_kernel, args);
     check_launch("residual");
+}
+
+void combine_moe_rows(float* rows, const float* weights, int top_k, int hidden, int tokens,
+                      cudaStream_t stream) {
+    if (tokens <= 0) { return; }
+    ninfer::pdl::launch_arch(tokens, row_threads(hidden), 0, stream, combine_moe_rows_kernel, rows,
+                             weights, top_k, hidden);
+    check_launch("combine_moe_rows");
 }
 
 void keep_products(const ResidualArgs& args, int begin, int end, cudaStream_t stream) {

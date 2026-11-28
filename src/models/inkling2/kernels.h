@@ -281,6 +281,8 @@ struct ResidualArgs {
     const float* moe_rows = nullptr;
     const float* moe_weights = nullptr;
     int top_k = 0;
+    // moe_rows holds each row's weighted sum in its first pair's place (combine_moe_rows).
+    bool moe_combined = false;
     const float* conv = nullptr; // [hidden][4]
     History history;
     bool keep  = false;
@@ -290,6 +292,13 @@ struct ResidualArgs {
     MixArgs mix;
 };
 void residual(const ResidualArgs& args, cudaStream_t stream);
+
+// Each of `tokens` rows' routed-expert output, the sum over its `top_k` pairs of the pair's FP32
+// row times its weight, in pair order from zero (as residual() forms it), into the row's first
+// pair's place of `rows` ([tokens * top_k][hidden]). A prompt chunk's residual then reads it at
+// each of its four lags instead of forming it four times.
+void combine_moe_rows(float* rows, const float* weights, int top_k, int hidden, int tokens,
+                      cudaStream_t stream);
 
 // A prompt chunk's history of a product site: the products of rows [begin, end) as residual()
 // reads them, into their slots (position: the row's logical one). Runs after the chunk's

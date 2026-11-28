@@ -74,6 +74,13 @@ tokenization, the chat template, output parsing and the serving protocols.
   ([measurements](#measurements)); the shared launches then added 1.9% without drafts on an RTX
   PRO 4500 Blackwell (126.6 to 129.0 tok/s) and 2.2% on an RTX 4090 (139.4-139.9 to 142.8-142.9
   tok/s), and 1.1-1.4% with DSpark, again with the same tokens.
+- **A prompt chunk's MoE update.** A row's residual update convolves its routed-expert output with
+  the three rows before it, which in a prompt chunk are rows of the same call. The chunk forms each
+  row's weighted sum of its pairs once, in pair order from zero as the update would, in the place
+  of its first pair, and the update reads that sum at each tap: the same bits as summing at every
+  tap. An 11,722-token prompt prefilled in 3,688-3,751 ms instead of 3,753-3,819 ms on an A40
+  (four runs each), with the same total NLL over 9,718 tokens of wikitext to the last digit and the
+  same answers at C=1.
 - **Expert read-ahead.** With the experts on the GPU, a decode call of one row guesses each
   visit's experts one visit early: on a side stream, the next visit's router scores the current
   visit's MoE input, and the next visit reads its likeliest experts' rows into L2 while its
