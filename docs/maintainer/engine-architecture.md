@@ -414,6 +414,13 @@ Scheduler 保证：
   一组 request（先为整组预留容量，任一成员出错则整组都不入队），worker 因此在同一 boundary
   看到整组，而不是先启动第一个、其余在它的 pass 期间才到达（serve 的 decision read 与 rerank
   window 即如此提交）；
+- Gemma 4、Flint、Inkling 2 与 DeepSeek-V4.1 的 Engine core 同样共享 prompt pass：剩余 prompt
+  最短的请求的 prefill step 按同一顺序带上其它正在 prefill 的纯文本 prompt 的下一步，合计不超过
+  `prefill_chunk`；不结束其 prompt 的 step 可截到剩余空间（至少 64 token）。executor 的
+  `forward_pieces` 让投影、norm、router、expert 与 head 一次处理所有行，KV、窗口环、卷积与循环
+  状态、Engram 历史和 attention 则按各自的序列运行；一行的算术随 pass 的宽度而定，与多请求的
+  decode step 相同。带 media 或分支的 prompt、DSpine drafter（Inkling 2 还有 DFlash2）、
+  DeepSeek 的 prefill tail 与 host/disk expert 的 prompt span 单独运行；
 - 已有 decode work 不会被连续 prefill 饿死：只要有 decode work，每个 prefill unit 之前先运行
   `decode_rounds_per_prefill` 个 decode（或 control）unit（按该 unit 的 token 数相对一个 chunk
   成比例，至少一个；`0` 为 `prefill_chunk / 64`，`1` 为严格交替），短 prompt 因此一轮之后即可

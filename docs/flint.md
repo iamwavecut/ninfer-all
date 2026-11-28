@@ -298,6 +298,15 @@ repetitions, the first having spread ±22%.
   or second, it reads the same whatever that branch holds; that a read joining the prompt's last
   chunk leaves nothing of its branches in the sequence; and that a prompt on the second sequence
   reads bit for bit as on the first, one decode step of both giving both the same row.
+- **Shared prompt passes.** `ninfer_flint_shared_prompt_real_test` (with `NINFER_FLINT_ARTIFACT`)
+  runs the prompts of four sequences in one pass, one past the 513-position window, and again with
+  one cut over two passes. A pass repeats bit for bit, and each prompt reads the same bits beside
+  other prompts of the same lengths. The next decode step lies nearer each prompt run alone than any
+  other prompt run alone, and so do the passes' last logits, all but one in each check. A row of
+  random tokens can sit where any rounding moves it far: of 24 random prompts of 130 to 193 tokens
+  run alone, four moved 6 to 17 logits between one chunk and chunks of 64, and the cut pass's last
+  row moved 19; the other rows lie up to 4.5 logits from alone (one chunk against two of the same
+  prompt: up to 0.75).
 
 ### Rounding with the pass
 

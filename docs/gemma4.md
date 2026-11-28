@@ -566,7 +566,8 @@ its masks inside the strings take 0.04 ms instead of 70-96 ms (one Apple M-serie
 
 Every decoding request must make progress: one that accepts no token for 120 s fails with
 `inference request made no progress for 120 s` instead of holding its sequence. A prompt that waits
-for its turn is not measured: up to 64 prompts take their steps one at a time between decode rounds.
+for its turn is not measured: prompts take their steps between decode rounds, text prompts several
+in one pass ([serving](serving.md#execution-behavior)).
 
 ## Images and video
 
@@ -648,6 +649,13 @@ dominate a small one. A follow-up turn over the same picture reuses it without e
   (`ninfer_gemma4_assistant_real_test`, given an artifact). The same test verifies the anchor and
   the drafts in one pass and decodes them one at a time on another sequence: the logits are equal
   bit for bit.
+- Shared prompt passes: `ninfer_gemma4_shared_prompt_real_test` (given an artifact) runs the prompts
+  of four sequences in one pass, one past the 1,024-position window, and again with one cut over two
+  passes. A pass repeats bit for bit, and each prompt reads the same bits beside other prompts of
+  the same lengths. The next decode step lies nearer each prompt run alone than any other prompt run
+  alone, and so do the passes' last logits, all but one in each check. With random tokens the 26B's
+  rows lie up to 17.4 logits from alone (one chunk against two of the same prompt: up to 8.1), the
+  31B's up to 1.3 (1.5).
 - End to end, [`tools/reference/gemma4.py`](../tools/reference/gemma4.py), an FP64 NumPy forward
   of the model over the exactly decoded GGUF, is the oracle. NInfer agrees with it within the
   activation-quantization noise llama.cpp shows against the same oracle: over a 147-token WikiText

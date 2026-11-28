@@ -151,11 +151,14 @@ Result run(const Scenario& scenario, const char* artifact, const std::vector<Tok
         for (int repeat = 0; repeat < 2; ++repeat) {
             record_generation(engine.generate(engine.prepare_tokens(prompt(source, 2305), false), request), true);
             monotonic(previous, engine.runtime_stats().experts);
-            std::vector<GenerationHandle> handles;
+            // One group: the requests reach the Engine at one boundary, so their prompts share the
+            // same passes in every scenario (a row's rounding follows its pass's width).
+            std::vector<GenerationSubmission> group;
             for (std::uint32_t row = 0; row < scenario.concurrency; ++row) {
-                handles.push_back(engine.submit(engine.prepare_tokens(prompt(source, 17 + row), false), request));
+                group.push_back({.prompt  = engine.prepare_tokens(prompt(source, 17 + row), false),
+                                 .options = request});
             }
-            for (auto& handle : handles) {
+            for (auto& handle : engine.submit_group(std::move(group))) {
                 record_generation(handle.wait(), false);
                 monotonic(previous, engine.runtime_stats().experts);
             }

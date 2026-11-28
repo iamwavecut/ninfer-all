@@ -1259,6 +1259,16 @@ step took these times per call, the mean of its 16 gate-and-up and 28 down calls
   two logits are closest (gaps of 0.01 to 0.04). The FP64 forward took 2 h 53 min on the
   Threadripper 3960X. Since then the GPU's IQ1_S, IQ1_M and IQ2_XXS products round step by step as
   the [CPU share](#the-cpu-share) does, which changes the outputs; this check was not rerun.
+- **Shared prompt passes.** `ninfer_deepseek_v41_shared_prompt_real_test`
+  (`NINFER_DEEPSEEK_ARTIFACT`, and `NINFER_DEEPSEEK_ENGRAM_TABLE` for a separate table; the experts
+  from the artifact's files, under the exact prefill tail, with the DSpark drafter when the artifact
+  holds one) runs the prompts
+  of four sequences in one pass, one past the 128-position window, and again with one cut over two
+  passes. A pass repeats bit for bit, and each prompt reads the same bits beside other prompts of
+  the same lengths, Engram rows and drafter taps included. The next decode step lies nearer each
+  prompt run alone than any other prompt run alone, and so do the passes' last logits, all but one
+  in each check. The rows lie up to 3.8 logits from alone (one chunk against two of the same prompt:
+  up to 1.2).
 - **The STQ product.** `ninfer_linear_stq_test` qualifies the STQ drafter's matrix product against
   an FP64 oracle over its own decode of the trellis words and sign vectors, at the drafter's shapes
   and 1 to 8 rows: `fc` (15,360 to 5,120), `wkv`, `wq_b` with BF16 output, `wo_b`, the shared

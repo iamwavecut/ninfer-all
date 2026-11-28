@@ -1123,6 +1123,12 @@ from the file, and copies brought 47.8 GiB to the card over its 384 tokens.
   rows kept up to its second and a decode step after it give the same logits bit for bit; an image
   holds four of the eight full-attention visits' rows a position (`last-all` also 20 of the 40
   rings), and a sequence loaded from one decodes as the sequence it came from.
+- **Shared prompt passes.** `ninfer_inkling2_shared_prompt_real_test` (`NINFER_INKLING_ARTIFACT`)
+  runs the prompts of four sequences in one pass, one past the 1,024-position window, and again with
+  one cut over two passes. A pass repeats bit for bit, and each prompt reads the same bits beside
+  other prompts of the same lengths. The next decode step lies nearer each prompt run alone than any
+  other prompt run alone, and so do the passes' last logits, all but one in each check. The rows lie
+  up to 1.3 logits from alone (one chunk against two of the same prompt: up to 1.25).
 - **The vision tower.** `ninfer_inkling2_vision_real_test` (`NINFER_INKLING_VISION_ARTIFACT`,
   `NINFER_INKLING_VISION_IMAGE` and `NINFER_INKLING_VISION_DIR`, with the rows of
   `tools/reference/inkling2_vision.py` there) runs examples/cli/media/natural_scene.png, a

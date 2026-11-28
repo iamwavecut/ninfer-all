@@ -1944,6 +1944,19 @@ struct Executor::Impl {
 
     // With `branches` (forward_branches): the chunk is those branches' tokens one after another,
     // each continuing the sequence at its position, and `logit_rows` is their count.
+    // One sequence's rows in a prompt pass: its first position, its first row and its rows in the
+    // pass, the logit rows its last rows leave, and (set by pass()) its full-attention slots and
+    // where its rows of the full-attention mask begin, in halves.
+    struct PassPiece {
+        std::uint32_t sequence = 0;
+        std::uint32_t first    = 0;
+        int row                = 0;
+        int t                  = 0;
+        int logit_rows         = 0;
+        int full_slots         = 0;
+        std::size_t mask_at    = 0;
+    };
+
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const ChunkMedia> media = {},
                  std::span<const std::uint32_t> branches = {}) {
@@ -1953,31 +1966,80 @@ struct Executor::Impl {
             (logit_rows == 0 && !branches.empty())) {
             throw std::invalid_argument("gemma4 forward: invalid call");
         }
-        // No logits: a full last block only writes its keys and values (Executor::forward).
-        const bool kv_only   = logit_rows == 0;
-        const bool branching = !branches.empty();
-        if (branching && (!media.empty() || logit_rows != branches.size() ||
-                          std::accumulate(branches.begin(), branches.end(), std::uint64_t{0}) !=
-                              std::uint64_t(t) ||
-                          std::find(branches.begin(), branches.end(), 0U) != branches.end())) {
+        if (!branches.empty() &&
+            (!media.empty() || logit_rows != branches.size() ||
+             std::accumulate(branches.begin(), branches.end(), std::uint64_t{0}) !=
+                 std::uint64_t(t) ||
+             std::find(branches.begin(), branches.end(), 0U) != branches.end())) {
             throw std::invalid_argument("gemma4 forward_branches: invalid branches");
         }
         if (!media.empty() && !vision_media) {
             throw std::invalid_argument("gemma4 forward: media needs an executor with vision");
         }
-        const std::uint32_t first = positions[sequence];
-        if (first + std::uint32_t(t) > options.max_context) {
-            throw std::invalid_argument("gemma4 forward: context capacity exceeded");
+        std::vector<PassPiece> pieces{PassPiece{.sequence   = sequence,
+                                                .first      = positions[sequence],
+                                                .t          = t,
+                                                .logit_rows = int(logit_rows)}};
+        pass(pieces, tokens, media, branches);
+    }
+
+    void forward_pieces(std::span<const PromptPiece> in) {
+        if (in.empty() || in.size() > options.sequences) {
+            throw std::invalid_argument("gemma4 forward_pieces: invalid call");
         }
-        back(sequence, first + std::uint32_t(t), true);
+        if (spine) {
+            throw std::logic_error("gemma4 forward_pieces: a DSpine drafter's pass is one sequence's");
+        }
+        std::vector<PassPiece> pieces;
+        std::vector<std::int32_t> tokens;
+        std::vector<char> seen(options.sequences, 0);
+        for (const PromptPiece& piece : in) {
+            if (piece.sequence >= options.sequences || seen[piece.sequence] != 0 ||
+                piece.tokens.empty()) {
+                throw std::invalid_argument("gemma4 forward_pieces: invalid piece");
+            }
+            seen[piece.sequence] = 1;
+            pieces.push_back(PassPiece{.sequence   = piece.sequence,
+                                       .first      = positions[piece.sequence],
+                                       .row        = int(tokens.size()),
+                                       .t          = int(piece.tokens.size()),
+                                       .logit_rows = piece.logits ? 1 : 0});
+            tokens.insert(tokens.end(), piece.tokens.begin(), piece.tokens.end());
+        }
+        if (tokens.size() > options.prefill_chunk) {
+            throw std::invalid_argument("gemma4 forward_pieces: more tokens than a prompt chunk");
+        }
+        pass(pieces, tokens, {}, {});
+    }
+
+    // A prompt pass over the rows of `pieces` (one sequence each, consecutive rows in `tokens`):
+    // the products, norms, routers and experts run over all its rows at once, the keys, values and
+    // attention of each piece over its own sequence. Media and branches come with one piece.
+    void pass(std::vector<PassPiece>& pieces, std::span<const std::int32_t> tokens,
+              std::span<const ChunkMedia> media, std::span<const std::uint32_t> branches) {
+        const int t          = int(tokens.size());
+        const bool branching = !branches.empty();
+        const bool several   = pieces.size() > 1;
+        // No logits: a full last block only writes its keys and values (Executor::forward).
+        const bool kv_only = std::all_of(pieces.begin(), pieces.end(),
+                                         [](const PassPiece& pc) { return pc.logit_rows == 0; });
+        for (const PassPiece& pc : pieces) {
+            if (pc.first + std::uint32_t(pc.t) > options.max_context) {
+                throw std::invalid_argument("gemma4 forward: context capacity exceeded");
+            }
+        }
+        for (const PassPiece& pc : pieces) { back(pc.sequence, pc.first + std::uint32_t(pc.t), true); }
         prompt_pass = true;
         std::vector<std::int32_t> pos(t);
-        for (int i = 0; i < t; ++i) { pos[i] = std::int32_t(first) + i; }
+        for (const PassPiece& pc : pieces) {
+            for (int i = 0; i < pc.t; ++i) { pos[pc.row + i] = std::int32_t(pc.first) + i; }
+        }
         // A branch pass: each row rotates at its branch's position, and takes the cache slot of
         // its place in the chunk (`slots`, the positions a plain chunk has); `starts` its branch's
         // first row, for the masks.
         std::vector<std::int32_t> slots, starts;
         if (branching) {
+            const std::uint32_t first = pieces.front().first;
             slots = pos;
             starts.resize(t);
             for (std::size_t b = 0, row = 0; b < branches.size(); row += branches[b++]) {
@@ -2016,6 +2078,7 @@ struct Executor::Impl {
         stage(tokens, pos, {}, {}, blocks, unit_rows, slots, starts);
         const auto* d_branch_starts =
             branching ? static_cast<const std::int32_t*>(d_starts.p) : nullptr;
+        const auto* d_pos = static_cast<const std::int32_t*>(d_positions.p);
         workspace->reset();
         auto scope = workspace->scope();
         auto* h    = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * hidden * 4).data);
@@ -2026,20 +2089,29 @@ struct Executor::Impl {
             place_media(media, h);
             CUDA_CHECK(cudaEventRecord(media_end, stream));
         }
-        // Masks: the sliding ring and the full-attention prefix. With bidirectional vision
-        // attention, a media unit's soft tokens see each other in the sliding ring.
+        // Masks: each piece's sliding ring (its rows of mask_ring) and full-attention prefix (its
+        // rows of mask_full, one after another). With bidirectional vision attention, a media
+        // unit's soft tokens see each other in the sliding ring.
         const bool bidirectional = !media.empty() && model.vision_config()->bidirectional_attention;
-        const int full_slots = int(round_up(first + t, 256));
+        const int window         = int(config.sliding_window);
         auto* mask_ring = static_cast<__half*>(
             workspace->alloc_bytes(std::size_t(t) * prefill_ring * 2).data);
         auto* mask_full = static_cast<__half*>(this->mask_full.p);
-        kernels::build_mask(mask_ring, t, prefill_ring, int(first), prefill_ring,
-                            int(config.sliding_window), stream,
-                            bidirectional ? static_cast<const std::int32_t*>(d_blocks.p) : nullptr,
-                            d_branch_starts);
-        const int window = int(config.sliding_window);
-        kernels::build_mask(mask_full, t, full_slots, int(first), 0, 0, stream, nullptr,
-                            d_branch_starts);
+        std::size_t mask_at = 0;
+        int widest          = 0;
+        for (PassPiece& pc : pieces) {
+            pc.full_slots = int(round_up(pc.first + std::uint32_t(pc.t), 256));
+            pc.mask_at    = mask_at;
+            mask_at += std::size_t(pc.t) * std::size_t(pc.full_slots);
+            widest = std::max(widest, pc.t);
+            kernels::build_mask(mask_ring + std::size_t(pc.row) * prefill_ring, pc.t, prefill_ring,
+                                int(pc.first), prefill_ring, window, stream,
+                                bidirectional ? static_cast<const std::int32_t*>(d_blocks.p)
+                                              : nullptr,
+                                d_branch_starts);
+            kernels::build_mask(mask_full + pc.mask_at, pc.t, pc.full_slots, int(pc.first), 0, 0,
+                                stream, nullptr, d_branch_starts);
+        }
         // Each block's normalized input rows; after the last block, the final-normed rows (q8_1
         // for a vector-width chunk).
         const bool q8 = t <= gguf::kMaxVectorColumns;
@@ -2062,151 +2134,165 @@ struct Executor::Impl {
             }
             const int q_floats = query_heads * p.head_dim;
             auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
-            kernels::QkvArgs qa;
-            qa.qkv         = static_cast<const __nv_bfloat16*>(qkv.data);
-            qa.tokens      = t;
-            qa.query_heads = query_heads;
-            qa.kv_heads    = p.kv_heads;
-            qa.head_dim    = p.head_dim;
-            qa.has_v       = !p.full;
-            qa.q_norm      = p.q_norm;
-            qa.k_norm      = p.k_norm;
-            qa.eps         = eps;
-            qa.positions   = static_cast<const std::int32_t*>(d_positions.p);
-            qa.inv_freq    = static_cast<const float*>(p.full ? inv_freq_full.p : inv_freq_sliding.p);
-            qa.q_scale     = p.full ? full_query_scale : 1.0f;
-            qa.q_out       = q;
-            qa.slots       = branching ? static_cast<const std::int32_t*>(d_slots.p) : nullptr;
-            // A sliding block attends over the staging ring: the window before the chunk first
-            // comes over from the sequence's ring, the chunk's keys land there, and the window that
-            // ends the chunk goes back.
-            const std::int64_t seq_offset   = std::int64_t(sequence) * p.seq_stride;
             const std::int64_t stage_stride = std::int64_t(prefill_ring) * p.head_dim;
-            const bool quantized = kv.quantized();
-            kernels::RingCopyArgs keep;
-            keep.kv_heads = p.kv_heads;
-            keep.head_dim = p.head_dim;
-            if (!p.full && quantized) {
-                // The window before the chunk, decoded from the sequence's quantized ring.
-                for (const auto& [plane, dst] : {std::pair{&p.kq, &staging_k}, std::pair{&p.vq, &staging_v}}) {
-                    kernels::KvLoadArgs load;
-                    load.src             = *plane;
-                    load.src_ring        = p.ring;
-                    load.sequence        = int(sequence);
-                    load.begin           = std::max(0, int(first) - window);
-                    load.end             = int(first);
-                    load.heads           = p.kv_heads;
-                    load.dst             = static_cast<__half*>(dst->p);
-                    load.dst_head_stride = stage_stride;
-                    load.dst_ring        = prefill_ring;
-                    kernels::kv_load(load, stream);
-                }
-            } else if (!p.full) {
-                keep.src_k           = static_cast<const __half*>(p.k.p) + seq_offset;
-                keep.src_v           = static_cast<const __half*>(p.v.p) + seq_offset;
-                keep.dst_k           = static_cast<__half*>(staging_k.p);
-                keep.dst_v           = static_cast<__half*>(staging_v.p);
-                keep.src_head_stride = p.head_stride;
-                keep.dst_head_stride = stage_stride;
-                keep.src_ring        = p.ring;
-                keep.dst_ring        = prefill_ring;
-                keep.begin           = std::max(0, int(first) - window);
-                keep.end             = int(first);
-                kernels::ring_copy(keep, stream);
-            }
+            const bool quantized            = kv.quantized();
             // A quantized full block's chunk values land in F16 first (full_values, linear).
             __half* full_v = quantized ? static_cast<__half*>(full_values.p) : static_cast<__half*>(p.v.p);
-            qa.k_cache     = p.full ? nullptr : static_cast<__half*>(staging_k.p);
-            qa.v_cache     = p.full ? full_v : static_cast<__half*>(staging_v.p);
-            qa.seq_stride  = p.full && !quantized ? p.seq_stride : 0;
-            qa.head_stride = p.full ? p.head_stride : stage_stride;
-            qa.sequence    = p.full && !quantized ? int(sequence) : 0;
-            qa.ring        = p.full ? 0 : prefill_ring;
-            kernels::qkv_post(qa, stream);
             const bool kv_only_block =
                 kv_only && p.full && li + 1 == layers.size() && !spine_taps_last();
-            if (quantized) {
-                // The chunk's rows into the sequence's planes: a sliding block's into its ring (the
-                // staging rows become the values they represent, which the chunk then attends to),
-                // a full block's at their positions, after which the block's whole prefix comes
-                // back from the plane.
-                for (const auto& [plane, src] :
-                     {std::pair{&p.kq, &staging_k}, std::pair{&p.vq, &staging_v}}) {
-                    if (p.full && plane == &p.kq) { continue; }
-                    kernels::KvStoreArgs store;
-                    store.src             = p.full ? full_v : static_cast<__half*>(src->p);
-                    store.src_head_stride = p.full ? p.head_stride : stage_stride;
-                    store.src_ring        = p.full ? global_slots : prefill_ring;
-                    store.positions =
-                        static_cast<const std::int32_t*>(branching ? d_slots.p : d_positions.p);
-                    store.sequence        = int(sequence);
-                    store.rows            = t;
-                    store.heads           = p.kv_heads;
-                    store.dst             = *plane;
-                    store.dst_ring        = p.ring;
-                    // A branch pass keeps the sequence's window as it was: its rows go nowhere.
-                    store.store_from      = p.full      ? 0
-                                            : branching ? std::numeric_limits<int>::max()
-                                                        : int(first) + t - p.ring;
-                    store.write_back      = !p.full;
-                    kernels::kv_store(store, stream);
+            float* attn       = nullptr;
+            void* fa_space    = nullptr;
+            std::size_t fa_bytes = 0;
+            if (!kv_only_block) {
+                attn = static_cast<float*>(
+                    workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
+                fa_bytes = gguf::flash_attention_workspace_bytes(p.head_dim, query_heads,
+                                                                 p.kv_heads, widest);
+                fa_space = workspace->alloc_bytes(fa_bytes).data;
+            }
+            for (const PassPiece& pc : pieces) {
+                const int first = int(pc.first);
+                kernels::QkvArgs qa;
+                qa.qkv = static_cast<const __nv_bfloat16*>(qkv.data) +
+                         std::int64_t(pc.row) * p.qkv_rows;
+                qa.tokens      = pc.t;
+                qa.query_heads = query_heads;
+                qa.kv_heads    = p.kv_heads;
+                qa.head_dim    = p.head_dim;
+                qa.has_v       = !p.full;
+                qa.q_norm      = p.q_norm;
+                qa.k_norm      = p.k_norm;
+                qa.eps         = eps;
+                qa.positions   = d_pos + pc.row;
+                qa.inv_freq =
+                    static_cast<const float*>(p.full ? inv_freq_full.p : inv_freq_sliding.p);
+                qa.q_scale = p.full ? full_query_scale : 1.0f;
+                qa.q_out   = q + std::int64_t(pc.row) * q_floats;
+                qa.slots   = branching ? static_cast<const std::int32_t*>(d_slots.p) : nullptr;
+                // A sliding block attends over the staging ring: the window before the piece first
+                // comes over from the sequence's ring, the piece's keys land there, and the window
+                // that ends the piece goes back.
+                const std::int64_t seq_offset = std::int64_t(pc.sequence) * p.seq_stride;
+                kernels::RingCopyArgs keep;
+                keep.kv_heads = p.kv_heads;
+                keep.head_dim = p.head_dim;
+                if (!p.full && quantized) {
+                    // The window before the piece, decoded from the sequence's quantized ring.
+                    for (const auto& [plane, dst] :
+                         {std::pair{&p.kq, &staging_k}, std::pair{&p.vq, &staging_v}}) {
+                        kernels::KvLoadArgs load;
+                        load.src             = *plane;
+                        load.src_ring        = p.ring;
+                        load.sequence        = int(pc.sequence);
+                        load.begin           = std::max(0, first - window);
+                        load.end             = first;
+                        load.heads           = p.kv_heads;
+                        load.dst             = static_cast<__half*>(dst->p);
+                        load.dst_head_stride = stage_stride;
+                        load.dst_ring        = prefill_ring;
+                        kernels::kv_load(load, stream);
+                    }
+                } else if (!p.full) {
+                    keep.src_k           = static_cast<const __half*>(p.k.p) + seq_offset;
+                    keep.src_v           = static_cast<const __half*>(p.v.p) + seq_offset;
+                    keep.dst_k           = static_cast<__half*>(staging_k.p);
+                    keep.dst_v           = static_cast<__half*>(staging_v.p);
+                    keep.src_head_stride = p.head_stride;
+                    keep.dst_head_stride = stage_stride;
+                    keep.src_ring        = p.ring;
+                    keep.dst_ring        = prefill_ring;
+                    keep.begin           = std::max(0, first - window);
+                    keep.end             = first;
+                    kernels::ring_copy(keep, stream);
                 }
-                if (p.full && !kv_only_block) {
-                    kernels::KvLoadArgs load;
-                    load.src             = p.vq;
-                    load.sequence        = int(sequence);
-                    load.begin           = 0;
-                    load.end             = int(first) + t;
-                    load.heads           = p.kv_heads;
-                    load.dst             = full_v;
-                    load.dst_head_stride = p.head_stride;
-                    kernels::kv_load(load, stream);
+                qa.k_cache     = p.full ? nullptr : static_cast<__half*>(staging_k.p);
+                qa.v_cache     = p.full ? full_v : static_cast<__half*>(staging_v.p);
+                qa.seq_stride  = p.full && !quantized ? p.seq_stride : 0;
+                qa.head_stride = p.full ? p.head_stride : stage_stride;
+                qa.sequence    = p.full && !quantized ? int(pc.sequence) : 0;
+                qa.ring        = p.full ? 0 : prefill_ring;
+                kernels::qkv_post(qa, stream);
+                if (quantized) {
+                    // The piece's rows into the sequence's planes: a sliding block's into its ring
+                    // (the staging rows become the values they represent, which the piece then
+                    // attends to), a full block's at their positions, after which the block's
+                    // whole prefix comes back from the plane.
+                    for (const auto& [plane, src] :
+                         {std::pair{&p.kq, &staging_k}, std::pair{&p.vq, &staging_v}}) {
+                        if (p.full && plane == &p.kq) { continue; }
+                        kernels::KvStoreArgs store;
+                        store.src             = p.full ? full_v : static_cast<__half*>(src->p);
+                        store.src_head_stride = p.full ? p.head_stride : stage_stride;
+                        store.src_ring        = p.full ? global_slots : prefill_ring;
+                        store.positions = branching ? static_cast<const std::int32_t*>(d_slots.p)
+                                                    : d_pos + pc.row;
+                        store.sequence  = int(pc.sequence);
+                        store.rows      = pc.t;
+                        store.heads     = p.kv_heads;
+                        store.dst       = *plane;
+                        store.dst_ring  = p.ring;
+                        // A branch pass keeps the sequence's window as it was: its rows go nowhere.
+                        store.store_from = p.full      ? 0
+                                           : branching ? std::numeric_limits<int>::max()
+                                                       : first + pc.t - p.ring;
+                        store.write_back = !p.full;
+                        kernels::kv_store(store, stream);
+                    }
+                    if (p.full && !kv_only_block) {
+                        kernels::KvLoadArgs load;
+                        load.src             = p.vq;
+                        load.sequence        = int(pc.sequence);
+                        load.begin           = 0;
+                        load.end             = first + pc.t;
+                        load.heads           = p.kv_heads;
+                        load.dst             = full_v;
+                        load.dst_head_stride = p.head_stride;
+                        kernels::kv_load(load, stream);
+                    }
+                }
+                if (kv_only_block) { continue; }
+                if (p.full) {
+                    kernels::derive_keys(
+                        full_v + (quantized ? 0 : seq_offset), p.head_stride, p.kv_heads,
+                        p.head_dim, first + pc.t, p.k_norm,
+                        static_cast<const float2*>(rope_full.p), int(config.rotary_pairs_full),
+                        static_cast<__half*>(derived_keys.p), stream, branching ? d_pos : nullptr,
+                        first);
+                }
+                gguf::FlashAttentionArgs fa;
+                fa.head_dim       = p.head_dim;
+                fa.query_heads    = query_heads;
+                fa.kv_heads       = p.kv_heads;
+                fa.tokens         = pc.t;
+                fa.q              = q + std::int64_t(pc.row) * q_floats;
+                fa.q_token_stride = q_floats;
+                fa.k = p.full ? static_cast<const __half*>(derived_keys.p)
+                              : static_cast<const __half*>(staging_k.p);
+                fa.v = p.full ? full_v + (quantized ? 0 : seq_offset)
+                              : static_cast<const __half*>(staging_v.p);
+                fa.row_bytes  = std::int64_t(p.head_dim) * 2;
+                fa.head_bytes = (p.full ? p.head_stride : stage_stride) * 2;
+                fa.slots      = p.full ? pc.full_slots : prefill_ring;
+                fa.mask       = p.full ? mask_full + pc.mask_at
+                                       : mask_ring + std::size_t(pc.row) * prefill_ring;
+                fa.mask_row_halves = fa.slots;
+                fa.out             = attn + std::int64_t(pc.row) * q_floats;
+                fa.scale           = 1.0f;
+                gguf::flash_attention(fa, fa_space, fa_bytes, stream);
+                if (!p.full && !quantized && !branching) {
+                    kernels::RingCopyArgs back = keep;
+                    std::swap(back.src_head_stride, back.dst_head_stride);
+                    std::swap(back.src_ring, back.dst_ring);
+                    back.src_k = static_cast<const __half*>(staging_k.p);
+                    back.src_v = static_cast<const __half*>(staging_v.p);
+                    back.dst_k = static_cast<__half*>(p.k.p) + seq_offset;
+                    back.dst_v = static_cast<__half*>(p.v.p) + seq_offset;
+                    back.begin = std::max(0, first + pc.t - window);
+                    back.end   = first + pc.t;
+                    kernels::ring_copy(back, stream);
                 }
             }
             if (kv_only_block) { break; }
-            if (p.full) {
-                kernels::derive_keys(
-                    full_v + (quantized ? 0 : seq_offset), p.head_stride, p.kv_heads, p.head_dim,
-                    int(first) + t, p.k_norm, static_cast<const float2*>(rope_full.p),
-                    int(config.rotary_pairs_full), static_cast<__half*>(derived_keys.p), stream,
-                    branching ? static_cast<const std::int32_t*>(d_positions.p) : nullptr,
-                    int(first));
-            }
-            auto* attn = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
-            const std::size_t fa_bytes =
-                gguf::flash_attention_workspace_bytes(p.head_dim, query_heads, p.kv_heads, t);
-            void* fa_space = workspace->alloc_bytes(fa_bytes).data;
-            gguf::FlashAttentionArgs fa;
-            fa.head_dim        = p.head_dim;
-            fa.query_heads     = query_heads;
-            fa.kv_heads        = p.kv_heads;
-            fa.tokens          = t;
-            fa.q               = q;
-            fa.q_token_stride  = q_floats;
-            fa.k = p.full ? static_cast<const __half*>(derived_keys.p)
-                          : static_cast<const __half*>(staging_k.p);
-            fa.v = p.full ? full_v + (quantized ? 0 : seq_offset)
-                          : static_cast<const __half*>(staging_v.p);
-            fa.row_bytes       = std::int64_t(p.head_dim) * 2;
-            fa.head_bytes      = (p.full ? p.head_stride : stage_stride) * 2;
-            fa.slots           = p.full ? full_slots : prefill_ring;
-            fa.mask            = p.full ? mask_full : mask_ring;
-            fa.mask_row_halves = fa.slots;
-            fa.out             = attn;
-            fa.scale           = 1.0f;
-            gguf::flash_attention(fa, fa_space, fa_bytes, stream);
-            if (!p.full && !quantized && !branching) {
-                kernels::RingCopyArgs back = keep;
-                std::swap(back.src_head_stride, back.dst_head_stride);
-                std::swap(back.src_ring, back.dst_ring);
-                back.src_k = static_cast<const __half*>(staging_k.p);
-                back.src_v = static_cast<const __half*>(staging_v.p);
-                back.dst_k = static_cast<__half*>(p.k.p) + seq_offset;
-                back.dst_v = static_cast<__half*>(p.v.p) + seq_offset;
-                back.begin = std::max(0, int(first) + t - window);
-                back.end   = int(first) + t;
-                kernels::ring_copy(back, stream);
-            }
             Tensor attn_bf16 = workspace->alloc(DType::BF16, {q_floats, t});
             kernels::f32_to_bf16(attn, static_cast<__nv_bfloat16*>(attn_bf16.data),
                                  std::int64_t(t) * q_floats, stream);
@@ -2214,24 +2300,26 @@ struct Executor::Impl {
             project(attn_bf16, p.output, o);
             const bool last = li + 1 == layers.size();
             // The final rows in BF16 too when the assistant reads the last of them, or a branch
-            // pass gathers its branches' last ones.
+            // pass or a pass of several pieces gathers its last ones.
             block_tail(p, h, t, o, last ? final_norm : layers[li + 1].input_norm,
-                       q8 && !(last && (drafting() || branching))
+                       q8 && !(last && (drafting() || branching || several))
                            ? nullptr
                            : static_cast<__nv_bfloat16*>(x.data),
                        q8 ? &xq : nullptr);
             spine_tap(li, h, spine_row, t, spine_row);
         }
         if (spine_row < t) {
-            spine->commit(spine->lane(sequence), first + std::uint32_t(spine_row), 0,
+            const PassPiece& pc = pieces.front();
+            spine->commit(spine->lane(pc.sequence), pc.first + std::uint32_t(spine_row), 0,
                           std::uint32_t(t - spine_row), stream);
         }
+        auto* rows = static_cast<__nv_bfloat16*>(x.data);
         if (branching) {
             // Each branch's last row to the front, in branch order; a branch's last row lies at or
             // past its index, so no copy overwrites a later one's source. The sequence stays at
             // its position, its window untouched.
-            auto* rows      = static_cast<__nv_bfloat16*>(x.data);
-            std::size_t row = 0;
+            const PassPiece& pc = pieces.front();
+            std::size_t row     = 0;
             for (std::size_t b = 0; b < branches.size(); ++b) {
                 row += branches[b];
                 if (row - 1 == b) { continue; }
@@ -2239,38 +2327,53 @@ struct Executor::Impl {
                     rows + std::int64_t(b) * hidden, rows + std::int64_t(row - 1) * hidden,
                     std::size_t(hidden) * 2, cudaMemcpyDeviceToDevice, stream));
             }
-            head_logits(rows, int(logit_rows), 0);
+            head_logits(rows, pc.logit_rows, 0);
             // The branches' rows took the rings' slots past the sequence's position.
-            ring_floor[sequence] = first + std::uint32_t(t);
-            hold_base[sequence]  = kNoHold;
+            ring_floor[pc.sequence] = pc.first + std::uint32_t(t);
+            hold_base[pc.sequence]  = kNoHold;
             return;
         }
-        if (kv_only) {
-            // The assistant's hidden is the last token's: it drafts after the next prompt chunk.
-            if (drafting()) { anchored[sequence] = 0; }
-            positions[sequence]  = first + std::uint32_t(t);
-            ring_floor[sequence] = first + std::uint32_t(t);
-            hold_base[sequence]  = kNoHold;
-            return;
-        }
+        // The assistant's hidden is a logit piece's last token's; a piece without logits drafts
+        // after its next prompt chunk.
         if (drafting()) {
-            CUDA_CHECK(cudaMemcpyAsync(static_cast<__nv_bfloat16*>(anchor_hidden.p) +
-                                           std::int64_t(sequence) * hidden,
-                                       static_cast<const __nv_bfloat16*>(x.data) +
-                                           std::int64_t(t - 1) * hidden,
-                                       std::size_t(hidden) * 2, cudaMemcpyDeviceToDevice, stream));
-            anchored[sequence] = 1;
+            for (const PassPiece& pc : pieces) {
+                anchored[pc.sequence] = pc.logit_rows > 0 ? 1 : 0;
+                if (pc.logit_rows == 0) { continue; }
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<__nv_bfloat16*>(anchor_hidden.p) +
+                        std::int64_t(pc.sequence) * hidden,
+                    rows + std::int64_t(pc.row + pc.t - 1) * hidden, std::size_t(hidden) * 2,
+                    cudaMemcpyDeviceToDevice, stream));
+            }
         }
-        if (q8) {
-            head_logits_q8(xq, t, int(logit_rows));
-        } else {
-            head_logits(static_cast<const __nv_bfloat16*>(x.data) +
-                            std::int64_t(t - int(logit_rows)) * hidden,
-                        int(logit_rows), 0);
+        if (!kv_only && !several) {
+            const PassPiece& pc = pieces.front();
+            if (q8) {
+                head_logits_q8(xq, t, pc.logit_rows);
+            } else {
+                head_logits(rows + std::int64_t(t - pc.logit_rows) * hidden, pc.logit_rows, 0);
+            }
+        } else if (!kv_only) {
+            // Each logit piece's last row to the front, in piece order; a piece's last row lies at
+            // or past its index, so no copy overwrites a later one's source.
+            int column = 0;
+            for (const PassPiece& pc : pieces) {
+                if (pc.logit_rows == 0) { continue; }
+                const int row = pc.row + pc.t - 1;
+                if (row != column) {
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        rows + std::int64_t(column) * hidden, rows + std::int64_t(row) * hidden,
+                        std::size_t(hidden) * 2, cudaMemcpyDeviceToDevice, stream));
+                }
+                ++column;
+            }
+            head_logits(rows, column, 0);
         }
-        positions[sequence]  = first + std::uint32_t(t);
-        ring_floor[sequence] = first + std::uint32_t(t);
-        hold_base[sequence]  = kNoHold;
+        for (const PassPiece& pc : pieces) {
+            positions[pc.sequence]  = pc.first + std::uint32_t(pc.t);
+            ring_floor[pc.sequence] = pc.first + std::uint32_t(pc.t);
+            hold_base[pc.sequence]  = kNoHold;
+        }
     }
 
     // ---- Decode ---------------------------------------------------------------------------------------
@@ -3198,6 +3301,10 @@ void Executor::forward_branches(std::uint32_t sequence, std::span<const std::int
                                 std::span<const std::uint32_t> lengths) {
     impl_->forward(sequence, tokens, static_cast<std::uint32_t>(lengths.size()), {}, lengths);
 }
+
+void Executor::forward_pieces(std::span<const PromptPiece> pieces) { impl_->forward_pieces(pieces); }
+
+bool Executor::shares_prompt_passes() const noexcept { return !impl_->spine; }
 
 bool Executor::vision() const noexcept { return impl_->vision_media; }
 

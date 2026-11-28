@@ -70,6 +70,14 @@ struct ExecutorOptions {
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
 };
 
+// One sequence's prompt tokens in a shared prompt pass (Executor::forward_pieces).
+struct PromptPiece {
+    std::uint32_t sequence = 0;
+    std::span<const std::int32_t> tokens;
+    // The logits of the piece's last token: one column of logits() each, in piece order.
+    bool logits = false;
+};
+
 struct ExecutorMemory {
     std::uint64_t kv_bytes        = 0;
     // Beside an elastic expert cache, the full-attention caches grow with their sequences: the
@@ -143,6 +151,15 @@ public:
     void forward_prompt_branches(std::uint32_t sequence, std::span<const std::int32_t> prompt,
                                  std::span<const std::int32_t> tokens,
                                  std::span<const std::uint32_t> lengths);
+    // Prompt tokens of several sequences (distinct, at most prefill_chunk tokens in all) in one
+    // pass, each piece at its sequence's next positions as forward() runs it: the products,
+    // routers and experts take every piece's rows in one call, the keys, values and attention each
+    // piece's own sequence. A row's arithmetic follows the call's width, as in a decode step of
+    // several sequences. Leaves one logit column per piece that wants it, in piece order.
+    void forward_pieces(std::span<const PromptPiece> pieces);
+    // Whether forward_pieces() runs: not with a DSpine drafter, whose pass keeps one sequence's
+    // rows.
+    [[nodiscard]] bool shares_prompt_passes() const noexcept;
     // One token of each of `sequences` (distinct) at its next position; logits one column each.
     void decode(std::span<const std::uint32_t> sequences, std::span<const std::int32_t> tokens);
     // BF16 [vocab, rows], ready on head_stream().

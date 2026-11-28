@@ -103,6 +103,14 @@ struct ChunkMedia {
     std::vector<std::uint32_t> rows;
 };
 
+// One sequence's prompt tokens in a shared prompt pass (Executor::forward_pieces).
+struct PromptPiece {
+    std::uint32_t sequence = 0;
+    std::span<const std::int32_t> tokens;
+    // The logits of the piece's last token: one column of logits() each, in piece order.
+    bool logits = false;
+};
+
 struct ExecutorMemory {
     std::uint64_t kv_bytes        = 0;
     // Beside an elastic expert cache, the full-attention caches grow with their sequences: the
@@ -175,6 +183,17 @@ public:
     // logits(), one column per branch in order. The sequence keeps its position and window.
     void forward_branches(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                           std::span<const std::uint32_t> lengths);
+    // Text prompt tokens of several sequences (distinct, at most prefill_chunk tokens in all) in
+    // one pass, each piece at its sequence's next positions as forward() runs it: the products,
+    // routers and experts take every piece's rows in one call, the keys, values and attention each
+    // piece's own sequence. A row's arithmetic follows the call's width, as in a decode step of
+    // several sequences. Leaves one logit column per piece that wants it, in piece order; after
+    // a piece without logits the assistant drafts after the sequence's next chunk, as after
+    // forward() without logit rows.
+    void forward_pieces(std::span<const PromptPiece> pieces);
+    // Whether forward_pieces() runs: not with a DSpine drafter, whose pass keeps one sequence's
+    // rows.
+    [[nodiscard]] bool shares_prompt_passes() const noexcept;
     // Whether prompt chunks may carry media.
     [[nodiscard]] bool vision() const noexcept;
     // The device time the last forward() spent on its media (encoding and placing its soft

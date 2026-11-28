@@ -919,8 +919,9 @@ curl http://127.0.0.1:8080/v1/load -H 'Authorization: Bearer local-secret'
   `reused_prompt_tokens`). `committed_decode_tokens` counts tokens committed by decode rounds and
   excludes each request's first token, which prefill emits; with speculative decoding a round commits
   several tokens per row. `decode_row_rounds` is the sum of decode batch sizes over `decode_rounds`.
-  `shared_prefill_passes` counts prefill passes that computed the last prompt chunks of several
-  requests at once, and `shared_prefill_requests` the requests those passes completed.
+  `shared_prefill_passes` counts prefill passes that computed prompt steps of several requests at
+  once (a Qwen3.5-core model's last chunks, or the next steps of text prompts on Gemma 4, Flint,
+  Inkling 2 and DeepSeek-V4.1), and `shared_prefill_requests` the requests in those passes.
 - Gauges and counters come from the snapshot the Engine publishes at execution boundaries, so they
   can trail the instant of the poll by up to one boundary.
 
@@ -3293,6 +3294,21 @@ these passes as `shared_prefill_passes`. Requests that arrive together share the
 `submit_group` puts several requests in the queue at once, so the first does not start alone before
 the others arrive. A branched read, the decision and rerank endpoints' reads of one request, runs
 its state's last chunk and its branches as blocks of these passes, up to 64 blocks a pass.
+
+Gemma 4, Flint, Inkling 2 and DeepSeek-V4.1 share prompt passes too. The prompt step of the
+request with the shortest remaining prompt takes the next steps of other text prompts that are
+prefilling, shortest remaining first, while they fit `--prefill-chunk` tokens together; a step that
+does not end its prompt may take the room that is left, 64 tokens at least. Every layer's products,
+norms, routers and experts take the rows of all the prompts in one call, so the weights are read
+(and missing host or disk experts are copied) once a pass instead of once a prompt, and the first
+tokens of a burst of short prompts come after one pass instead of one pass and its decode rounds
+each. Each prompt keeps its own keys, values, windows, recurrent states and Engram history. A row's
+arithmetic follows the width of its pass, as in a decode step of several requests, so a prompt in a
+shared pass and the same prompt alone may round differently. A prompt runs alone when it has media
+or branches, when the model drafts with a DSpine drafter (on Inkling 2 also a DFlash2 drafter), on
+DeepSeek-V4.1 for a step in which its prefill tail skips rows of blocks 21 to 39 (the early
+chunks of a long prompt) and for a prompt span of host or disk experts, and when a prompt it could
+start from the stored prefix of a prompt in the pass waits for that prefix.
 
 On a Qwen3.5-core model the waiting one-token requests (decision reads) are ordered by remaining
 work, as PrefillOnly (arXiv 2505.07203) schedules prefill-only jobs: they trade the queue positions
