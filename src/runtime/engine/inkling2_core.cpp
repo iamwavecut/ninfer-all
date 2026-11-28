@@ -710,6 +710,8 @@ struct Inkling2Core::Impl {
     // Host copies of an image each way, about PCIe 4.0 x16's; and the prefill time per token.
     static constexpr double kImageCopyBytesPerSecond = 12e9;
     static constexpr double kPrefillSecondsPerToken  = 2e-4;
+    // The fewest tokens of a prompt step cut to the room a shared prompt pass has left.
+    static constexpr std::uint32_t kMinSharedPiece = 64;
     std::uint32_t decode_run                = 0;
     std::uint32_t decode_rounds_per_prefill = 1;
 
@@ -1564,7 +1566,7 @@ struct Inkling2Core::Impl {
         if (prefilling && (!decoding || decode_run >= decode_rounds_before(*prefilling))) {
             decode_run = 0;
             try {
-                prefill_step(prefilling);
+                shared_prefill_step(prefilling);
             } catch (...) { fail(prefilling, std::current_exception()); }
             return true;
         }
@@ -1865,17 +1867,18 @@ struct Inkling2Core::Impl {
         finish(request, reason);
     }
 
-    void prefill_step(const std::shared_ptr<Request>& request) {
+    // Readies the request's next prefill step: a prompt admitted with nothing to resume may find a
+    // prefix another request stored while it waited (the shared system prompt of requests that
+    // arrived together) and starts there. Returns the step's tokens, or nothing when the request
+    // ended (cancelled) or its step ran (a branched read's branch step).
+    std::optional<std::uint32_t> begin_prefill(const std::shared_ptr<Request>& request) {
         Request& r          = *request;
         Slot& slot          = slots[r.slot];
-        auto& executor      = *instance.executor;
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
         if (r.cancelled.load(std::memory_order_acquire)) {
             finish_now(request, FinishReason::Cancelled);
-            return;
+            return std::nullopt;
         }
-        // A prompt admitted with nothing to resume may find a prefix another request stored while
-        // it waited (the shared system prompt of requests that arrived together): start there.
         if (reuse_prefixes && r.reusable && r.prefilled == 0) {
             const auto [image, from_store] = find_stored(r);
             std::vector<TokenId> tokens;
@@ -1898,11 +1901,24 @@ struct Inkling2Core::Impl {
         }
         if (r.branches && r.prefilled == prompt_n) {
             branch_step(request);
-            return;
+            return std::nullopt;
         }
         const std::uint32_t n = prefill_step_tokens(r);
         if (n == 0) { throw std::logic_error("inkling2: an empty prefill step"); }
-        const auto chunk = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
+        return n;
+    }
+
+    void prefill_step(const std::shared_ptr<Request>& request) {
+        const std::optional<std::uint32_t> n = begin_prefill(request);
+        if (n) { feed_prompt(request, *n); }
+    }
+
+    // Runs the request's next `n` prompt tokens alone, then ends the step.
+    void feed_prompt(const std::shared_ptr<Request>& request, std::uint32_t n) {
+        Request& r          = *request;
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const auto chunk    = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
         // A branched read's last chunk takes the first branches into its pass when the first fits
         // beside it: the sequence keeps the chunk's rows and the branches run from its end.
         std::vector<TokenId> branch_tokens;
@@ -1918,6 +1934,125 @@ struct Inkling2Core::Impl {
         } else {
             executor.forward_prompt_branches(r.slot, chunk, branch_tokens, lengths);
         }
+        end_prefill(request, n, 0, 1, lengths);
+    }
+
+    // A prompt without branches or media, whose step may share a pass with other prompts'.
+    [[nodiscard]] static bool plain_prompt(const Request& r) {
+        return !r.branches && r.media.empty();
+    }
+
+    // A prompt step of `lead` that also takes the steps of other plain prompts that are prefilling,
+    // in prefills_before order, while they fit one prompt chunk (Executor::forward_pieces): their
+    // rows go through every layer's products, routers and experts in one call, so a burst of short
+    // prompts reads the weights (and copies the missing experts) once instead of once a prompt, and
+    // each first token comes after one pass instead of one pass and its decode rounds a prompt. A
+    // step that does not end its prompt may take the room left, at least kMinSharedPiece tokens. A
+    // prompt that could start from the prefix a packed prompt is about to store waits for it.
+    void shared_prefill_step(const std::shared_ptr<Request>& lead) {
+        auto& executor = *instance.executor;
+        if (!executor.shares_prompt_passes() || !plain_prompt(*lead)) {
+            prefill_step(lead);
+            return;
+        }
+        const std::optional<std::uint32_t> lead_n = begin_prefill(lead);
+        if (!lead_n) { return; }
+        const std::uint32_t chunk = executor.options().prefill_chunk;
+        struct Packed {
+            std::shared_ptr<Request> request;
+            std::uint32_t tokens = 0;
+        };
+        std::vector<Packed> packed{{lead, *lead_n}};
+        std::uint32_t total = *lead_n;
+        std::vector<std::shared_ptr<Request>> candidates;
+        for (const Slot& slot : slots) {
+            if (slot.request && slot.request != lead && !slot.request->decoding &&
+                plain_prompt(*slot.request)) {
+                candidates.push_back(slot.request);
+            }
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const auto& a, const auto& b) { return prefills_before(*a, *b); });
+        const auto shares_store = [&](const Request& r) {
+            if (!reuse_prefixes || !r.reusable || r.prefilled != 0 || r.shared_at.empty()) {
+                return false;
+            }
+            const std::uint32_t frontier = r.shared_at.front();
+            return std::any_of(packed.begin(), packed.end(), [&](const Packed& p) {
+                const Request& q = *p.request;
+                return q.prefilled < frontier && q.prompt_tokens.size() >= frontier &&
+                       std::equal(r.prompt_tokens.begin(), r.prompt_tokens.begin() + frontier,
+                                  q.prompt_tokens.begin());
+            });
+        };
+        for (const auto& request : candidates) {
+            if (chunk - total < kMinSharedPiece) { break; }
+            if (shares_store(*request)) { continue; }
+            std::optional<std::uint32_t> n;
+            try {
+                n = begin_prefill(request);
+            } catch (...) {
+                fail(request, std::current_exception());
+                continue;
+            }
+            if (!n) { continue; }
+            const auto left = static_cast<std::uint32_t>(request->prompt_tokens.size()) -
+                              request->prefilled;
+            if (*n > chunk - total) {
+                // Only a step that does not end its prompt is cut to the room left.
+                if (*n == left) { continue; }
+                n = chunk - total;
+            }
+            packed.push_back({request, *n});
+            total += *n;
+        }
+        if (packed.size() == 1) {
+            feed_prompt(lead, *lead_n);
+            return;
+        }
+        std::vector<models::inkling2::PromptPiece> pieces;
+        std::vector<std::uint32_t> columns;
+        std::uint32_t rows = 0;
+        for (const Packed& p : packed) {
+            const Request& r = *p.request;
+            const bool ends  = r.prefilled + p.tokens == r.prompt_tokens.size();
+            pieces.push_back(
+                {.sequence = r.slot,
+                 .tokens   = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, p.tokens),
+                 .logits   = ends});
+            columns.push_back(ends ? rows++ : 0);
+        }
+        try {
+            executor.forward_pieces(pieces);
+        } catch (...) {
+            const std::exception_ptr error = std::current_exception();
+            for (std::size_t i = 1; i < packed.size(); ++i) { fail(packed[i].request, error); }
+            throw;
+        }
+        {
+            std::lock_guard lock(stats_mutex);
+            ++stats.shared_prefill_passes;
+            stats.shared_prefill_requests += packed.size();
+        }
+        for (std::size_t i = 0; i < packed.size(); ++i) {
+            try {
+                end_prefill(packed[i].request, packed[i].tokens, columns[i], std::max(rows, 1U));
+            } catch (...) { fail(packed[i].request, std::current_exception()); }
+        }
+    }
+
+    // After the request's next `n` prompt tokens ran (their logits, when they end the prompt, in
+    // column `column` of `rows`; a branched read's first branches `lengths` beside them): its
+    // bookkeeping, a stored prefix or anchor where the step ends at one, and at the prompt's end
+    // its first token.
+    void end_prefill(const std::shared_ptr<Request>& request, std::uint32_t n,
+                     std::uint32_t column, std::uint32_t rows,
+                     std::span<const std::uint32_t> lengths = {}) {
+        Request& r          = *request;
+        Slot& slot          = slots[r.slot];
+        auto& executor      = *instance.executor;
+        const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
+        const auto chunk    = std::span<const TokenId>(r.prompt_tokens).subspan(r.prefilled, n);
         slot.fed.insert(slot.fed.end(), chunk.begin(), chunk.end());
         for (const MediaMark& mark : r.media) {
             if (mark.begin >= r.prefilled && mark.begin < r.prefilled + n) {
@@ -1959,7 +2094,7 @@ struct Inkling2Core::Impl {
             return;
         }
         if (r.branches) { return; } // the next steps run the branches
-        finish_prompt(request);
+        finish_prompt(request, column, rows);
     }
 
     // The image rows of prompt tokens [begin, end) in row order: each image's span, encoded once
@@ -2152,7 +2287,8 @@ struct Inkling2Core::Impl {
 
     // The prompt is in (and a branched read's branches): the request takes its first token and
     // decodes from there.
-    void finish_prompt(const std::shared_ptr<Request>& request) {
+    void finish_prompt(const std::shared_ptr<Request>& request, std::uint32_t column = 0,
+                       std::uint32_t rows = 1) {
         Request& r          = *request;
         auto& executor      = *instance.executor;
         const auto prompt_n = static_cast<std::uint32_t>(r.prompt_tokens.size());
@@ -2185,19 +2321,22 @@ struct Inkling2Core::Impl {
             accept(request, r.branch_token, &r.branch_record, Draws{});
             return;
         }
+        const Tensor logits = executor.logits(rows);
         if (!mask_ready(r)) {
-            defer_sample(r, executor.logits(1), 0, ops::kSamplePurposePrefill);
+            defer_sample(r, logits, column, ops::kSamplePurposePrefill);
             return;
         }
         if (!mask_usable(request)) { return; }
         const SampleRow row = sample_row(r);
         TokenId token       = 0;
         runtime::RawTokenLogprob logprob;
+        const Tensor source(static_cast<std::uint8_t*>(logits.data) +
+                                std::size_t(column) * vocab_rows * sizeof(__nv_bfloat16),
+                            DType::BF16, {logits.ne[0], 1});
         sample(std::span(&row, 1), ops::kSamplePurposePrefill, std::span(&token, 1),
-               std::span(&logprob, 1));
-        const Tensor logits = executor.logits(1);
+               std::span(&logprob, 1), &source);
         accept(request, token, row.logprobs ? &logprob : nullptr,
-               Draws{.logits = &logits, .purpose = ops::kSamplePurposePrefill});
+               Draws{.logits = &source, .purpose = ops::kSamplePurposePrefill});
         next_mask(request);
     }
 

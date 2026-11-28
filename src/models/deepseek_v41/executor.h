@@ -136,6 +136,16 @@ struct NextPromptCall {
     std::span<const std::uint8_t> image_rows;
 };
 
+// One sequence's prompt tokens in a shared prompt pass (Executor::forward_pieces).
+struct PromptPiece {
+    std::uint32_t sequence = 0;
+    std::span<const std::int32_t> tokens;
+    // The logits of the piece's last token: one column of logits() each, in piece order.
+    bool logits = false;
+    // forward()'s state_at for the piece (0: the piece's end).
+    std::uint32_t state_at = 0;
+};
+
 struct ExecutorMemory {
     std::uint64_t kv_bytes        = 0;
     // Beside an elastic expert cache, the compressed caches grow with their sequences: the bytes
@@ -220,6 +230,22 @@ public:
     void forward(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                  std::uint32_t logit_rows, std::span<const ImageRows> images = {},
                  std::uint32_t state_at = 0, NextPromptCall next = {});
+    // Text prompt tokens of several sequences (distinct, at most prefill_chunk tokens in all) in
+    // one pass, each piece at its sequence's next positions as forward() runs it: the Engram,
+    // mixes, products, routers and experts take every piece's rows in one call, the window
+    // latents, compressed rows, index selection and attention each piece's own sequence. A row's
+    // arithmetic follows the call's width, as in a decode step of several sequences. Leaves one
+    // logit column per piece that wants it, in piece order.
+    void forward_pieces(std::span<const PromptPiece> pieces);
+    // Whether forward_pieces() runs: not with a DSpine drafter, whose taps keep one sequence's
+    // rows.
+    [[nodiscard]] bool shares_prompt_passes() const noexcept;
+    // Whether a prompt call of `tokens` at the sequence's next positions (with its last row's
+    // logits, before the kept state at `state_at`, as in PromptPiece) runs every row through the
+    // decoder blocks: always without a prefill tail, and under one where the tail's rows reach the
+    // call's first row. Only such calls share a pass, whose decoder blocks run every row.
+    [[nodiscard]] bool runs_every_row(std::uint32_t sequence, std::uint32_t tokens, bool logits,
+                                      std::uint32_t state_at) const;
     // Whether the sequence's state at its position is complete. Decode, verify, draft, snapshot()
     // and save_image() of the live state need a complete state; reset(), restore() and
     // load_image() leave one.

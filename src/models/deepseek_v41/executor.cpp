@@ -422,14 +422,15 @@ struct Executor::Impl {
     int decode_splits = 1;
     // The DSpark drafter (Model::dspark()): its blocks (each with every sequence's window ring),
     // the backbone blocks it taps (target_of: a block's index among the targets, -1 for none), the
-    // taps of a pass's last rows ([window][targets][hidden] FP32, the streams' mean entering each
-    // target), the seed's kv rows of each block, and a draft's buffers: the anchor and the drafts,
-    // their confidences and the Markov steps' scratch on the device, the drafts and confidences in
-    // pinned memory.
+    // taps of a pass's last rows ([tap_rows][targets][hidden] FP32, the streams' mean entering each
+    // target: a window of rows, or with several sequences the windows of a shared prompt pass's
+    // pieces, prefill_chunk rows at most), the seed's kv rows of each block, and a draft's buffers:
+    // the anchor and the drafts, their confidences and the Markov steps' scratch on the device, the
+    // drafts and confidences in pinned memory.
     struct Drafter {
         std::vector<LayerPlan> layers;
         std::vector<int> target_of;
-        int targets = 0, block = 0, domain = 0;
+        int targets = 0, block = 0, domain = 0, tap_rows = 0;
         std::int32_t noise = 0;
         Weight fc;
         std::vector<Weight> kv;
@@ -1093,7 +1094,13 @@ struct Executor::Impl {
             }
             d.layers.push_back(std::move(p));
         }
-        d.taps    = DeviceBuffer(std::size_t(window) * d.targets * hidden * 4);
+        d.tap_rows = options.sequences < 2
+                         ? window
+                         : int(std::max<std::uint64_t>(
+                               std::uint64_t(window),
+                               std::min<std::uint64_t>(options.prefill_chunk,
+                                                       std::uint64_t(options.sequences) * window)));
+        d.taps    = DeviceBuffer(std::size_t(d.tap_rows) * d.targets * hidden * 4);
         d.ids     = DeviceBuffer(std::size_t(d.block + 1) * 4);
         d.values  = DeviceBuffer(std::size_t(d.block) * 4);
         d.scratch = DeviceBuffer(kernels::markov_scratch_bytes());
@@ -2163,11 +2170,26 @@ struct Executor::Impl {
     void attention(const LayerPlan& p, float* h, const float* pre, int t, const Pass& s,
                    std::int32_t* topk, std::uint32_t* candidates, const Coefficients& c,
                    bool kv_only = false) {
-        auto scope      = workspace->scope();
-        const auto* pos = static_cast<const std::int32_t*>(d_positions.p) + s.row;
-        const auto* seq = s.chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p);
-        Tensor x        = alloc_bf16(hidden, t);
-        auto* x32       = alloc<float>(std::size_t(t) * hidden);
+        Pass part = s;
+        part.t    = t;
+        attention(p, h, pre, t, std::span<const Pass>(&part, 1), topk, candidates, c, kv_only);
+    }
+
+    // The attention of a pass, or of a shared prompt pass's prompt chunks (`parts`, each a chunk of
+    // its own sequence, their t rows in order from the first part's row): the norms, products and
+    // output over every row, and each part's window latents, compressed rows, index selection and
+    // attention over its own sequence.
+    void attention(const LayerPlan& p, float* h, const float* pre, int t, std::span<const Pass> parts,
+                   std::int32_t* topk, std::uint32_t* candidates, const Coefficients& c,
+                   bool kv_only = false) {
+        auto scope        = workspace->scope();
+        const Pass& lead  = parts.front();
+        const bool chunk  = lead.chunk;
+        const auto* pos   = static_cast<const std::int32_t*>(d_positions.p) + lead.row;
+        const auto* seq   = chunk ? nullptr : static_cast<const std::int32_t*>(d_sequences.p);
+        if (kv_only && !chunk) { throw std::logic_error("deepseek_v41: a key-value-only decode row"); }
+        Tensor x          = alloc_bf16(hidden, t);
+        auto* x32         = alloc<float>(std::size_t(t) * hidden);
         kernels::hc_pre_norm(h, pre, p.attention_norm, t, streams, hidden, eps,
                              static_cast<__nv_bfloat16*>(x.data), x32, stream);
         const int qkv_rows = query_rank + kLatent;
@@ -2182,82 +2204,99 @@ struct Executor::Impl {
         auto* qr32 = alloc<float>(std::size_t(t) * query_rank);
         kernels::rms_rows(qkv, qkv_rows, query_rank, t, p.query_norm, eps,
                           static_cast<__nv_bfloat16*>(qr.data), qr32, stream);
-        // The window latents: a chunk's into the staging ring after the window before it, decode
-        // rows' into their sequences' rings.
+        // The queries of every row (the window latents below do not read them).
+        Tensor q, o;
+        if (!kv_only) {
+            q = alloc_bf16(heads * kLatent, t);
+            if (p.stq) {
+                stq_project(p.stq->query_b, qr, nullptr, heads * kLatent, 0,
+                            static_cast<__nv_bfloat16*>(q.data));
+            } else {
+                project_bf16(qr, p.query_b, q);
+            }
+            kernels::rotate_heads(static_cast<const __nv_bfloat16*>(q.data), t, heads, kLatent, pos,
+                                  p.freq, false, static_cast<__nv_bfloat16*>(q.data), stream);
+            o = alloc_bf16(heads * kLatent, t);
+        }
         const auto ring_stride = std::int64_t(kRingBytes);
         auto* ring             = static_cast<std::uint8_t*>(p.ring.p);
-        auto* own              = ring + std::int64_t(s.sequence) * ring_stride;
         auto* stage_ring       = static_cast<std::uint8_t*>(staging.p);
-        if (s.chunk) {
-            kernels::ring_copy(own, kRing, stage_ring, prefill_ring,
-                               std::max(0, int(s.first) - window + 1), int(s.first), stream);
+        for (const Pass& s : parts) {
+            // The part's rows, from row `at` of the call's.
+            const int at = s.row - lead.row, n = s.t;
+            auto* own    = ring + std::int64_t(s.sequence) * ring_stride;
+            // The window latents: a chunk's into the staging ring after the window before it,
+            // decode rows' into their sequences' rings.
+            if (chunk) {
+                kernels::ring_copy(own, kRing, stage_ring, prefill_ring,
+                                   std::max(0, int(s.first) - window + 1), int(s.first), stream);
+            }
+            kernels::KvPostArgs kv;
+            kv.kv         = qkv + std::size_t(at) * qkv_rows + query_rank;
+            kv.kv_stride  = qkv_rows;
+            kv.tokens     = n;
+            kv.norm       = p.kv_norm;
+            kv.eps        = eps;
+            kv.positions  = pos + at;
+            kv.freq       = p.freq;
+            kv.cache      = chunk ? stage_ring : ring;
+            kv.seq_stride = chunk ? 0 : ring_stride;
+            kv.sequences  = seq;
+            kv.ring       = chunk ? prefill_ring : kRing;
+            kernels::kv_post(kv, stream);
+            const float* rows32 = x32 + std::size_t(at) * hidden;
+            if (kv_only) {
+                if (p.ratio > 0 && p.kv_source) { compress_block(p, rows32, n, s); }
+                const int end = int(s.first) + n;
+                kernels::ring_copy(stage_ring, prefill_ring, own, kRing, std::max(0, end - window),
+                                   end, stream);
+                continue;
+            }
+            std::int32_t* rows_topk = topk == nullptr ? nullptr : topk + std::size_t(at) * index_topk;
+            kernels::AttentionArgs a;
+            if (p.ratio > 0) {
+                if (p.kv_source) { compress_block(p, rows32, n, s); }
+                const LayerPlan& source = layers[std::size_t(p.kv_from)];
+                if (p.index_source) {
+                    index_block(p, source, qr32 + std::size_t(at) * query_rank, rows32, n, s,
+                                rows_topk,
+                                candidates == nullptr ? nullptr
+                                                      : candidates + std::size_t(at) * candidate_words);
+                }
+                a.compressed            = static_cast<const std::uint8_t*>(source.latents.p);
+                a.compressed_seq_stride = std::int64_t(source.latents.row_bytes);
+                a.topk                  = rows_topk;
+                a.k                     = index_topk;
+            }
+            a.q                 = static_cast<const __nv_bfloat16*>(q.data) +
+                  std::size_t(at) * heads * kLatent;
+            a.tokens            = n;
+            a.heads             = heads;
+            a.positions         = s.visible != nullptr ? s.visible : pos + at;
+            a.sequences         = seq;
+            a.sequence          = int(s.sequence);
+            a.window            = chunk ? stage_ring : ring;
+            a.window_seq_stride = chunk ? 0 : ring_stride;
+            a.ring              = chunk ? prefill_ring : kRing;
+            a.window_size       = window + s.extra_window;
+            // A prefill tail's run: its chunks' decoder blocks read no window position before it.
+            a.window_floor      = chunk && p.decoder ? int(decoder_from[s.sequence]) : 0;
+            a.sinks             = p.sinks;
+            a.scale             = 1.0f / std::sqrt(float(kLatent));
+            a.splits            = chunk ? 1 : decode_splits;
+            auto part_scope     = workspace->scope();
+            if (a.splits > 1) {
+                a.partial = alloc<float>(kernels::sparse_attention_workspace_floats(n, heads, a.splits));
+            }
+            a.out = static_cast<__nv_bfloat16*>(o.data) + std::size_t(at) * heads * kLatent;
+            kernels::sparse_attention(a, stream);
+            if (chunk) {
+                const int end = int(s.first) + n;
+                kernels::ring_copy(stage_ring, prefill_ring, own, kRing, std::max(0, end - window),
+                                   end, stream);
+            }
         }
-        kernels::KvPostArgs kv;
-        kv.kv        = qkv + query_rank;
-        kv.kv_stride = qkv_rows;
-        kv.tokens    = t;
-        kv.norm      = p.kv_norm;
-        kv.eps       = eps;
-        kv.positions = pos;
-        kv.freq      = p.freq;
-        kv.cache     = s.chunk ? stage_ring : ring;
-        kv.seq_stride = s.chunk ? 0 : ring_stride;
-        kv.sequences = seq;
-        kv.ring      = s.chunk ? prefill_ring : kRing;
-        kernels::kv_post(kv, stream);
-        if (kv_only) {
-            if (!s.chunk) { throw std::logic_error("deepseek_v41: a key-value-only decode row"); }
-            if (p.ratio > 0 && p.kv_source) { compress_block(p, x32, t, s); }
-            const int end = int(s.first) + t;
-            kernels::ring_copy(stage_ring, prefill_ring, own, kRing, std::max(0, end - window), end,
-                               stream);
-            return;
-        }
-        Tensor q = alloc_bf16(heads * kLatent, t);
-        if (p.stq) {
-            stq_project(p.stq->query_b, qr, nullptr, heads * kLatent, 0,
-                        static_cast<__nv_bfloat16*>(q.data));
-        } else {
-            project_bf16(qr, p.query_b, q);
-        }
-        kernels::rotate_heads(static_cast<const __nv_bfloat16*>(q.data), t, heads, kLatent, pos,
-                              p.freq, false, static_cast<__nv_bfloat16*>(q.data), stream);
-        kernels::AttentionArgs a;
-        if (p.ratio > 0) {
-            if (p.kv_source) { compress_block(p, x32, t, s); }
-            const LayerPlan& source = layers[std::size_t(p.kv_from)];
-            if (p.index_source) { index_block(p, source, qr32, x32, t, s, topk, candidates); }
-            a.compressed            = static_cast<const std::uint8_t*>(source.latents.p);
-            a.compressed_seq_stride = std::int64_t(source.latents.row_bytes);
-            a.topk                  = topk;
-            a.k                     = index_topk;
-        }
-        Tensor o            = alloc_bf16(heads * kLatent, t);
-        a.q                 = static_cast<const __nv_bfloat16*>(q.data);
-        a.tokens            = t;
-        a.heads             = heads;
-        a.positions         = s.visible != nullptr ? s.visible : pos;
-        a.sequences         = seq;
-        a.sequence          = int(s.sequence);
-        a.window            = s.chunk ? stage_ring : ring;
-        a.window_seq_stride = s.chunk ? 0 : ring_stride;
-        a.ring              = s.chunk ? prefill_ring : kRing;
-        a.window_size       = window + s.extra_window;
-        // A prefill tail's run: its chunks' decoder blocks read no window position before it.
-        a.window_floor      = s.chunk && p.decoder ? int(decoder_from[s.sequence]) : 0;
-        a.sinks             = p.sinks;
-        a.scale             = 1.0f / std::sqrt(float(kLatent));
-        a.splits            = s.chunk ? 1 : decode_splits;
-        if (a.splits > 1) {
-            a.partial = alloc<float>(kernels::sparse_attention_workspace_floats(t, heads, a.splits));
-        }
-        a.out = static_cast<__nv_bfloat16*>(o.data);
-        kernels::sparse_attention(a, stream);
-        if (s.chunk) {
-            const int end = int(s.first) + t;
-            kernels::ring_copy(stage_ring, prefill_ring, own, kRing, std::max(0, end - window), end,
-                               stream);
-        }
+        if (kv_only) { return; }
         // The grouped output projection: group g's heads (rounded as the reference rounds them)
         // through rows [g * o_rank, (g + 1) * o_rank) of output_a, into the latent's rows there. A
         // decode or verification call runs the groups as the experts of one vector product, its
@@ -3234,6 +3273,71 @@ struct Executor::Impl {
         head_logits(static_cast<const __nv_bfloat16*>(x.data), s.logit_rows, s.logit_column);
     }
 
+    // A shared prompt pass over the t staged rows of `parts` (prompt chunks of distinct sequences,
+    // in row order; the drafter's taps of part i from row tap_at[i]): the Engram, mixes, products,
+    // routers and experts of every block over every row, each part's window latents, compressed
+    // rows, index selection and attention over its own sequence (attention()). A part's logit row
+    // goes to its logit column; without any, the last block keeps its window latents alone.
+    void run_pieces(std::span<const Pass> parts, std::span<const int> tap_at, int t, int logit_rows) {
+        prompt_pass = true;
+        image_mask  = nullptr;
+        workspace->reset();
+        auto scope = workspace->scope();
+        auto* h    = alloc<float>(std::size_t(t) * streams * hidden);
+        embed(t, h);
+        const int site = 2 * streams + streams * streams;
+        Coefficients attention_site, ffn_site;
+        for (Coefficients* c : {&attention_site, &ffn_site}) {
+            auto* base = alloc<float>(std::size_t(t) * site);
+            c->pre     = base;
+            c->post    = base + std::size_t(t) * streams;
+            c->comb    = base + std::size_t(t) * 2 * streams;
+        }
+        auto* mix_scratch = alloc<float>(std::size_t(t) * config.hc_mixes());
+        auto* topk        = alloc<std::int32_t>(std::size_t(t) * index_topk);
+        auto* candidates  = candidate_words > 0 ? alloc<std::uint32_t>(std::size_t(t) * candidate_words)
+                                                : nullptr;
+        Pass all;
+        all.t            = t;
+        all.chunk        = true;
+        const float* pre = nullptr; // the first block reads stream 0
+        for (std::size_t l = 0; l < layers.size(); ++l) {
+            const LayerPlan& p = layers[l];
+            for (std::size_t i = 0; drafter && i < parts.size(); ++i) {
+                const Pass& s = parts[i];
+                tap(l, h + std::size_t(s.row + s.tap_row) * streams * hidden, s.t - s.tap_row, tap_at[i]);
+            }
+            if (p.engram >= 0) { engram_block(p, h, t, all); }
+            mixes(p.hc_attention, h, t, mix_scratch, attention_site);
+            const bool kv_only = logit_rows == 0 && l + 1 == layers.size();
+            attention(p, h, pre, t, parts, topk, candidates, attention_site, kv_only);
+            if (kv_only) { break; }
+            mixes(p.hc_ffn, h, t, mix_scratch, ffn_site);
+            ffn(p, h, attention_site.pre, t, ffn_site);
+            pre = ffn_site.pre;
+        }
+        for (std::size_t i = 0; drafter && i < parts.size(); ++i) {
+            const Pass& s = parts[i];
+            if (s.tap_row < s.t) {
+                seed(s.t - s.tap_row, tap_at[i],
+                     static_cast<const std::int32_t*>(d_positions.p) + s.row + s.tap_row, nullptr,
+                     s.sequence);
+            }
+        }
+        if (logit_rows == 0) { return; }
+        Tensor x = alloc_bf16(hidden, logit_rows);
+        for (const Pass& s : parts) {
+            if (s.logit_rows == 0) { continue; }
+            const int row = s.row + s.t - s.logit_rows;
+            kernels::hc_pre_norm(h + std::int64_t(row) * streams * hidden, pre + std::int64_t(row) * streams,
+                                 final_norm, s.logit_rows, streams, hidden, eps,
+                                 static_cast<__nv_bfloat16*>(x.data) +
+                                     std::int64_t(s.logit_column) * hidden,
+                                 nullptr, stream);
+        }
+        head_logits(static_cast<const __nv_bfloat16*>(x.data), logit_rows, 0);
+    }
+
     // ---- Calls -----------------------------------------------------------------------------------
 
     [[nodiscard]] std::uint32_t prompt_step() const noexcept {
@@ -3495,6 +3599,109 @@ struct Executor::Impl {
         give_back(borrowed);
         decoder_ran(sequence, first + std::uint32_t(n), decoder_row, n);
         positions[sequence] = first + std::uint32_t(n);
+    }
+
+    // Whether prompt chunks of several sequences may share a pass (forward_pieces): not with a
+    // DSpine drafter, whose taps keep one sequence's rows.
+    [[nodiscard]] bool shares_prompt_passes() const noexcept { return !spine; }
+
+    // Whether a prompt call of `t` tokens at the sequence's next positions (its last row's logits
+    // with `logits`, before the kept state at `state_at`) runs every row through the decoder
+    // blocks, as decoder_start() finds, with those blocks not behind the call: always without a
+    // prefill tail, and under one where the rows the tail runs reach the call's first.
+    [[nodiscard]] bool runs_every_row(std::uint32_t sequence, std::uint32_t t, bool logits,
+                                      std::uint32_t state_at) const {
+        if (decoder_behind.at(sequence) != 0) { return false; }
+        if (tail_rows == 0) { return true; }
+        const std::uint32_t first = positions.at(sequence), end = first + t;
+        std::uint32_t at          = state_at == 0 ? end : state_at;
+        if (logits) { at = std::min(at, end); }
+        const std::int64_t need = std::int64_t(at) - std::int64_t(tail_rows);
+        if (need >= std::int64_t(end)) { return false; }
+        if (need <= std::int64_t(first)) { return true; }
+        // Exact rounds the row down to the call's chunk boundary at or below it.
+        return options.prefill_tail == PrefillTail::Exact &&
+               need - std::int64_t(first) < std::int64_t(options.prefill_chunk);
+    }
+
+    void forward_pieces(std::span<const PromptPiece> in) {
+        if (!shares_prompt_passes()) {
+            throw std::logic_error("deepseek_v41: a shared prompt pass with a DSpine drafter");
+        }
+        std::size_t total = 0;
+        int logit_rows    = 0;
+        for (std::size_t i = 0; i < in.size(); ++i) {
+            const PromptPiece& piece = in[i];
+            const bool repeated      = std::any_of(in.begin(), in.begin() + std::ptrdiff_t(i),
+                                                   [&](const PromptPiece& other) {
+                                                       return other.sequence == piece.sequence;
+                                                   });
+            if (piece.sequence >= options.sequences || piece.tokens.empty() || repeated) {
+                throw std::invalid_argument("deepseek_v41 forward_pieces: invalid piece");
+            }
+            const std::uint32_t end = positions[piece.sequence] + std::uint32_t(piece.tokens.size());
+            if (end > options.max_context) {
+                throw std::invalid_argument("deepseek_v41 forward_pieces: context capacity exceeded");
+            }
+            if (piece.state_at != 0 && piece.state_at < end) {
+                throw std::invalid_argument("deepseek_v41 forward_pieces: a kept state before the "
+                                            "piece's end");
+            }
+            if (!runs_every_row(piece.sequence, std::uint32_t(piece.tokens.size()), piece.logits,
+                                piece.state_at)) {
+                throw std::logic_error("deepseek_v41 forward_pieces: a piece whose prefill tail "
+                                       "skips rows of the decoder blocks");
+            }
+            total += piece.tokens.size();
+            logit_rows += piece.logits ? 1 : 0;
+        }
+        if (in.empty() || total > options.prefill_chunk) {
+            throw std::invalid_argument("deepseek_v41 forward_pieces: invalid pass");
+        }
+        const int t = int(total);
+        std::vector<std::int32_t> tokens, pos;
+        std::vector<std::uint32_t> owners;
+        std::vector<Pass> parts;
+        std::vector<int> tap_at;
+        tokens.reserve(total);
+        pos.reserve(total);
+        owners.reserve(total);
+        int row = 0, column = 0, tapped = 0;
+        for (const PromptPiece& piece : in) {
+            const std::uint32_t first = positions[piece.sequence];
+            const int n               = int(piece.tokens.size());
+            back(piece.sequence, first + std::uint32_t(n));
+            Pass s;
+            s.t            = n;
+            s.chunk        = true;
+            s.row          = row;
+            s.staged       = t;
+            s.sequence     = piece.sequence;
+            s.first        = first;
+            s.logit_rows   = piece.logits ? 1 : 0;
+            s.logit_column = piece.logits ? column++ : 0;
+            s.tap_row      = drafter ? tap_start(first, n, piece.state_at) : n;
+            s.spine_row    = n;
+            tap_at.push_back(tapped);
+            tapped += n - s.tap_row;
+            parts.push_back(s);
+            tokens.insert(tokens.end(), piece.tokens.begin(), piece.tokens.end());
+            for (int i = 0; i < n; ++i) { pos.push_back(std::int32_t(first) + i); }
+            owners.insert(owners.end(), std::size_t(n), piece.sequence);
+            row += n;
+        }
+        if (drafter && tapped > drafter->tap_rows) {
+            throw std::logic_error("deepseek_v41 forward_pieces: the drafter's taps overflow");
+        }
+        stage(tokens, pos, {});
+        // Each piece's rows continue its sequence's Engram history; the read-ahead holds one
+        // sequence's next call, which a shared pass does not use.
+        read_engram_rows(tokens, owners, true);
+        run_pieces(parts, tap_at, t, logit_rows);
+        for (const Pass& s : parts) {
+            decoder_ran(s.sequence, s.first + std::uint32_t(s.t), 0, s.t);
+            positions[s.sequence] = s.first + std::uint32_t(s.t);
+        }
     }
 
     // The Engram rows of a pass whose row r belongs to owners[r], from that sequence's history.
@@ -4075,6 +4282,14 @@ void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tok
                        std::uint32_t logit_rows, std::span<const ImageRows> images,
                        std::uint32_t state_at, NextPromptCall next) {
     impl_->forward(sequence, tokens, logit_rows, 0, images, state_at, next);
+}
+
+void Executor::forward_pieces(std::span<const PromptPiece> pieces) { impl_->forward_pieces(pieces); }
+
+bool Executor::shares_prompt_passes() const noexcept { return impl_->shares_prompt_passes(); }
+bool Executor::runs_every_row(std::uint32_t sequence, std::uint32_t tokens, bool logits,
+                              std::uint32_t state_at) const {
+    return impl_->runs_every_row(sequence, tokens, logits, state_at);
 }
 
 bool Executor::resumable(std::uint32_t sequence) const { return impl_->resumable(sequence); }

@@ -144,7 +144,8 @@ public:
     // them at one boundary, so a Qwen3.5-core Engine admits them at once and runs their last prompt
     // chunks in one shared pass instead of starting the first before the rest arrive; Gemma 4,
     // Flint and Qwen3.8-Flash-Next admit them at once, and the first to reach a declared cache
-    // boundary they share keeps its state there for the others. Every request is checked before any
+    // boundary they share keeps its state there for the others. Gemma 4, Flint, Inkling 2 and
+    // DeepSeek-V4.1 run the prompts' steps in shared passes. Every request is checked before any
     // is queued; an error for one request cancels the group.
     [[nodiscard]] std::vector<GenerationHandle>
     submit_group(std::vector<GenerationSubmission> submissions);

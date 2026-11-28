@@ -1287,6 +1287,58 @@ kernels. Flint on the RTX 3090 (`--max-context 1024`: 64 sequences of 2,048 toke
 beside the cache) decoded 120.17 / 125.54 / 153.92 at 32 / 48 / 64 requests with the route table's
 kernel and 125.27 / 129.15 / 167.15 on the vector kernels, 167.54 with the default.
 
+### Shared prompt passes
+
+`ninfer-serve --max-concurrency 64 --max-context 2048 --kv-dtype rk8v4` (Gemma 4 31B
+`--max-concurrency 16`: 64 sequences of 2,048 tokens do not fit beside its weights; DeepSeek-V4.1
+`--kv-dtype bf16 --expert-residency host` with its Engram table; Inkling 2 host rows
+`--expert-residency host --expert-cache-mib 4096`), `serve_load.py --profile chat`: N short-chat
+requests of 256 tokens arrive together, EOS ignored; the median and the last first token (ms),
+tok/s over the whole load (`aggregate_tps`) and while all N decode at once (`steady_tps`). A40, November 28, one run each
+(Inkling 2 with host experts: two loads on one server each, both shown). Before is `4d26602349`,
+which prefilled the prompts one at a time; current runs their steps in [shared prompt
+passes](serving.md#execution-behavior).
+
+| Model | N | Build | First token, median | Last first token | Aggregate | Steady |
+|---|---:|---|---:|---:|---:|---:|
+| Gemma 4 26B-A4B, QAT Q4_0 | 8 | before | 361.8 | 654.2 | 392.88 | 436.23 |
+|  |  | current | 198.8 | 199.9 | 424.06 | 439.30 |
+|  | 64 | before | 3,332.4 | 7,853.3 | 938.82 | 1,444.24 |
+|  |  | current | 846.1 | 905.6 | 1,377.42 | 1,483.37 |
+| Gemma 4 31B, QAT Q4_0 | 8 | before | 832.5 | 1,538.4 | 150.80 | 167.63 |
+|  |  | current | 521.6 | 522.4 | 161.77 | 167.72 |
+|  | 16 | before | 1,649.4 | 3,209.5 | 264.36 | 328.38 |
+|  |  | current | 873.8 | 875.9 | 308.79 | 328.73 |
+| Flint, UD-Q4_K_XL | 8 | before | 317.7 | 566.0 | 415.28 | 456.80 |
+|  |  | current | 185.9 | 187.2 | 444.86 | 461.00 |
+|  | 64 | before | 3,247.8 | 7,849.9 | 819.50 | 1,132.88 |
+|  |  | current | 613.7 | 698.9 | 1,175.54 | 1,229.03 |
+| Inkling 2 Mini, UD-IQ4_XS | 8 | before | 632.9 | 1,042.4 | 206.33 | 223.64 |
+|  |  | current | 347.4 | 348.7 | 216.91 | 223.60 |
+|  | 64 | before | 5,692.6 | 13,685.4 | 500.57 | 726.81 |
+|  |  | current | 1,358.7 | 1,417.3 | 724.27 | 768.95 |
+| Inkling 2 Mini, host experts | 8 | before | 3,297.9 | 5,161.8 | 98.70 | 127.77 |
+|  |  | current | 1,371.7 | 1,372.8 | 119.05 | 128.42 |
+|  | 64 | before | 25,171.0 / 26,544.2 | 63,474.4 / 64,780.4 | 132.67 / 131.54 | 216.34 / 216.57 |
+|  |  | current | 2,587.4 / 2,710.8 | 2,724.3 / 2,851.4 | 207.75 / 198.01 | 213.26 / 203.41 |
+| DeepSeek-V4.1-Flash, IQ1_M, host experts | 8 | before | 2,518.5 | 4,519.5 | 72.21 | 83.17 |
+|  |  | current | 2,746.9 | 2,747.9 | 76.10 | 84.09 |
+|  | 64 | before | 19,640.3 | 54,196.8 | 116.62 | 149.15 |
+|  |  | current | 5,813.1 | 6,187.2 | 166.69 | 176.57 |
+
+A shared pass gives all its prompts their first tokens together: DeepSeek-V4.1's eight first
+tokens came after one 2.7 s pass, later than the median of eight passes one after another and
+1.8 s before the last of them.
+
+Steady decode is the same code in both builds; its window differs. Before, the last prompts
+prefilled while the first requests decoded, so the window began late and, at 64 requests, without
+the prefill rounds the earlier tok/s figures include. With host experts the device cache then held
+the replies' experts when all 64 decoded: 63-68% of the routes hit it. Current starts all 64 replies
+within 3 s of a cache that the prompts' routes placed: it decoded 320 tok/s for the first 5 s
+(72% hits), fell to 179-192 tok/s while the cache traded the prompts' experts for the replies'
+(48-58% hits, 25-60 s into the load) and recovered to 205 tok/s (62%); the whole load took 78.9 and
+82.7 s against 123.5 and 124.6 s.
+
 ## Flint
 
 Recursive's Flint from Unsloth's

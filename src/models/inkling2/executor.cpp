@@ -2141,6 +2141,13 @@ struct Executor::Impl {
 
     // ---- The forward pass ------------------------------------------------------------------------
 
+    // One sequence's rows of a shared prompt pass (forward_pieces): its first row in the call, its
+    // rows and its first position.
+    struct CallPiece {
+        std::uint32_t sequence = 0;
+        int row = 0, t = 0, first = 0;
+    };
+
     // A call's rows and the buffers that live across its visits.
     struct Call {
         int t     = 0;
@@ -2177,6 +2184,8 @@ struct Executor::Impl {
         float* split = nullptr;
         bool guess   = false; // a decode call that reads its visits' guessed experts ahead
         bool guessed = false; // the guess stream has work of this call to join
+        // A shared prompt pass: its pieces, in row order (empty: a call of one sequence).
+        std::vector<CallPiece> pieces;
     };
 
     [[nodiscard]] const void* input_q(const Call& c, int i) const {
@@ -2412,6 +2421,43 @@ struct Executor::Impl {
         return h;
     }
 
+    // A shared pass's piece as a prompt chunk of its own sequence: its rows' slice of the call's
+    // planes (which keep the call's stride), its positions and its rows' history.
+    [[nodiscard]] Call piece_call(const Call& c, const CallPiece& pc) const {
+        Call p;
+        p.t        = pc.t;
+        p.chunk    = true;
+        p.sequence = pc.sequence;
+        p.first    = pc.first;
+        p.kept     = pc.t;
+        p.rows           = c.rows;
+        p.rows.positions = c.rows.positions + pc.row;
+        p.rows.sequences = nullptr;
+        p.rows.sequence  = int(pc.sequence);
+        p.rows.tokens    = pc.t;
+        p.rows.chunk     = true;
+        p.rows.first     = pc.first;
+        p.rows.shared    = 0;
+        p.rows.starts    = nullptr;
+        p.plane          = c.plane;
+        const std::int64_t at = std::int64_t(pc.row) * hidden;
+        const auto slice = [at](auto* base) { return base != nullptr ? base + at : nullptr; };
+        p.states = c.states;
+        for (float*& buffer : p.states.buffers) { buffer = slice(buffer); }
+        p.distinct   = c.distinct;
+        p.in_bf16    = slice(c.in_bf16);
+        p.in_f32     = slice(c.in_f32);
+        p.raw        = slice(c.raw);
+        p.messages   = slice(c.messages);
+        p.ffn_bf16   = slice(c.ffn_bf16);
+        p.ffn_f32    = slice(c.ffn_f32);
+        p.ffn_raw    = slice(c.ffn_raw);
+        p.spark_taps = slice(c.spark_taps);
+        p.spark_rows = pc.t;
+        p.split      = c.split;
+        return p;
+    }
+
     void visit(Call& c, std::size_t v) {
         const VisitPlan& vp = visits[v];
         const LayerPlan& lp = layers[vp.layer];
@@ -2521,32 +2567,15 @@ struct Executor::Impl {
         }
         auto* q = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 4).data);
         auto* r = static_cast<float*>(workspace->alloc_bytes(std::size_t(t) * query_heads * rel * 4).data);
-        kernels::QueryArgs qa;
-        qa.qgr             = qgr;
-        qa.stride          = lp.query_rows;
-        qa.relative        = relative;
-        qa.relative_stride = relative_stride;
-        qa.tokens          = t;
-        qa.heads           = query_heads;
-        qa.query_clip      = lp.query_clip;
-        qa.relative_clip   = lp.relative_clip;
-        qa.qk_clip         = config.qk_clip;
-        qa.rel_clip        = config.relative_clip;
-        qa.log_scale       = lp.full;
-        qa.alpha           = config.log_scale_alpha;
-        qa.floor           = float(config.log_scale_floor);
-        qa.positions       = c.rows.positions;
-        qa.q_out           = q;
-        qa.r_out           = r;
         // K and V into the cache, in the launch that also writes Q: a prompt chunk's sliding visit
         // attends over the staging ring (the window before the chunk comes over from the
         // sequence's ring, the chunk's keys land there, and the window that ends the chunk's kept
         // rows goes back). A full visit of an mxfp8 run encodes its rows into its planes there;
         // one of rk8v4 or rk4v4 stages them as F16 (one slot per row) for kv_store to encode.
-        // The caches are the visit's own, or (--loop-kv) the core's last pass's (`kvp`).
+        // The caches are the visit's own, or (--loop-kv) the core's last pass's (`kvp`). A shared
+        // pass runs this, and the attention, piece by piece, each over its own sequence.
         const VisitPlan& kvp = vp.store >= 0 ? visits[std::size_t(vp.store)] : vp;
         const std::int64_t stage_stride = std::int64_t(prefill_ring) * kD;
-        const std::int64_t seq_offset   = std::int64_t(c.sequence) * kvp.seq_stride;
         const bool staging   = c.chunk && !vp.full;
         const bool quantized = vp.full && kvfmt.quantized();
         KvPlaneView k_view, v_view; // a quantized full visit's planes, else null codings
@@ -2567,78 +2596,23 @@ struct Executor::Impl {
             k_view = view(kvp.k_codes, kvp.k_scales, kvfmt.key.coding);
             v_view = view(kvp.v_codes, kvp.v_scales, kvfmt.value.coding);
         }
-        kernels::RingCopyArgs keep;
-        keep.kv_heads = kv_heads;
-        kernels::KvArgs ka;
-        ka.rows        = c.rows;
-        ka.kv          = kv;
-        ka.kv_stride   = 2 * kvd;
-        ka.k_taps      = taps;
-        ka.v_taps      = taps != nullptr ? taps + kv_heads * kTaps : nullptr;
-        ka.taps_stride = tap_columns;
-        ka.k_conv      = lp.key_conv;
-        ka.v_conv      = lp.value_conv;
-        ka.k_history   = site(v, 0);
-        ka.v_history   = site(v, kvd);
-        ka.keep        = c.keep;
-        ka.kv_heads    = kv_heads;
-        ka.qk_clip     = config.qk_clip;
-        ka.eps         = eps;
-        if (quantized && kvfmt.mxfp8()) {
-            ka.k_plane = k_view;
-            ka.v_plane = v_view;
-        } else if (quantized) {
-            auto* stage = static_cast<__half*>(workspace->alloc_bytes(std::size_t(t) * 2 * kvd * 2).data);
-            ka.k_cache     = stage;
-            ka.v_cache     = stage + std::size_t(t) * kvd;
-            ka.seq_stride  = 0;
-            ka.head_stride = std::int64_t(t) * kD;
-            ka.ring        = 0;
-            ka.row_slots   = true;
-        } else if (staging) {
-            keep.src_k           = static_cast<const __half*>(kvp.k.p) + seq_offset;
-            keep.src_v           = static_cast<const __half*>(kvp.v.p) + seq_offset;
-            keep.dst_k           = static_cast<__half*>(staging_k.p);
-            keep.dst_v           = static_cast<__half*>(staging_v.p);
-            keep.src_head_stride = kvp.head_stride;
-            keep.dst_head_stride = stage_stride;
-            keep.src_ring        = kvp.ring;
-            keep.dst_ring        = prefill_ring;
-            keep.begin           = std::max(0, c.first - window);
-            keep.end             = c.first;
-            kernels::ring_copy(keep, stream);
-            ka.k_cache     = static_cast<__half*>(staging_k.p);
-            ka.v_cache     = static_cast<__half*>(staging_v.p);
-            ka.seq_stride  = 0;
-            ka.head_stride = stage_stride;
-            ka.ring        = prefill_ring;
+        // The pieces of a shared pass, else the call itself (row 0).
+        std::vector<std::pair<Call, int>> parts;
+        if (c.pieces.empty()) {
+            parts.emplace_back(c, 0);
         } else {
-            ka.k_cache     = static_cast<__half*>(kvp.k.p);
-            ka.v_cache     = static_cast<__half*>(kvp.v.p);
-            ka.seq_stride  = kvp.seq_stride;
-            ka.head_stride = kvp.head_stride;
-            ka.ring        = kvp.ring;
+            for (const CallPiece& pc : c.pieces) { parts.emplace_back(piece_call(c, pc), pc.row); }
         }
-        kernels::attention_inputs(qa, ka, stream);
-        if (quantized && kvfmt.staged()) {
-            kernels::KvStoreArgs stores[2];
-            const __half* srcs[2] = {ka.k_cache, ka.v_cache};
-            const KvPlaneView* planes[2] = {&k_view, &v_view};
-            for (int i = 0; i < 2; ++i) {
-                stores[i].rows            = c.rows;
-                stores[i].src             = srcs[i];
-                stores[i].src_head_stride = std::int64_t(t) * kD;
-                stores[i].rows_count      = t;
-                stores[i].heads           = kv_heads;
-                stores[i].dst             = *planes[i];
-            }
-            kernels::kv_store_pair(stores[0], stores[1], stream);
+        int widest = 0;
+        for (const auto& [part, row] : parts) { widest = std::max(widest, part.t); }
+        // A quantized visit's F16 staging of rk8v4 or rk4v4 (one slot per row of a part), and a
+        // full visit's far-field states once a part needs them, for the widest part.
+        __half* kv_stage = nullptr;
+        if (quantized && !kvfmt.mxfp8()) {
+            kv_stage = static_cast<__half*>(
+                workspace->alloc_bytes(std::size_t(widest) * 2 * kvd * 2).data);
         }
-        if (c.chunk) {
-            const auto [begin, end] = kept_history(c);
-            kernels::keep_history(kv, 2 * kvd, 2 * kvd, c.rows.positions, begin, end, site(v, 0),
-                                  int(c.sequence), stream);
-        }
+        float* far = nullptr;
         // Attention.
         __nv_bfloat16* attn = nullptr;
         Q8Act attn_q;
@@ -2647,12 +2621,102 @@ struct Executor::Impl {
         } else {
             attn = static_cast<__nv_bfloat16*>(workspace->alloc_bytes(std::size_t(t) * q_floats * 2).data);
         }
-        {
+        for (const auto& [part, row] : parts) {
+            const int pt = part.t;
+            kernels::QueryArgs qa;
+            qa.qgr             = qgr + std::int64_t(row) * lp.query_rows;
+            qa.stride          = lp.query_rows;
+            qa.relative        = relative + std::int64_t(row) * relative_stride;
+            qa.relative_stride = relative_stride;
+            qa.tokens          = pt;
+            qa.heads           = query_heads;
+            qa.query_clip      = lp.query_clip;
+            qa.relative_clip   = lp.relative_clip;
+            qa.qk_clip         = config.qk_clip;
+            qa.rel_clip        = config.relative_clip;
+            qa.log_scale       = lp.full;
+            qa.alpha           = config.log_scale_alpha;
+            qa.floor           = float(config.log_scale_floor);
+            qa.positions       = part.rows.positions;
+            qa.q_out           = q + std::int64_t(row) * q_floats;
+            qa.r_out           = r + std::int64_t(row) * query_heads * rel;
+            const std::int64_t seq_offset = std::int64_t(part.sequence) * kvp.seq_stride;
+            kernels::RingCopyArgs keep;
+            keep.kv_heads = kv_heads;
+            kernels::KvArgs ka;
+            ka.rows        = part.rows;
+            ka.kv          = kv + std::int64_t(row) * 2 * kvd;
+            ka.kv_stride   = 2 * kvd;
+            ka.k_taps      = taps != nullptr ? taps + std::int64_t(row) * tap_columns : nullptr;
+            ka.v_taps      = taps != nullptr ? ka.k_taps + kv_heads * kTaps : nullptr;
+            ka.taps_stride = tap_columns;
+            ka.k_conv      = lp.key_conv;
+            ka.v_conv      = lp.value_conv;
+            ka.k_history   = site(v, 0);
+            ka.v_history   = site(v, kvd);
+            ka.keep        = part.keep;
+            ka.kv_heads    = kv_heads;
+            ka.qk_clip     = config.qk_clip;
+            ka.eps         = eps;
+            if (quantized && kvfmt.mxfp8()) {
+                ka.k_plane = k_view;
+                ka.v_plane = v_view;
+            } else if (quantized) {
+                ka.k_cache     = kv_stage;
+                ka.v_cache     = kv_stage + std::size_t(pt) * kvd;
+                ka.seq_stride  = 0;
+                ka.head_stride = std::int64_t(pt) * kD;
+                ka.ring        = 0;
+                ka.row_slots   = true;
+            } else if (staging) {
+                keep.src_k           = static_cast<const __half*>(kvp.k.p) + seq_offset;
+                keep.src_v           = static_cast<const __half*>(kvp.v.p) + seq_offset;
+                keep.dst_k           = static_cast<__half*>(staging_k.p);
+                keep.dst_v           = static_cast<__half*>(staging_v.p);
+                keep.src_head_stride = kvp.head_stride;
+                keep.dst_head_stride = stage_stride;
+                keep.src_ring        = kvp.ring;
+                keep.dst_ring        = prefill_ring;
+                keep.begin           = std::max(0, part.first - window);
+                keep.end             = part.first;
+                kernels::ring_copy(keep, stream);
+                ka.k_cache     = static_cast<__half*>(staging_k.p);
+                ka.v_cache     = static_cast<__half*>(staging_v.p);
+                ka.seq_stride  = 0;
+                ka.head_stride = stage_stride;
+                ka.ring        = prefill_ring;
+            } else {
+                ka.k_cache     = static_cast<__half*>(kvp.k.p);
+                ka.v_cache     = static_cast<__half*>(kvp.v.p);
+                ka.seq_stride  = kvp.seq_stride;
+                ka.head_stride = kvp.head_stride;
+                ka.ring        = kvp.ring;
+            }
+            kernels::attention_inputs(qa, ka, stream);
+            if (quantized && kvfmt.staged()) {
+                kernels::KvStoreArgs stores[2];
+                const __half* srcs[2] = {ka.k_cache, ka.v_cache};
+                const KvPlaneView* planes[2] = {&k_view, &v_view};
+                for (int i = 0; i < 2; ++i) {
+                    stores[i].rows            = part.rows;
+                    stores[i].src             = srcs[i];
+                    stores[i].src_head_stride = std::int64_t(pt) * kD;
+                    stores[i].rows_count      = pt;
+                    stores[i].heads           = kv_heads;
+                    stores[i].dst             = *planes[i];
+                }
+                kernels::kv_store_pair(stores[0], stores[1], stream);
+            }
+            if (part.chunk) {
+                const auto [begin, end] = kept_history(part);
+                kernels::keep_history(ka.kv, 2 * kvd, 2 * kvd, part.rows.positions, begin, end,
+                                      site(v, 0), int(part.sequence), stream);
+            }
             kernels::AttentionArgs aa;
-            aa.rows        = c.rows;
-            aa.q           = q;
-            aa.r           = r;
-            aa.sinks       = sinks;
+            aa.rows        = part.rows;
+            aa.q           = qa.q_out;
+            aa.r           = qa.r_out;
+            aa.sinks       = sinks + std::int64_t(row) * query_heads;
             aa.sink_stride = query_heads;
             aa.table       = lp.distances;
             aa.extent      = int(lp.full ? config.relative_extent : config.sliding_window);
@@ -2667,43 +2731,46 @@ struct Executor::Impl {
             aa.query_heads = query_heads;
             aa.kv_heads    = kv_heads;
             aa.scale       = 1.0f / std::sqrt(float(kD));
-            aa.splits      = c.chunk ? 1 : (lp.full ? decode_splits_full : decode_splits_sliding);
+            aa.splits      = part.chunk ? 1 : (lp.full ? decode_splits_full : decode_splits_sliding);
             // A prompt chunk far enough into a full visit runs its far field on tensor cores.
-            if (c.chunk && lp.full && ka.ring == 0 &&
-                c.first > int(config.relative_extent)) {
-                aa.far = static_cast<float*>(workspace->alloc_bytes(
-                    kernels::attention_workspace_floats(t, query_heads, 1) * 4).data);
+            if (part.chunk && lp.full && ka.ring == 0 &&
+                part.first > int(config.relative_extent)) {
+                if (far == nullptr) {
+                    far = static_cast<float*>(workspace->alloc_bytes(
+                        kernels::attention_workspace_floats(widest, query_heads, 1) * 4).data);
+                }
+                aa.far = far;
             }
-            if (!c.chunk && lp.full && ka.ring == 0 && c.row_group > 1) {
+            if (!part.chunk && lp.full && ka.ring == 0 && part.row_group > 1) {
                 // The groups: at most ceil(t / row_group), one more for each further sequence.
-                aa.row_group  = c.row_group;
-                aa.row_groups = std::min(t, (t + c.row_group - 1) / c.row_group +
-                                                std::min(t, int(options.sequences)) - 1);
+                aa.row_group  = part.row_group;
+                aa.row_groups = std::min(pt, (pt + part.row_group - 1) / part.row_group +
+                                                 std::min(pt, int(options.sequences)) - 1);
             }
-            if (!c.chunk && aa.splits > 1) {
+            if (!part.chunk && aa.splits > 1) {
                 aa.partial = static_cast<float*>(workspace->alloc_bytes(
-                    kernels::attention_workspace_floats(t, query_heads, aa.splits) * 4).data);
+                    kernels::attention_workspace_floats(pt, query_heads, aa.splits) * 4).data);
             }
-            aa.gate        = qgr + q_floats;
+            aa.gate        = qgr + std::int64_t(row) * lp.query_rows + q_floats;
             aa.gate_stride = lp.query_rows;
-            aa.out         = attn;
+            aa.out         = attn != nullptr ? attn + std::int64_t(row) * q_floats : nullptr;
             aa.out_q       = attn_q.rows;
             kernels::attention(aa, stream);
-        }
-        // A ring another pass shares takes back only the last pass's window: an earlier pass's
-        // rows past position `first + kept - ring` would land in the slots of the window before
-        // the chunk, which the next pass still copies in.
-        if (staging && c.kept > 0 && vp.store < 0) {
-            kernels::RingCopyArgs back = keep;
-            std::swap(back.src_head_stride, back.dst_head_stride);
-            std::swap(back.src_ring, back.dst_ring);
-            back.src_k = static_cast<const __half*>(staging_k.p);
-            back.src_v = static_cast<const __half*>(staging_v.p);
-            back.dst_k = static_cast<__half*>(kvp.k.p) + seq_offset;
-            back.dst_v = static_cast<__half*>(kvp.v.p) + seq_offset;
-            back.begin = std::max(0, c.first + c.kept - window);
-            back.end   = c.first + c.kept;
-            kernels::ring_copy(back, stream);
+            // A ring another pass shares takes back only the last pass's window: an earlier
+            // pass's rows past position `first + kept - ring` would land in the slots of the
+            // window before the chunk, which the next pass still copies in.
+            if (staging && part.kept > 0 && vp.store < 0) {
+                kernels::RingCopyArgs back = keep;
+                std::swap(back.src_head_stride, back.dst_head_stride);
+                std::swap(back.src_ring, back.dst_ring);
+                back.src_k = static_cast<const __half*>(staging_k.p);
+                back.src_v = static_cast<const __half*>(staging_v.p);
+                back.dst_k = static_cast<__half*>(kvp.k.p) + seq_offset;
+                back.dst_v = static_cast<__half*>(kvp.v.p) + seq_offset;
+                back.begin = std::max(0, part.first + part.kept - window);
+                back.end   = part.first + part.kept;
+                kernels::ring_copy(back, stream);
+            }
         }
         auto* y = static_cast<float*>(workspace->alloc_bytes(std::size_t(c.plane) * 4).data);
         product(lp.output, c.q8 ? attn_q.base : nullptr, attn, t, y, hidden);
@@ -2723,11 +2790,7 @@ struct Executor::Impl {
             ra.cur     = s.buffers[s.cur];
             ra.hidden  = hidden;
             ra.mix     = ffn_mix(c, v);
-            kernels::residual(ra, stream);
-            if (c.chunk) {
-                const auto [begin, end] = kept_history(c);
-                kernels::keep_products(ra, begin, end, stream);
-            }
+            piece_residual(c, ra, y);
         }
         if (vp.control) {
             control(c, lp, 1, {c.ffn_raw, nullptr, nullptr}, {c.messages + 3 * c.plane, nullptr, nullptr},
@@ -2752,11 +2815,40 @@ struct Executor::Impl {
             ra.mix         = attention_mix(c, v + 1);
             c.inputs_ready = true;
         }
-        kernels::residual(ra, stream);
-        if (c.chunk) {
-            const auto [begin, end] = kept_history(c);
-            kernels::keep_products(ra, begin, end, stream);
+        piece_residual(c, ra, nullptr);
+    }
+
+    // A residual update of call c (ra.y the product, else ra's MoE output) and the mix ra carries:
+    // in one launch, its prompt chunk's history kept after it; for a shared pass, each piece's
+    // update over its own sequence's history, then the mix over every row.
+    void piece_residual(const Call& c, kernels::ResidualArgs& ra, const float* y) {
+        if (c.pieces.empty()) {
+            kernels::residual(ra, stream);
+            if (c.chunk) {
+                const auto [begin, end] = kept_history(c);
+                kernels::keep_products(ra, begin, end, stream);
+            }
+            return;
         }
+        const int k = ra.top_k;
+        for (const CallPiece& pc : c.pieces) {
+            const Call part          = piece_call(c, pc);
+            const std::int64_t at    = std::int64_t(pc.row) * hidden;
+            kernels::ResidualArgs pa = ra;
+            pa.rows                  = part.rows;
+            pa.y                     = y != nullptr ? y + at : nullptr;
+            pa.fixed                 = ra.fixed != nullptr ? ra.fixed + at : nullptr;
+            pa.moe_rows    = ra.moe_rows != nullptr ? ra.moe_rows + at * k : nullptr;
+            pa.moe_weights = ra.moe_weights != nullptr ? ra.moe_weights + std::int64_t(pc.row) * k
+                                                       : nullptr;
+            pa.cur         = ra.cur + at;
+            pa.mix         = kernels::MixArgs{};
+            pa.mix.split   = ra.mix.split;
+            kernels::residual(pa, stream);
+            const auto [begin, end] = kept_history(part);
+            kernels::keep_products(pa, begin, end, stream);
+        }
+        if (ra.mix.query_count > 0) { kernels::mix(ra.mix, stream); }
     }
 
     // Whether visit v of call c reads its guessed experts ahead.
@@ -3129,6 +3221,84 @@ struct Executor::Impl {
         ring_floor[sequence] = first + std::uint32_t(t);
     }
 
+    void forward_pieces(std::span<const PromptPiece> in) {
+        if (in.empty() || in.size() > options.sequences) {
+            throw std::invalid_argument("inkling2 forward_pieces: invalid call");
+        }
+        if (spine) {
+            throw std::logic_error(
+                "inkling2 forward_pieces: a DSpine or DFlash2 drafter's pass is one sequence's");
+        }
+        std::vector<CallPiece> pieces;
+        std::vector<std::int32_t> tokens, pos;
+        std::vector<char> seen(options.sequences, 0);
+        for (const PromptPiece& piece : in) {
+            if (piece.sequence >= options.sequences || seen[piece.sequence] != 0 ||
+                piece.tokens.empty()) {
+                throw std::invalid_argument("inkling2 forward_pieces: invalid piece");
+            }
+            seen[piece.sequence] = 1;
+            const std::uint32_t first = positions[piece.sequence];
+            if (first + piece.tokens.size() > options.max_context) {
+                throw std::invalid_argument("inkling2 forward: context capacity exceeded");
+            }
+            pieces.push_back(CallPiece{.sequence = piece.sequence,
+                                       .row      = int(tokens.size()),
+                                       .t        = int(piece.tokens.size()),
+                                       .first    = int(first)});
+            tokens.insert(tokens.end(), piece.tokens.begin(), piece.tokens.end());
+            for (std::size_t i = 0; i < piece.tokens.size(); ++i) {
+                pos.push_back(std::int32_t(first + i));
+            }
+        }
+        if (tokens.size() > options.prefill_chunk) {
+            throw std::invalid_argument("inkling2 forward_pieces: more tokens than a prompt chunk");
+        }
+        for (const CallPiece& pc : pieces) {
+            back(pc.sequence, std::uint32_t(pc.first + pc.t));
+        }
+        const int t = int(tokens.size());
+        stage(tokens, pos, {});
+        workspace->reset();
+        auto scope = workspace->scope();
+        Call c;
+        c.t        = t;
+        c.q8       = false; // a piece's rows gather from the BF16 final rows
+        c.chunk    = true;
+        c.sequence = pieces.front().sequence;
+        c.first    = pieces.front().first;
+        c.kept     = t;
+        c.rows.positions = static_cast<const std::int32_t*>(d_positions.p);
+        c.rows.sequence  = int(c.sequence);
+        c.rows.tokens    = t;
+        c.rows.chunk     = true;
+        c.rows.first     = c.first;
+        c.plane          = std::int64_t(t) * hidden;
+        c.spark_rows     = t;
+        c.pieces         = pieces;
+        run_with_taps(c, {}, 0, 0);
+        // Each logit piece's last row to the front, in piece order; a piece's last row lies at or
+        // past its index, so no copy overwrites a later one's source.
+        auto* rows = c.ffn_bf16;
+        int column = 0;
+        for (std::size_t i = 0; i < pieces.size(); ++i) {
+            if (!in[i].logits) { continue; }
+            const int row = pieces[i].row + pieces[i].t - 1;
+            if (row != column) {
+                CUDA_CHECK(cudaMemcpyAsync(rows + std::int64_t(column) * hidden,
+                                           rows + std::int64_t(row) * hidden,
+                                           std::size_t(hidden) * 2, cudaMemcpyDeviceToDevice,
+                                           stream));
+            }
+            ++column;
+        }
+        if (column > 0) { head_logits(rows, column, 0); }
+        for (const CallPiece& pc : pieces) {
+            positions[pc.sequence]  = std::uint32_t(pc.first + pc.t);
+            ring_floor[pc.sequence] = std::uint32_t(pc.first + pc.t);
+        }
+    }
+
     // run() with the DSpine drafter's taps of rows [tap_first, tap_first + tap_rows): each
     // visit's output state.
     void run_with_taps(Call& c, std::span<const ImageRows> images, int tap_first, int tap_rows) {
@@ -3182,7 +3352,11 @@ struct Executor::Impl {
             CUDA_CHECK(cudaEventRecord(guess_done, guess_stream));
             CUDA_CHECK(cudaStreamWaitEvent(stream, guess_done, 0));
         }
-        if (spark) { spark_inject(c); }
+        if (spark && c.pieces.empty()) {
+            spark_inject(c);
+        } else if (spark) {
+            for (const CallPiece& pc : c.pieces) { spark_inject(piece_call(c, pc)); }
+        }
         if (spine) { store_tap(spine_final_tap, c.ffn_f32, tap_first, tap_rows); }
     }
 
@@ -3700,6 +3874,10 @@ void Executor::forward(std::uint32_t sequence, std::span<const std::int32_t> tok
                        std::uint32_t logit_rows, std::span<const ImageRows> images) {
     impl_->forward(sequence, tokens, logit_rows, {}, 0, images);
 }
+
+void Executor::forward_pieces(std::span<const PromptPiece> pieces) { impl_->forward_pieces(pieces); }
+
+bool Executor::shares_prompt_passes() const noexcept { return !impl_->spine; }
 
 void Executor::forward_branches(std::uint32_t sequence, std::span<const std::int32_t> tokens,
                                 std::span<const std::uint32_t> lengths) {
