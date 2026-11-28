@@ -151,7 +151,13 @@ using SmallScheduleR16C32   = T2SmallTI8Schedule<8, 1, 4, 2, 3, 2>;
 using SmallScheduleR32C16K8 = T2SmallTI8Schedule<8, 2, 2, 2, 4, 2>;
 // One pass over the weights for 33 to 64 columns (a decode round of that many requests) where a
 // profile names one; the compiled route launches 32 columns at a time, which measured 2.5-6.9%
-// faster on the RTX 3090 at 40-64 columns than r32c64 in Ternary Bonsai 2's decode.
+// faster on the RTX 3090 at 40-64 columns than r32c64 in Ternary Bonsai 2's decode. A 40-, 48- or
+// 56-column launch reads the weights once for a round of up to that many requests where the
+// compiled route reads them twice: 32 columns and the rest. They split K as the 32-column
+// schedule does, so their columns' sums are its bits.
+using SmallScheduleR32C40   = T2SmallTI8Schedule<4, 1, 5, 2, 3, 2>;
+using SmallScheduleR32C48   = T2SmallTI8Schedule<4, 1, 6, 2, 2, 2>;
+using SmallScheduleR32C56   = T2SmallTI8Schedule<4, 1, 7, 2, 2, 2>;
 using SmallScheduleR32C64   = T2SmallTI8Schedule<4, 1, 8, 2, 2, 2>;
 using SmallScheduleR32C64W1 = T2SmallTI8Schedule<4, 1, 8, 2, 2, 1>;
 using SmallScheduleR16C64W1 = T2SmallTI8Schedule<8, 1, 8, 2, 2, 1>;
@@ -181,6 +187,9 @@ bool small_named(std::string_view schedule, const T2A8Activations& x, SmallColum
     if (schedule == "r32c16") { return take.template operator()<SmallScheduleR32C16>(); }
     if (schedule == "r16c32") { return take.template operator()<SmallScheduleR16C32>(); }
     if (schedule == "r32c16k8") { return take.template operator()<SmallScheduleR32C16K8>(); }
+    if (schedule == "r32c40") { return take.template operator()<SmallScheduleR32C40>(); }
+    if (schedule == "r32c48") { return take.template operator()<SmallScheduleR32C48>(); }
+    if (schedule == "r32c56") { return take.template operator()<SmallScheduleR32C56>(); }
     if (schedule == "r32c64") { return take.template operator()<SmallScheduleR32C64>(); }
     if (schedule == "r32c64w1") { return take.template operator()<SmallScheduleR32C64W1>(); }
     if (schedule == "r16c64w1") { return take.template operator()<SmallScheduleR16C64W1>(); }

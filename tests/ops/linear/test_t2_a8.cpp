@@ -44,12 +44,14 @@ int t2_a8_conformance() {
     return failures;
 }
 
-// The 64-column small-T schedules a device profile may name for 33..64 columns, forced on the
-// shapes Ternary Bonsai 2 runs, against the same oracle.
+// The 40- to 64-column small-T schedules a device profile may name for 33..64 columns, forced on
+// the shapes Ternary Bonsai 2 runs, against the same oracle; a width past a schedule's columns
+// takes the compiled launches.
 int t2_a8_wide_schedules() {
     int failures = 0;
-    constexpr std::array kWidths{a8(24), a8(33), a8(40), a8(48), a8(57), a8(64), a8(65), a8(100)};
-    for (const char* schedule : {"r32c64", "r32c64w1", "r16c64w1"}) {
+    constexpr std::array kWidths{a8(24), a8(33), a8(40), a8(41), a8(48), a8(49), a8(56),
+                                 a8(57), a8(64), a8(65), a8(100)};
+    for (const char* schedule : {"r32c40", "r32c48", "r32c56", "r32c64", "r32c64w1", "r16c64w1"}) {
         const std::string name = std::string("T2_A8 ") + schedule;
         {
             const ops::DeviceRouteForce force("t2_i8_small/34816x5120", schedule);

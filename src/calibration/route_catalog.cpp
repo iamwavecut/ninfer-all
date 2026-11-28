@@ -63,7 +63,8 @@ std::vector<RouteCatalogEntry> build_catalog(ops::DeviceTier tier) {
         // the small-T kernel against the prefill GEMM per width.
         const std::vector<std::string> t2_small = {
             "r16c8",  "r16c16", "r32c32",   "r16c8w1",  "r16c8s3",  "r32c8",  "r32c8k4",
-            "r16c16w1", "r32c16", "r16c32", "r32c16k8", "r32c64", "r32c64w1", "r16c64w1"};
+            "r16c16w1", "r32c16", "r16c32", "r32c16k8", "r32c40", "r32c48", "r32c56",
+            "r32c64", "r32c64w1", "r16c64w1"};
         for (const char* shape : {"4096+12288x5120", "7168+7168x5120", "5120x6144", "34816x5120",
                                   "5120x17408", "248320x5120"}) {
             add(std::string("t2_i8_small/") + shape, t2_small);
