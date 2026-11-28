@@ -3105,9 +3105,9 @@ receive request IDs.
 
 By default the server persistently reports aggregate activity every five seconds. `prefill` counts
 prompt suffix tokens actually computed during the interval, excluding prefix-cache hits, as each
-Engine step ends. Qwen3.8-Flash-Next with experts off the GPU computes a span of up to 16 prompt
-chunks layer by layer in one step, and counts each layer's share of the span's tokens as the layer
-is queued, so the intervals inside a span show its rate; `decode`
+Engine step ends. Qwen3.8-Flash-Next on one GPU computes a span of up to 16 prompt chunks (eight
+with device experts) layer by layer in one step, and counts each layer's share of the span's tokens
+as the layer is queued, so the intervals inside a span show its rate; `decode`
 counts tokens finally committed by decode rounds, excluding the first token produced by prefill.
 For MTP, DFlash and DFlash2 this is the accepted committed output, not draft or rejected tokens.
 Pretty `batch` and JSONL `average_size` are decode row-rounds divided by decode rounds during the

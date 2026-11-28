@@ -1211,6 +1211,10 @@ struct Executor::Impl {
     // group_workspace_from on) is a cache slot between prompts, as the span's stack is.
     static constexpr std::uint32_t kGroupTokens = 6144;
     static constexpr std::size_t kGroupShare    = 4;
+    // Device experts: the memory a span leaves free at least (allocate_device_span), and the
+    // workspace of a group's expert call, beside the rank's.
+    static constexpr std::size_t kDeviceSpanReserve = 1ULL << 30;
+    std::unique_ptr<DeviceArena> group_arena;
     std::uint32_t span_group = 1;
     std::size_t start_free_bytes                = 0;
     std::size_t group_workspace_from            = 0;
@@ -1375,6 +1379,7 @@ struct Executor::Impl {
         if (verify_width > 0) { allocate_speculation(); }
         allocate_span();
         if (dflash2_operands || (verify_width > 0 && options.dspine)) { allocate_drafter(); }
+        allocate_device_span();
         allocate_cache();
         require_wide_route();
         memory.streamed_kv = stream_slots != 0;
@@ -5387,17 +5392,20 @@ struct Executor::Impl {
         }
     }
 
-    // The tokens a prompt span takes, 0 without spans. Spans need one device and GGUF experts off
-    // the GPU: a host layer's wide calls copy every uncached expert of the layer into the pool,
+    // The tokens a prompt span takes, 0 without spans. Spans need one device and GGUF or latent
+    // experts: a host layer's wide calls copy every uncached expert of the layer into the pool,
     // and a disk layer's read the ones its slots lack, which the chunks before them in the span
-    // left there; per span instead of per chunk.
+    // left there; per span instead of per chunk. Device experts run a span's consecutive chunks
+    // in one expert call (device_groups), so that several prompts read the layer's experts once;
+    // their span is the widest that the memory left beside the caches holds
+    // (allocate_device_span), which may be none.
     [[nodiscard]] std::uint32_t planned_span_tokens() const {
         const bool native = std::any_of(layers.begin(), layers.end(),
                                         [](const LayerPlan& plan) { return plan.moe.native.has_value(); });
         // One device: its segments split only where the PLE layer's rows arrive.
         const bool one_rank = std::all_of(segments.begin(), segments.end(),
                                           [](const Segment& segment) { return segment.rank == 0; });
-        if (model.options().experts == ExpertResidency::Device || native || !one_rank) { return 0; }
+        if (native || !one_rank) { return 0; }
         const std::uint32_t tokens =
             std::min<std::uint32_t>(options.max_context, span_chunks * options.prefill_chunk);
         return tokens > options.prefill_chunk ? tokens : 0;
@@ -5414,7 +5422,7 @@ struct Executor::Impl {
         }
         const std::uint64_t further =
             std::uint64_t(kLoneSpanChunks - kSpanChunks) * options.prefill_chunk;
-        if (options.sequences != 1 ||
+        if (options.sequences != 1 || device_groups() ||
             options.max_context <= kSpanChunks * options.prefill_chunk) {
             return;
         }
@@ -5445,6 +5453,12 @@ struct Executor::Impl {
         return least;
     }
 
+    // Whether a span's expert groups run over device banks: any run of consecutive chunks wider
+    // than the decode form, up to the whole span, takes one expert call (group_end).
+    [[nodiscard]] bool device_groups() const {
+        return model.options().experts == ExpertResidency::Device;
+    }
+
     // The most tokens a group of `chunks` chunks holds: a span holds no more than its planes do.
     [[nodiscard]] std::uint32_t group_tokens(std::uint32_t chunks) const {
         return std::min(chunks * options.prefill_chunk, planned_span_tokens());
@@ -5465,9 +5479,57 @@ struct Executor::Impl {
                               : 0;
     }
 
+    // Host and disk experts' span, sized before the expert cache takes the memory left.
     void allocate_span() {
         const std::uint32_t tokens = planned_span_tokens();
-        if (tokens == 0) { return; }
+        if (tokens == 0 || device_groups()) { return; }
+        span_group = planned_group_chunks();
+        allocate_span_planes(tokens, span_group > 1 ? group_tokens(span_group) : 0);
+    }
+
+    // Device experts' span, once the caches and the drafter are in: the widest of kSpanChunks,
+    // half and a quarter as many chunks whose planes, group planes and expert-call workspace fit
+    // the memory free then, less kDeviceSpanReserve or a quarter of it (for the graphs and what
+    // the Engine allocates later). None fits: no span, and every prompt call runs alone as it did.
+    void allocate_device_span() {
+        const std::uint32_t planned = planned_span_tokens();
+        if (planned == 0 || !device_groups()) { return; }
+        RankBinding bind(device, 0);
+        std::size_t free = 0, total = 0;
+        CUDA_CHECK(cudaMemGetInfo(&free, &total));
+        const std::size_t reserve = std::max<std::size_t>(kDeviceSpanReserve, free / 4);
+        if (free <= reserve) { return; }
+        for (std::uint32_t chunks = span_chunks; chunks >= 2; chunks /= 2) {
+            const std::uint32_t tokens = std::min(chunks * options.prefill_chunk, planned);
+            if (tokens <= options.prefill_chunk) { return; }
+            const std::uint64_t call = gguf_experts() ? group_workspace(tokens) : 0;
+            if (span_plane_bytes(tokens, tokens) + call > free - reserve) { continue; }
+            allocate_span_planes(tokens, tokens);
+            if (call > 0) {
+                group_arena = std::make_unique<DeviceArena>(call);
+                memory.ranks[0].workspace_bytes += call;
+            }
+            return;
+        }
+    }
+
+    // The bytes allocate_span_planes() takes for a span of `tokens` and groups of `group`.
+    [[nodiscard]] std::uint64_t span_plane_bytes(std::uint32_t tokens, std::uint32_t group) const {
+        const std::uint64_t t = tokens;
+        std::uint64_t bytes   = t * (std::uint64_t(config.hc_count) * config.hidden_size * 4 + 4 +
+                                   4 + std::uint64_t(config.hidden_size) * 2 + config.hc_count * 4);
+        if (vision_context) { bytes += t * 3 * 4; }
+        if (table) {
+            bytes += t * config.ngram_heads() * ops::ngram_row_bytes(options.ngram->format);
+        }
+        bytes += std::uint64_t(group) *
+                 (2 * std::uint64_t(config.num_experts_per_tok) * 4 + 4 + config.hidden_size * 4);
+        return bytes;
+    }
+
+    // A span of `tokens`: its stacks, staged positions and n-gram rows, and with `group` > 0 the
+    // routes and output of an expert group of that many tokens.
+    void allocate_span_planes(std::uint32_t tokens, std::uint32_t group) {
         span_tokens       = tokens;
         const auto width  = std::size_t(config.hc_count) * config.hidden_size;
         RankBinding bind(device, 0);
@@ -5489,14 +5551,12 @@ struct Executor::Impl {
             span_host_rows = std::make_unique<PinnedHostBuffer>(span_rows.bytes);
             bytes += span_rows.bytes;
         }
-        span_group = planned_group_chunks();
-        if (span_group > 1) {
-            const std::size_t group = group_tokens(span_group);
-            const std::size_t pairs = group * config.num_experts_per_tok;
+        if (group > 0) {
+            const std::size_t pairs = std::size_t(group) * config.num_experts_per_tok;
             span_ids     = DeviceBuffer(pairs * 4);
             span_weights = DeviceBuffer(pairs * 4);
-            span_shared  = DeviceBuffer(group * 4);
-            span_y       = DeviceBuffer(group * config.hidden_size * 4);
+            span_shared  = DeviceBuffer(std::size_t(group) * 4);
+            span_y       = DeviceBuffer(std::size_t(group) * config.hidden_size * 4);
             bytes += span_ids.bytes + span_weights.bytes + span_shared.bytes + span_y.bytes;
         }
         memory.ranks[0].workspace_bytes += bytes;
@@ -5517,8 +5577,15 @@ struct Executor::Impl {
     // full pool and kPrefetchTokens or more, so that it runs from the layer's prefetched pool copy;
     // a narrow chunk (narrow_chunk) runs alone, as forward() runs it.
     [[nodiscard]] std::size_t group_end(std::span<const SpanChunk> chunks, std::size_t first) const {
-        if (span_group == 1 || slot_pools.empty() || slot_pools[0].slots < config.num_experts ||
-            narrow_chunk(chunks[first].count)) {
+        if (narrow_chunk(chunks[first].count)) { return first + 1; }
+        if (device_groups()) {
+            // Over device banks every row's products and fixed-point sums are those of its chunk
+            // alone, so a group takes any run of wider chunks the span holds.
+            std::size_t last = first + 1;
+            while (last < chunks.size() && !narrow_chunk(chunks[last].count)) { ++last; }
+            return last;
+        }
+        if (span_group == 1 || slot_pools.empty() || slot_pools[0].slots < config.num_experts) {
             return first + 1;
         }
         std::size_t last = std::min<std::size_t>(chunks.size(), first + span_group);
@@ -5563,6 +5630,21 @@ struct Executor::Impl {
         Tensor ids(ids_p, DType::I32, {top, t});
         Tensor weights(weights_p, DType::FP32, {top, t});
         Tensor shared(shared_p, DType::FP32, {t});
+        if (device_groups()) {
+            // The group's rows over the device banks, as run_moe() runs a chunk's.
+            const Tensor mixed(rank.mixed, DType::BF16, {h, t});
+            Tensor y(span_y.p, DType::FP32, {h, t});
+            if (m.latent) {
+                // In slices of the rank's workspace, as host experts' groups run.
+                auto scope = rank.workspace->scope();
+                ops::moe_latent_gguf(mixed, ids, weights, shared, m.latent_banks(), *rank.workspace,
+                                     y, st);
+                return;
+            }
+            auto scope = group_arena->scope();
+            ops::moe_experts_gguf(mixed, ids, weights, shared, m.banks(), *group_arena, y, st);
+            return;
+        }
         void* const own_y = rank.y;
         rank.y            = span_y.p;
         bool pooled       = false;
