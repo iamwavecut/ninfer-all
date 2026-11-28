@@ -1137,6 +1137,22 @@ A round of more than eight requests decodes without drafts; eight or fewer verif
 
 At `--max-concurrency 8` eight requests decode 139.4 tok/s.
 
+### Prompt spans with device experts
+
+`ninfer-serve --max-concurrency 32 --max-context 2048 --kv-dtype bf16 --ngram-table <table>`, the
+experts on the GPU, `serve_load.py --profile chat`: N short-chat requests of 256 tokens arrive
+together, EOS ignored; the median first token, tok/s over the whole load (`aggregate_tps`) and while
+all N decode at once (`steady_tps`). A40, GSQ-RCO Coder IQ1_M with the IQ4_NL table, November 28,
+one run each. Before is `4d26602349`, whose prompt steps with device experts were one chunk each;
+current packs the prompts' chunks into [spans](qwen3-8-flash-next.md#execution).
+
+| N | Build | First token, ms | Aggregate | Steady |
+|---:|---|---:|---:|---:|
+| 8 | before | 1,249.5 | 141.24 | 153.24 |
+| | current | 618.9 | 148.54 | 154.44 |
+| 32 | before | 6,070.0 | 187.44 | 216.27 |
+| | current | 2,767.1 | 204.96 | 218.88 |
+
 ### Quality
 
 The first 72 KB of the WikiText sample in `perplexity-1m`, 2,560-token windows advancing by 1,024,

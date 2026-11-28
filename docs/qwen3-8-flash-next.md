@@ -703,8 +703,9 @@ at startup). Requests are admitted
 in arrival order. Prompts prefill a step at a time, each step from the prompt with the fewest tokens
 left, so a short or cached request is not held behind a long prompt for its whole prefill (a prompt
 passed over eight times goes next, and a prompt with media, once begun, finishes first). A step is
-one chunk, or with host or disk experts on one GPU a span of up to eight chunks of the prompt
-(sixteen under `--max-concurrency 1`, where no other prompt waits behind a step), media
+one chunk, or on one GPU a span of up to eight chunks of the prompt (with host or disk experts
+sixteen under `--max-concurrency 1`, where no other prompt waits behind a step; with device
+experts eight, four or two, as the memory left at startup holds), media
 or not (see [Execution](#execution)); while other requests decode, a span is two chunks at most,
 since they wait for the whole step. Before a step, while requests are decoding, they run
 `--decode-rounds-per-prefill` rounds (by default the chunk size over 64, 16 at the default chunk)
@@ -723,11 +724,12 @@ and 11.5% faster without drafts (BF16 KV). A speculative round counts as the tok
 its requests fed on average, so drafting streams get as many tokens per chunk as plain ones and
 hold a prompt back no longer.
 
-With host or disk experts on one GPU, a step of a prompt without media or branched reads also
-takes the next chunks of the other such prompts that are prefilling, in the same order, while they
-fit the span: their chunks reach each layer together, so the layer's uncached experts cross the
-bus once for all of them. A step that does not end its prompt takes whole chunks, so each prompt
-runs the chunks it would run alone and computes the same bits. A prompt that would resume from a
+On one GPU, a step of a prompt without media or branched reads also takes the next chunks of the
+other such prompts that are prefilling, in the same order, while they fit the span: their chunks
+reach each layer together, so the layer's uncached experts cross the bus once for all of them, and
+with device experts the chunks wider than eight tokens run in one expert call, which reads each
+routed expert's weights once for all of them. A step that does not end its prompt takes whole
+chunks, so each prompt runs the chunks it would run alone and computes the same bits. A prompt that would resume from a
 prefix another prompt of the step is about to keep waits for it, and a step that passes a shared
 prefix (below) runs alone. On the RTX 3090 above (host
 experts), eight requests got their last first token after 6.2-6.7 s instead of 19.3-20.9 s
@@ -1054,6 +1056,15 @@ not.
   memory the device has free at startup: in a prompt past eight chunks each layer's uncached experts
   then cross the bus half as often ([Expert placements](#expert-placements)). Weighted expert
   outputs are summed in fixed point, so the result does not depend on the order experts finish in.
+- With device experts on one GPU, prompts run in the same spans: each layer runs its attention over
+  every chunk of the span, then one expert call over the device banks for each run of the span's
+  chunks wider than eight tokens (a chunk of up to eight tokens runs alone, in the decode form).
+  Every row's products and fixed-point sums are those of its chunk alone, so a span computes the
+  bits its chunks would one by one; several prompts' chunks then read each routed expert's weights
+  once. The span and its call's workspace take memory of their own (1.6 GiB for eight 1,024-token
+  chunks on the IQ1_M Coder): at startup, once the caches and the drafter are in, the span is the
+  widest of eight, four and two chunks whose planes and workspace fit the memory then free less
+  1 GiB or a quarter of it, and with none, every prompt step is one chunk.
 - A prompt chunk whose rows produce no logits (each chunk before the prompt's last, and a scoring
   call's chunks before its first scored position) runs the last layer, a sparse attention layer,
   only up to its key/value and indexer-key appends. In a span, the last layer's expert calls run
