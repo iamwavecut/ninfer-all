@@ -747,8 +747,9 @@ struct FlintCore::Impl {
         CUDA_CHECK(ninfer::fill_and_wait(token_counts.p, 0, token_counts.bytes));
     }
 
-    // A request that neither computes a prompt chunk nor accepts a token for this long fails with
-    // an explicit error rather than holding its sequence, so a stall surfaces as errors.
+    // A decoding request that accepts no token for this long fails with an explicit error rather
+    // than holding its sequence, so a stall surfaces as errors. A prompt waiting for its chunks is
+    // not measured: up to 64 prompts take their steps one at a time between decode rounds.
     static constexpr auto kProgressTimeout = std::chrono::seconds(120);
     Clock::time_point progress_checked{};
 
@@ -805,14 +806,16 @@ struct FlintCore::Impl {
         return false;
     }
 
-    // Fails each request that has made no progress for kProgressTimeout.
+    // Fails each decoding request that has made no progress for kProgressTimeout.
     void check_progress() {
         const auto now = Clock::now();
         if (now - progress_checked < std::chrono::seconds(1)) { return; }
         progress_checked = now;
         for (const Slot& slot : slots) {
             const auto request = slot.request;
-            if (!request || now - request->progress < kProgressTimeout) { continue; }
+            if (!request || !request->decoding || now - request->progress < kProgressTimeout) {
+                continue;
+            }
             fail(request, std::make_exception_ptr(RequestError(
                               RequestErrorKind::Unavailable,
                               "inference request made no progress for " +

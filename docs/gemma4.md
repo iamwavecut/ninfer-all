@@ -563,9 +563,9 @@ with strings of `maxLength: 200` and `maxLength: 2800` compiles in 81 ms instead
 its masks inside the strings take 0.04 ms instead of 70-96 ms (one Apple M-series core; Gemma's
 262,144-token vocabulary was not measured).
 
-Every running request must make progress: one that neither computes a prompt chunk nor accepts a
-token for 120 s fails with `inference request made no progress for 120 s` instead of holding its
-sequence.
+Every decoding request must make progress: one that accepts no token for 120 s fails with
+`inference request made no progress for 120 s` instead of holding its sequence. A prompt that waits
+for its turn is not measured: up to 64 prompts take their steps one at a time between decode rounds.
 
 ## Images and video
 
