@@ -1,7 +1,8 @@
 // The router's model lifecycle and catalog, without an Engine: a fake service records what the
 // registry asks of it. Covered: resolving ids and aliases, autoload, making room under models_max
 // by putting the least recently used idle model to sleep (or unloading it when it cannot sleep),
-// waking a sleeping model, leases holding a model in place, idle sleep, explicit load/unload/sleep,
+// waking a sleeping model, leases holding a model in place, a busy model making way for a waiting
+// one after the switch delay and not before its hold time, idle sleep, explicit load/unload/sleep,
 // the event stream, and the preset/models-directory catalog with its option precedence.
 
 #include "product/launch_config/launch_config.h"
@@ -12,6 +13,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -155,6 +157,85 @@ void leases_hold_models() {
     other.join();
     expect(loaded_b && state_of(registry, "a") == ModelState::Sleeping,
            "the waiting request proceeds once the lease ends");
+}
+
+bool wait_for(const std::function<bool()>& done, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (!done() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return done();
+}
+
+void busy_model_makes_way() {
+    Journal journal;
+    RegistryPolicy policy;
+    policy.models_max   = 1;
+    policy.room_timeout = std::chrono::seconds(20);
+    policy.switch_after = std::chrono::seconds(1);
+    policy.hold_min     = std::chrono::seconds(0);
+    ModelRegistry registry({model("a"), model("b")}, policy, factory(journal), true);
+    auto running = std::make_unique<ModelRegistry::Lease>(registry.acquire("a"));
+    std::atomic<bool> served_b{false}, served_a{false};
+    std::thread waiting([&] {
+        auto lease = registry.acquire("b");
+        served_b   = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    expect(!registry.status("a")->draining, "a busy model keeps taking requests before the delay");
+    expect(wait_for([&] { return registry.status("a")->draining; }, std::chrono::seconds(5)),
+           "after the delay the busy model drains");
+    std::thread late([&] {
+        auto lease = registry.acquire("a");
+        served_a   = true;
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    expect(!served_a, "a draining model takes no new request");
+    expect(!served_b && state_of(registry, "a") == ModelState::Loaded,
+           "the running request keeps its model until it ends");
+    running.reset();
+    waiting.join();
+    late.join();
+    expect(served_b && served_a, "the waiting model is served, then the drained one again");
+    const std::vector<std::string> expected{"load a", "sleep a", "load b", "sleep b", "wake a"};
+    expect(journal.calls == expected, "the room a drained model leaves goes to the waiting model");
+    expect(!registry.status("a")->draining, "a woken model takes requests again");
+}
+
+void hold_and_switch_off() {
+    {
+        Journal journal;
+        RegistryPolicy policy;
+        policy.models_max   = 1;
+        policy.room_timeout = std::chrono::seconds(20);
+        policy.switch_after = std::chrono::seconds(1);
+        policy.hold_min     = std::chrono::seconds(3);
+        ModelRegistry registry({model("a"), model("b")}, policy, factory(journal), true);
+        auto running = std::make_unique<ModelRegistry::Lease>(registry.acquire("a"));
+        const auto loaded = std::chrono::steady_clock::now();
+        std::thread waiting([&] { auto lease = registry.acquire("b"); });
+        expect(wait_for([&] { return registry.status("a")->draining; }, std::chrono::seconds(6)),
+               "a held model drains once its hold time has passed");
+        expect(std::chrono::steady_clock::now() - loaded >= std::chrono::milliseconds(2900),
+               "not before its hold time");
+        running.reset();
+        waiting.join();
+    }
+    {
+        Journal journal;
+        RegistryPolicy policy;
+        policy.models_max   = 1;
+        policy.room_timeout = std::chrono::seconds(2);
+        policy.switch_after = std::chrono::seconds(0);
+        ModelRegistry registry({model("a"), model("b")}, policy, factory(journal), true);
+        auto running = registry.acquire("a");
+        bool refused = false;
+        try {
+            (void)registry.acquire("b");
+        } catch (const ModelLoadFailed&) { refused = true; }
+        expect(refused && !registry.status("a")->draining,
+               "with switching off a busy model never drains and the request times out");
+    }
 }
 
 void idle_sleep_and_events() {
@@ -306,6 +387,8 @@ int main() {
     try {
         lifecycle_under_one_slot();
         leases_hold_models();
+        busy_model_makes_way();
+        hold_and_switch_off();
         idle_sleep_and_events();
         observing_is_not_use();
         failed_model_reloads();

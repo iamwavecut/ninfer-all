@@ -9,6 +9,10 @@
 // follows the configured bounds: at most `models_max` models are loaded at once, and the least
 // recently used loaded model without leases makes way -- put to sleep when it was started with
 // model suspend (it then wakes in seconds, with its retained conversations), unloaded otherwise.
+// When every loaded model has leases, a request that has waited `switch_after` for room drains the
+// least recently used of those loaded at least `hold_min`: it takes no new requests (they wait as
+// for a model that is not loaded), finishes the ones it runs, and then makes way. So a model under
+// constant load does not keep the others out for the whole room timeout.
 // Idle models go to sleep after `sleep_idle` and are unloaded after `unload_idle`. In router mode a
 // model whose Engine failed Engine-wide is unloaded once its requests are gone, so the next request
 // for it loads it again.
@@ -60,6 +64,8 @@ struct ModelStatusSnapshot {
     std::uint32_t leases = 0;
     std::chrono::steady_clock::time_point last_used{};
     bool held = false;
+    // Takes no new requests until it has made way for a waiting model.
+    bool draining = false;
 };
 
 struct RegistryPolicy {
@@ -71,6 +77,10 @@ struct RegistryPolicy {
     std::chrono::seconds unload_idle{0};
     // How long a request waits for a busy model to make room before it fails.
     std::chrono::seconds room_timeout{600};
+    // How long a request waits for room before it drains a busy model; zero never drains one.
+    std::chrono::seconds switch_after{30};
+    // A model loaded or woken less than this long ago is not drained.
+    std::chrono::seconds hold_min{60};
 };
 
 // A service the registry starts for a model, and how it is driven. Production builds a
@@ -205,9 +215,12 @@ private:
         std::unique_ptr<ModelService> service;
         std::uint32_t leases = 0;
         std::chrono::steady_clock::time_point last_used{};
+        // When it last became Loaded (load or wake), for RegistryPolicy::hold_min.
+        std::chrono::steady_clock::time_point loaded_at{};
         bool failed = false;
         std::string last_error;
-        bool held = false;
+        bool held     = false;
+        bool draining = false;
     };
 
     [[nodiscard]] ModelStatusSnapshot snapshot_locked(const Slot& slot) const;
@@ -215,7 +228,8 @@ private:
     [[nodiscard]] std::size_t require_locked(std::string_view model) const;
     // Brings `index` to Loaded, releasing the lock while the service loads or wakes.
     void make_loaded_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
-    // Frees one loaded slot other than `keep`, waiting for one to become idle; false on timeout.
+    // Frees one loaded slot other than `keep`, waiting for one to become idle and draining a busy
+    // one after RegistryPolicy::switch_after; false on timeout.
     bool make_room_locked(std::unique_lock<std::mutex>& lock, std::size_t keep,
                           std::chrono::steady_clock::time_point deadline);
     void put_to_sleep_locked(std::unique_lock<std::mutex>& lock, std::size_t index);
@@ -234,6 +248,8 @@ private:
     std::deque<ModelEvent> events_;
     std::uint64_t first_event_ = 1;
     bool stopping_             = false;
+    // While a busy model drains: the model whose request drained it, which takes the room first.
+    std::optional<std::size_t> reserved_;
     std::thread idle_thread_;
 };
 

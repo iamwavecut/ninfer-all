@@ -191,7 +191,8 @@ constexpr std::string_view kContextCapacitySettings[] = {
 bool router_option(std::string_view argument) {
     return argument == "--models-dir" || argument == "--models-preset" ||
            argument == "--models-max" || argument == "--sleep-idle-seconds" ||
-           argument == "--unload-idle-seconds";
+           argument == "--unload-idle-seconds" || argument == "--models-switch-seconds" ||
+           argument == "--models-hold-seconds";
 }
 
 ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::string>& arguments,
@@ -346,6 +347,11 @@ std::string serve_usage_text(const char* argv0) {
            "  --sleep-idle-seconds N        put a model idle for N s to sleep (needs\n"
            "                                --model-suspend); also without a router\n"
            "  --unload-idle-seconds N       unload a model idle for N s\n"
+           "  --models-switch-seconds N     after N s without room, the least recently used\n"
+           "                                busy model takes no new requests and makes way\n"
+           "                                once its own are done (default 30, 0 = never)\n"
+           "  --models-hold-seconds N       a model loaded less than N s ago is not made to\n"
+           "                                make way (default 60)\n"
            "\n"
            "MODEL SUSPEND\n"
            "  --model-suspend               enable POST /v1/models/{id}/suspend and /resume\n"
@@ -1704,6 +1710,16 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         if (arg == "--unload-idle-seconds") {
             options.unload_idle_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--unload-idle-seconds"), "unload-idle-seconds"));
+            continue;
+        }
+        if (arg == "--models-switch-seconds") {
+            options.models_switch_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--models-switch-seconds"), "models-switch-seconds"));
+            continue;
+        }
+        if (arg == "--models-hold-seconds") {
+            options.models_hold_seconds = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--models-hold-seconds"), "models-hold-seconds"));
             continue;
         }
         if (arg == "--suspend-snapshot") {
