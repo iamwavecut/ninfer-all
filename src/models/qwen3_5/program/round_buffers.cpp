@@ -60,8 +60,8 @@ void validate_spec(const RoundStateSpec& spec) {
         throw std::invalid_argument("RoundState batch capacity must be in [1," +
                                     std::to_string(kMaximumConcurrency) + "]");
     }
-    if (spec.backend != SpeculativeBackend::None && spec.batch_capacity > kMaximumSpeculativeRows) {
-        throw std::invalid_argument("a speculative RoundState holds at most " +
+    if (is_masked_draft_backend(spec.backend) && spec.batch_capacity > kMaximumSpeculativeRows) {
+        throw std::invalid_argument("a masked-draft RoundState holds at most " +
                                     std::to_string(kMaximumSpeculativeRows) + " rows");
     }
     (void)checked_i32(static_cast<std::uint64_t>(spec.draft_window) + 1ULL,
@@ -70,11 +70,19 @@ void validate_spec(const RoundStateSpec& spec) {
 
 } // namespace
 
+std::uint32_t speculative_round_rows(const RoundStateSpec& spec) noexcept {
+    return std::min(spec.batch_capacity, kMaximumSpeculativeRows);
+}
+
 RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundStateSpec& spec) {
     validate_spec(spec);
     RoundStateLayout layout;
     layout.spec = spec;
-    if (!spec.causal_scoring && spec.backend == SpeculativeBackend::None) {
+    // Under MTP, rounds of more rows than a speculative round holds are ordinary rounds whose MTP
+    // layer writes each row's KV at the round's position.
+    const bool mtp_ordinary =
+        spec.backend == SpeculativeBackend::Mtp && spec.batch_capacity > kMaximumSpeculativeRows;
+    if (!spec.causal_scoring && (spec.backend == SpeculativeBackend::None || mtp_ordinary)) {
         OrdinaryDecodeStateLayout& ordinary = layout.ordinary.emplace();
         ordinary.ingress =
             builder.add(sizeof(OrdinaryDecodeIngress), 256, "ordinary decode ingress");
@@ -87,6 +95,12 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             add_tensor(builder, DType::BF16,
                        {spec.hidden, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
                        "ordinary decode hidden");
+        if (mtp_ordinary) {
+            ordinary.mtp_hidden = add_tensor(
+                builder, DType::BF16,
+                {spec.hidden, checked_i32(spec.batch_capacity, "RoundState batch capacity")},
+                "ordinary decode MTP hidden");
+        }
     }
     if (!spec.causal_scoring) {
         layout.token    = add_tensor(builder, DType::I32, {1}, "step token");
@@ -106,7 +120,8 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             spec.backend == SpeculativeBackend::None
                 ? 1U
                 : std::max(spec.draft_window, spec.verify_window) + 1U;
-        const std::int32_t rows = checked_i32(spec.batch_capacity * width, "logprob rows");
+        const std::int32_t rows = checked_i32(
+            std::max(spec.batch_capacity, speculative_round_rows(spec) * width), "logprob rows");
         layout.logprob_ids =
             add_tensor(builder, DType::I32, {ops::kLogprobTopK, rows}, "logprob top ids");
         layout.logprob_values =
@@ -155,6 +170,13 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
                             DType::I32, {count});
     logits         = layout.logits.bind(backing);
     hidden         = layout.hidden.bind(backing);
+    if (layout.mtp_hidden) {
+        mtp_kv_table_rows =
+            ingress_tensor(offsetof(OrdinaryDecodeIngress, mtp_kv_table_rows), DType::I32);
+        mtp_valid_columns =
+            ingress_tensor(offsetof(OrdinaryDecodeIngress, mtp_valid_columns), DType::I32);
+        mtp_hidden = layout.mtp_hidden->bind(backing);
+    }
 }
 
 void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layout) {
@@ -190,8 +212,8 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
         MtpDecodeStateLayout& decode = *layout.mtp_decode;
         decode.ingress = builder.add(sizeof(MtpDecodeIngress), kArenaAlign, "MTP decode ingress");
         decode.egress  = builder.add(sizeof(MtpDecodeEgress), kArenaAlign, "MTP decode egress");
-        const auto batch =
-            checked_i32(layout.spec.batch_capacity, "RoundState MTP batch capacity exceeds int32");
+        const auto batch = checked_i32(speculative_round_rows(layout.spec),
+                                       "RoundState MTP batch capacity exceeds int32");
         decode.verify_ids =
             add_tensor(builder, DType::I32, {verify_columns, batch}, "MTP decode verify ids");
         decode.target_positions =
@@ -509,7 +531,7 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
     const std::uint32_t verify_window =
         std::max(layout.spec.draft_window, layout.spec.verify_window);
     if (layout.mtp_decode) {
-        mtp_decode.emplace(backing, *layout.mtp_decode, layout.spec.batch_capacity,
+        mtp_decode.emplace(backing, *layout.mtp_decode, speculative_round_rows(layout.spec),
                            layout.spec.draft_window, verify_window);
     }
     if (layout.dflash_decode) {

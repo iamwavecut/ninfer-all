@@ -23,13 +23,15 @@ void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions, 
     // whose key plane is INT8 and whose value scale is FP16.
     constexpr auto kStorage = KvCacheStorage::Fp8KeyNvfp4Value;
     const auto tokens       = static_cast<std::int32_t>(k.ne[2]);
+    // A batched view's sequences, one grid row each; the page kernel takes one sequence.
+    const auto sequences    = static_cast<unsigned>(k.ne[3]);
     auto* cache_k           = static_cast<KvKeyCodeT<kStorage>*>(cache.k_pages.data);
     auto* cache_v           = static_cast<KvValueCodeT<kStorage>*>(cache.v_pages.data);
     auto* scale_k           = static_cast<KvKeyScaleT<kStorage>*>(cache.k_scale_pages.data);
     auto* scale_v           = static_cast<KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
     assert_kv_planes<kStorage, decltype(cache_k), decltype(cache_v), decltype(scale_k),
                      decltype(scale_v)>();
-    if (tokens >= 128 && Geometry::KVHeads <= 2) {
+    if (tokens >= 128 && Geometry::KVHeads <= 2 && sequences == 1) {
         constexpr int TokensPerTile = 8;
         const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
         const dim3 grid(static_cast<unsigned>(max_tiles), static_cast<unsigned>(Geometry::KVHeads));
@@ -41,7 +43,8 @@ void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions, 
         constexpr int FillWarps       = kBlock / 32;
         const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
         const int grid = static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
-        kv_cache_append_full_k8v4_kernel<Geometry, Metadata><<<grid, kBlock, 0, stream>>>(
+        kv_cache_append_full_k8v4_kernel<Geometry, Metadata>
+            <<<dim3(grid, sequences), kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
             static_cast<const std::int32_t*>(positions.data), metadata, cache_k, cache_v, scale_k,
             scale_v, tokens);

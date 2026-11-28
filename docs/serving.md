@@ -2683,7 +2683,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `auto` with the hybrid prefix cache and `--max-context` with the checkpoint catalog up to 8 requests; past 8 the catalog's pool is `auto` too, since one window of 2048 tokens holds 32 pages of 64 tokens and every request needs one | `auto`; `--max-context` with the checkpoint catalog up to `--max-concurrency 8` |
 | `--kv-headroom-mib N` | device memory in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto`. `--vram-headroom-mib` is accepted as an alias | `1024` |
 | `--kv-host-mib N\|auto` | Qwen3.5 family on one device under Linux: continue the KV pool into N MiB of pinned host memory that the GPU reads in place, exact but slower for the part of a context there ([KV host tier](cli.md#kv-host-tier)); `auto` sizes it for every request to reach `--max-context` | `0` (off) |
-| `--max-concurrency N\|auto` | maximum admitted requests, `1..64`; `auto` admits as many as fit once the weights are loaded, each with its recurrent state and one `--max-context` KV window (with an explicit `--kv-capacity`, as many as its pages hold whole windows), and logs the count with each request's state and KV. With `--spec`, at most 8 (`auto` stops there); Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next take `1..8` and refuse `auto` | `1` |
+| `--max-concurrency N\|auto` | maximum admitted requests, `1..64`; `auto` admits as many as fit once the weights are loaded, each with its recurrent state and one `--max-context` KV window (with an explicit `--kv-capacity`, as many as its pages hold whole windows), and logs the count with each request's state and KV. With `--spec mtp` up to 64: a round of more than 8 requests decodes without drafts and runs MTP over each request's new token, so drafting resumes once 8 or fewer remain; with a block drafter (`dflash`, `dflash2`, `dspark`, `dspine`), at most 8 (`auto` stops there); Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next take `1..8` and refuse `auto` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `max(16, --max-concurrency)` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
 | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
@@ -3252,11 +3252,13 @@ kept (Inkling 2, four questions after a restart, each way).
 ## Execution behavior
 
 The server owns one resident Engine with a startup-fixed capacity of `1..64` active generation
-requests (`1..8` with `--spec` and on Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and
+requests (`1..8` with a block drafter and on Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and
 Qwen3.8-Flash-Next). At each decode boundary, every decode-ready request is compacted into one batch
 and processed by one model traversal and, when graphs are enabled and the batch has at most eight
 requests, one exact-batch CUDA Graph replay; a batch of more launches its kernels directly. Rounds
-of drafts verify at most eight requests.
+of drafts verify at most eight requests. With MTP, a batch of more decodes without drafts and runs
+the MTP layer over each request's sampled token, so MTP's KV keeps pace and the next round of eight
+or fewer drafts again.
 A request joins that batch only after its staged prefill finishes; when it completes or is
 cancelled, the next boundary rebuilds the batch without an empty row. A staged prefill holds
 admission back until it finishes, unless every staged prefill has only a last chunk left that can

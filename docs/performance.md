@@ -795,14 +795,22 @@ The same server runs as for Bonsai 2, total generated tok/s:
 
 Server with `--max-concurrency 64 --kv-dtype rk8v4` and the hybrid cache's automatic KV capacity,
 `tools/bench/serve_load.py --profile chat`: N short-chat requests of 256 tokens arrive together,
-EOS ignored. tok/s while all N decode at once (`steady_tps`); without drafts, as `--spec` runs at
-most eight requests. Rounds of more than eight requests run without a CUDA graph.
+EOS ignored. tok/s while all N decode at once (`steady_tps`); without drafts unless the Drafter
+column names one. Rounds of more than eight requests run without a CUDA graph.
 
-| Card | Model | `--max-context` | 8 | 16 | 32 | 48 | 64 |
-|---|---|---:|---:|---:|---:|---:|---:|
-| RTX 5090 | Qwen3.8-27B | 2,048 | 607.3 | 980.3 | 1,233.5 | 1,276.0 | 1,401.4 |
-| RTX 5090 | Ternary Bonsai 2 27B | 4,096 | 1,080.3 | 1,646.2 | 1,780.6 | 1,839.9 | 1,982.9 |
-| RTX 3090 | Ternary Bonsai 2 27B | 2,048 | 549.0 | 744.8 | 862.7 | 838.6 | 903.0 |
+| Card | Model | Drafter | `--max-context` | 8 | 16 | 32 | 48 | 64 |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| RTX 5090 | Qwen3.8-27B | none | 2,048 | 607.3 | 980.3 | 1,233.5 | 1,276.0 | 1,401.4 |
+| RTX 5090 | Qwen3.8-27B | MTP 3 | 2,048 | 898.5 | 986.7 | 1,229.1 | 1,264.5 | 1,388.6 |
+| RTX 5090 | Ternary Bonsai 2 27B | none | 4,096 | 1,080.3 | 1,646.2 | 1,780.6 | 1,839.9 | 1,982.9 |
+| RTX 3090 | Ternary Bonsai 2 27B | none | 2,048 | 549.0 | 744.8 | 862.7 | 838.6 | 903.0 |
+
+With MTP 3 the same server decodes 207.7 tok/s for one request and 697.7 for four (92.0 and 335.6
+without drafts, 207.6 and 712.8 with MTP 3 at `--max-concurrency 8`). Past eight requests a round
+runs without drafts plus the MTP layer over each request's token: 46.1 ms at 64 requests against
+45.6 ms without drafts, 1.1% fewer tok/s at 64 and 0.8% at 48. Its startup holds 54,272 tokens of
+KV against 173,760 without drafts: MTP's 0.8 GiB of weights and the CUDA graphs and workspace of its
+rounds of up to eight requests.
 
 Qwen3.8-27B's Q4 gate and up projection runs its small-T kernel up to 64 columns: 186 µs against
 319 µs for the 64-by-128 tile at 64 columns on the RTX 5090, 432 µs against 782 µs on the

@@ -43,11 +43,14 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache);
+                         &state.text_cache, state.mtp_cache);
         card.set_stage_runtime(state.execution.stages);
         card.set_expert_runtime(state.execution.experts);
         card.set_steering(state.execution.steering);
         card.set_rope_yarn(state.execution.rope_yarn);
+        if (state.mtp_cache != nullptr) {
+            card.set_mtp_attention_window(state.execution.mtp_attention_window);
+        }
 
         Tensor tokens             = ordinary.tokens.slice(0, 0, batch_size);
         Tensor cache_positions    = ordinary.cache_positions.slice(0, 0, batch_size);
@@ -75,6 +78,19 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     ordinary.sampling, sample_positions, ops::kSamplePurposeDecode,
                     state.execution.work, state.execution.device.stream);
+        if (state.mtp_cache != nullptr) {
+            // The MTP layer's K and V at each row's position, from the sampled token and the
+            // target's hidden there, as a speculative round's alignment stores them for its
+            // accepted tokens: the next speculative round finds the MTP KV at the row's frontier.
+            const auto hidden_size = hidden.ne[0];
+            Tensor mtp_hidden      = ordinary.mtp_hidden.slice(1, 0, batch_size);
+            Tensor mtp_out         = mtp_hidden.view({hidden_size, 1, batch_size});
+            card.mtp_align_decode_batch(
+                sampled.view({1, batch_size}), hidden.view({hidden_size, 1, batch_size}),
+                cache_positions.view({1, batch_size}), rope_positions.view({1, batch_size}),
+                ordinary.mtp_valid_columns.slice(0, 0, batch_size),
+                ordinary.mtp_kv_table_rows.slice(0, 0, batch_size), envelope, mtp_out);
+        }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, ordinary.egress.data,
                                    sizeof(qwen3_5::OrdinaryDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
@@ -609,8 +625,12 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
     nvtx::ScopedRange round_range(nvtx::Name::DecodeOrdinaryRound, nvtx::Category::Decode,
                                   static_cast<std::uint64_t>(lanes.size()));
     runtime::ExecutionTimingRecorder timing(runtime::ExecutionTimingPhase::Submit, failed_timing);
-    if (speculative_backend != SpeculativeBackend::None) {
-        throw std::logic_error("ordinary batch execution requires the ordinary backend");
+    // Under MTP, rounds of more rows than a speculative round holds run here and keep the MTP KV
+    // aligned.
+    const bool mtp = speculative_backend == SpeculativeBackend::Mtp;
+    if ((speculative_backend != SpeculativeBackend::None && !mtp) || !io.ordinary ||
+        (mtp && (decoder->mtp_cache() == nullptr || !io.ordinary->mtp_hidden.data))) {
+        throw std::logic_error("ordinary batch execution requires the ordinary frame");
     }
     if (lanes.empty() || lanes.size() > max_concurrency || budgets.size() != lanes.size()) {
         throw std::invalid_argument("ordinary batch membership is invalid");
@@ -624,6 +644,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                 lanes.begin() + static_cast<std::ptrdiff_t>(row)) {
             throw std::invalid_argument("ordinary batch contains an invalid or duplicate lane");
         }
+        // A prefill's proposal copy lands before the round discards it.
+        if (mtp) { settle_initial_drafts(active_sequence(lane)); }
         const SequenceState& sequence = active_sequence(lane);
         const RequestControl& request = requests[lane];
         if (request.lifecycle != Lifecycle::Active ||
@@ -633,7 +655,10 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             sequence.ledger_frontier != sequence.execution_frontier + 1 ||
             sequence.ledger.size() != sequence.ledger_frontier ||
             sequence.prefix_identity.size() != sequence.ledger_frontier ||
-            sequence.prefix_digests.size() != sequence.ledger_frontier) {
+            sequence.prefix_digests.size() != sequence.ledger_frontier ||
+            (mtp && (!sequence.kv->backend ||
+                     backend_kv_addresses->bound_row(*sequence.kv->backend) < 0 ||
+                     sequence.mtp_kv_valid != sequence.execution_frontier))) {
             throw std::logic_error("ordinary batch row is not decode-ready");
         }
         maximum_frontier = std::max(maximum_frontier, sequence.execution_frontier);
@@ -646,7 +671,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                              static_cast<std::uint64_t>(lanes.size()));
         DecodeGraphExecutable* executable = nullptr;
         ops::CausalAttentionExecutionEnvelope envelope{maximum_frontier + 1, maximum_frontier + 1};
-        if (use_cuda_graph && lanes.size() <= kMaximumGraphRows) {
+        if (use_cuda_graph && !mtp && lanes.size() <= kMaximumGraphRows) {
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
@@ -673,6 +698,11 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
+            if (mtp) {
+                ordinary_host_ingress->mtp_kv_table_rows[row] =
+                    backend_kv_addresses->bound_row(*sequence.kv->backend);
+                ordinary_host_ingress->mtp_valid_columns[row] = 1;
+            }
             if (request.grammar) {
                 if (auto ready = take_next_mask(request, sequence, 0)) {
                     structured_round->adopt(sequence.lane, std::move(ready));
@@ -681,7 +711,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                 }
             }
             logprobs = logprobs || request.logprobs;
-            ensure_sequence_kv_mapped(sequence, frontier + 1, 0);
+            ensure_sequence_kv_mapped(sequence, frontier + 1, mtp ? frontier + 1 : 0);
         }
         if (structured_round) { structured_round->publish(); }
         arm_logprobs(logprobs);
@@ -695,7 +725,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             *io.ordinary,
             *ordinary_host_ingress,
             *ordinary_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            mtp ? decoder->mtp_cache() : nullptr};
 
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
@@ -725,7 +756,13 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                 round_logprobs[row] = fetched_logprob(static_cast<std::int32_t>(row), token);
             }
             sequence.text_kv_valid = base_E + 1;
-            commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
+            if (mtp) {
+                // The MTP KV holds the round's position; the next speculative round proposes anew.
+                sequence.mtp_kv_valid       = base_E + 1;
+                sequence.mtp_draft_count    = 0;
+                sequence.mtp_drafts_pending = false;
+            }
+            commit_sequence_kv(sequence, sequence.text_kv_valid, mtp ? sequence.mtp_kv_valid : 0);
             sequence.tail_hidden_valid = true;
             sequence.ledger.push_back(token);
             sequence.prefix_identity.append_generated(1, sequence.rope_delta);
@@ -1329,6 +1366,11 @@ ProgramImpl::decode_raw(std::span<const std::uint32_t> lanes,
         return decode_ordinary_batch(lanes, budgets, failed_timing);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
+        // A speculative round holds at most kMaximumSpeculativeRows rows; wider rounds are
+        // ordinary rounds that keep the MTP KV aligned.
+        if (lanes.size() > kMaximumSpeculativeRows) {
+            return decode_ordinary_batch(lanes, budgets, failed_timing);
+        }
         return decode_mtp_batch(lanes, budgets, failed_timing);
     }
     return decode_dflash_batch(lanes, budgets, failed_timing);

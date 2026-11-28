@@ -128,6 +128,23 @@ void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
                      PagedKVLayerView cache, cudaStream_t stream);
 
 /**
+ * Append the BF16 K/V columns of B sequences to batched paged storage of any 16-bit-input or
+ * quantized D256 profile above except Float16.
+ *
+ * k/v are contiguous BF16 [256,Hkv,W,B] with Hkv=1..4, positions contiguous device I32 [W,B],
+ * table_rows contiguous device I32 [B], and valid_columns either empty (every column valid) or
+ * contiguous device I32 [B]. For row b, columns i < min(max(valid_columns[b], 0), W) are stored at
+ * positions[0,b] + i through table row table_rows[b], each in exactly the representation the
+ * single-sequence form stores for that column (the fused append of causal attention stores the
+ * same). The columns past a row's valid count write nothing. The caller guarantees positions[i,b]
+ * = positions[0,b] + i, materialized table entries for every stored position, and that no two
+ * stored columns address the same row of the cache. Inputs are unchanged.
+ */
+void kv_cache_append(const Tensor& k, const Tensor& v, const Tensor& positions,
+                     const Tensor& valid_columns, const Tensor& table_rows,
+                     PagedKVBatchLayerView cache, cudaStream_t stream);
+
+/**
  * Append device-selected BF16 prefixes to batched paged growing-cache storage.
  *
  * k/v are contiguous BF16 [128,8,T,B], positions is contiguous device I32 [T,B], and counts and

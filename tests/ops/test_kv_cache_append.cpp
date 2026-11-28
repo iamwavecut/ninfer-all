@@ -1,6 +1,7 @@
 #include "ninfer/ops/kv_cache_append.h"
 #include "ops/kv_cache_e8_root_host.h"
 #include "ops/kv_cache_lloyd4_oracle.h"
+#include "ops/kv_cache/d256_profile.h"
 #include "ops/op_tester.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
@@ -2161,6 +2162,165 @@ int cyclic_variable_prefix_tests() {
 }
 
 
+
+// The batched form stores each row's columns exactly as the single-sequence form stores them: B
+// rows, each through its own table row from its own position, against one single-sequence call
+// per row on a second copy of the planes. Both copies start from the same bytes, so a write
+// outside the addressed rows differs too.
+int batched_append_case(KvCacheStorage storage, int kv_heads, int width, int batch, bool masked) {
+    const ops::D256KVCacheProfile profile = ops::d256_kv_cache_profile(storage);
+    constexpr int kRowPages               = 4;
+    const int physical_pages              = kRowPages * batch + 1;
+    const auto plane_bytes                = [&](DType dtype, int extent) {
+        return static_cast<std::size_t>(dtype_size(dtype)) * static_cast<std::size_t>(extent) *
+               kPage * static_cast<std::size_t>(kv_heads) * static_cast<std::size_t>(physical_pages);
+    };
+    const bool scaled = storage != KvCacheStorage::BFloat16;
+    const std::size_t bytes[4] = {
+        plane_bytes(profile.key_code_dtype, profile.key_leading_extent),
+        plane_bytes(profile.value_code_dtype, profile.value_leading_extent),
+        scaled ? plane_bytes(profile.key_scale_dtype, profile.scale_leading_extent) : 0,
+        scaled ? plane_bytes(profile.value_scale_dtype, profile.value_scale_leading_extent) : 0};
+
+    // Table row r maps its logical page l to physical page l * batch + r + 1; input row b uses
+    // table row (3 b + 1) mod batch, from position 5 + 37 b mod (the row's capacity - width).
+    std::vector<std::int32_t> tables(static_cast<std::size_t>(kRowPages) * batch);
+    for (int r = 0; r < batch; ++r) {
+        for (int l = 0; l < kRowPages; ++l) {
+            tables[static_cast<std::size_t>(r) * kRowPages + l] = l * batch + r + 1;
+        }
+    }
+    std::vector<std::int32_t> rows(static_cast<std::size_t>(batch));
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(width) * batch);
+    std::vector<std::int32_t> valid(static_cast<std::size_t>(batch));
+    for (int b = 0; b < batch; ++b) {
+        rows[b]         = (3 * b + 1) % batch; // distinct while 3 and batch are coprime
+        const int first = (5 + 37 * b) % (kRowPages * kPage - width);
+        for (int i = 0; i < width; ++i) {
+            positions[static_cast<std::size_t>(b) * width + i] = first + i;
+        }
+        // Every count from none to past the width.
+        valid[b] = masked ? (b % (width + 2)) : width;
+    }
+
+    const std::size_t input_count =
+        static_cast<std::size_t>(kFullHeadDim) * kv_heads * width * batch;
+    std::vector<float> host_k(input_count);
+    std::vector<float> host_v(input_count);
+    fill_uniform(host_k, 0x5a17u + static_cast<std::uint32_t>(kv_heads * 131 + batch), -1.5f, 1.5f);
+    fill_uniform(host_v, 0x6b28u + static_cast<std::uint32_t>(kv_heads * 131 + width), -2.0f, 2.0f);
+    std::vector<std::uint16_t> input_k(input_count);
+    std::vector<std::uint16_t> input_v(input_count);
+    for (std::size_t i = 0; i < input_count; ++i) {
+        input_k[i] = f32_to_bf16(host_k[i]);
+        input_v[i] = f32_to_bf16(host_v[i]);
+    }
+    DeviceBuffer d_k         = to_device(input_k);
+    DeviceBuffer d_v         = to_device(input_v);
+    DeviceBuffer d_positions = to_device(positions);
+    DeviceBuffer d_tables    = to_device(tables);
+    DeviceBuffer d_rows      = to_device(rows);
+    DeviceBuffer d_valid     = to_device(valid);
+
+    std::vector<GuardedDeviceBuffer> batched;
+    std::vector<GuardedDeviceBuffer> single;
+    batched.reserve(4);
+    single.reserve(4);
+    for (int plane = 0; plane < 4; ++plane) {
+        const std::size_t size = bytes[plane] == 0 ? 1 : bytes[plane];
+        batched.emplace_back(size);
+        single.emplace_back(size);
+        const auto start = patterned_bits((size + 1) / 2, 0x77310u + plane);
+        batched.back().copy_from_host(start.data(), size);
+        single.back().copy_from_host(start.data(), size);
+    }
+    const auto planes = [&](std::vector<GuardedDeviceBuffer>& b, auto& view) {
+        view.k_pages = Tensor(b[0].data(), profile.key_code_dtype,
+                              {profile.key_leading_extent, kPage, kv_heads, physical_pages});
+        view.v_pages = Tensor(b[1].data(), profile.value_code_dtype,
+                              {profile.value_leading_extent, kPage, kv_heads, physical_pages});
+        if (scaled) {
+            view.k_scale_pages =
+                Tensor(b[2].data(), profile.key_scale_dtype,
+                       {profile.scale_leading_extent, kPage, kv_heads, physical_pages});
+            view.v_scale_pages =
+                Tensor(b[3].data(), profile.value_scale_dtype,
+                       {profile.value_scale_leading_extent, kPage, kv_heads, physical_pages});
+        }
+        view.head_dim     = kFullHeadDim;
+        view.num_kv_heads = kv_heads;
+        view.storage      = storage;
+    };
+
+    PagedKVBatchLayerView view;
+    planes(batched, view);
+    view.block_tables = Tensor(d_tables.p, DType::I32, {kRowPages, batch});
+    ops::kv_cache_append(Tensor(d_k.p, DType::BF16, {kFullHeadDim, kv_heads, width, batch}),
+                         Tensor(d_v.p, DType::BF16, {kFullHeadDim, kv_heads, width, batch}),
+                         Tensor(d_positions.p, DType::I32, {width, batch}),
+                         masked ? Tensor(d_valid.p, DType::I32, {batch}) : Tensor{},
+                         Tensor(d_rows.p, DType::I32, {batch}), view, nullptr);
+
+    const std::size_t column = static_cast<std::size_t>(kFullHeadDim) * kv_heads;
+    for (int b = 0; b < batch; ++b) {
+        const int count = std::min(std::max(valid[b], 0), width);
+        if (count == 0) { continue; }
+        PagedKVLayerView row;
+        planes(single, row);
+        row.block_table = Tensor(static_cast<std::int32_t*>(d_tables.p) +
+                                     static_cast<std::size_t>(rows[b]) * kRowPages,
+                                 DType::I32, {kRowPages});
+        const std::size_t offset = column * static_cast<std::size_t>(width) * b;
+        ops::kv_cache_append(
+            Tensor(static_cast<std::uint16_t*>(d_k.p) + offset, DType::BF16,
+                   {kFullHeadDim, kv_heads, count}),
+            Tensor(static_cast<std::uint16_t*>(d_v.p) + offset, DType::BF16,
+                   {kFullHeadDim, kv_heads, count}),
+            Tensor(static_cast<std::int32_t*>(d_positions.p) + static_cast<std::size_t>(width) * b,
+                   DType::I32, {count}),
+            row, nullptr);
+    }
+    cuda_synchronize();
+
+    int failures = 0;
+    for (int plane = 0; plane < 4; ++plane) {
+        const std::size_t size = bytes[plane] == 0 ? 1 : bytes[plane];
+        std::vector<std::uint8_t> a(size), e(size);
+        batched[plane].copy_to_host(a.data(), size);
+        single[plane].copy_to_host(e.data(), size);
+        if (a != e) {
+            std::size_t at = 0;
+            while (a[at] == e[at]) { ++at; }
+            std::cerr << "batched kv_cache_append storage=" << static_cast<int>(storage)
+                      << " heads=" << kv_heads << " W=" << width << " B=" << batch
+                      << " masked=" << masked << ": plane " << plane << " differs at byte " << at
+                      << '\n';
+            ++failures;
+        }
+        failures += batched[plane].verify_guards("batched kv_cache_append");
+        failures += single[plane].verify_guards("single kv_cache_append");
+    }
+    return failures;
+}
+
+int batched_append_tests() {
+    int failures = 0;
+    for (const KvCacheStorage storage :
+         {KvCacheStorage::BFloat16, KvCacheStorage::Int8Group64, KvCacheStorage::Fp8E4M3Row256,
+          KvCacheStorage::Nvfp4Group16, KvCacheStorage::Fp8KeyNvfp4Value,
+          KvCacheStorage::RotatedInt8KeyInt4ValueGroup64, KvCacheStorage::RotatedLloyd4KeyInt4Value,
+          KvCacheStorage::RotatedInt4KeyInt4ValueE8, KvCacheStorage::RotatedE8RootKeyInt4Value,
+          KvCacheStorage::Bf16Packed}) {
+        for (const int kv_heads : {4, 2, 1}) {
+            // An ordinary round's 64 rows of one column each; verification-shaped rows, some
+            // masked short.
+            failures += batched_append_case(storage, kv_heads, 1, 64, false);
+            failures += batched_append_case(storage, kv_heads, 3, 5, true);
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -2255,6 +2415,7 @@ int main(int argc, char** argv) {
     failures += cyclic_decode_batch_case(kDFlashWindow);
     failures += cyclic_decode_batch_case(kDFlash2Window);
     failures += cyclic_variable_prefix_tests();
+    failures += batched_append_tests();
 
     if (failures != 0) {
         std::cerr << "kv_cache_append failures=" << failures << '\n';

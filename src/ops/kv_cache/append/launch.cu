@@ -17,12 +17,14 @@ template <typename Geometry, typename CacheView, typename Metadata>
 void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, CacheView cache,
                  Metadata metadata, cudaStream_t stream) {
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
+    // A batched view's sequences, one grid row each; the page kernels take one sequence.
+    const auto sequences = static_cast<unsigned>(k.ne[3]);
     Tensor& cache_k   = cache.k_pages;
     Tensor& cache_v   = cache.v_pages;
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
         Tensor& cache_k_scale = cache.k_scale_pages;
         Tensor& cache_v_scale = cache.v_scale_pages;
-        if (tokens >= 128 && Geometry::KVHeads <= 2) {
+        if (tokens >= 128 && Geometry::KVHeads <= 2 && sequences == 1) {
             constexpr int TokensPerTile = 8;
             const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
             const dim3 fill_grid(static_cast<unsigned>(max_tiles),
@@ -41,7 +43,8 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
             const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
             const int fill_grid =
                 static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
-            kv_cache_append_full_fp8_kernel<Geometry, Metadata><<<fill_grid, kBlock, 0, stream>>>(
+            kv_cache_append_full_fp8_kernel<Geometry, Metadata>
+                <<<dim3(fill_grid, sequences), kBlock, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(k.data),
                 static_cast<const __nv_bfloat16*>(v.data),
                 static_cast<const std::int32_t*>(positions.data), metadata,
@@ -59,7 +62,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
         // plane is a packed key coding, told apart by storage. Otherwise the plane is plain INT8.
         const bool packed_values = cache.v_pages.dtype == DType::U8;
         const auto issue         = [&]<bool PackedValues, KvKeyCoding Keys>() {
-            if (tokens >= 128 && Geometry::KVHeads <= 2) {
+            if (tokens >= 128 && Geometry::KVHeads <= 2 && sequences == 1) {
                 constexpr int TokensPerTile = 8;
                 const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
                 const dim3 fill_grid(static_cast<unsigned>(max_tiles),
@@ -80,7 +83,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
                 const int fill_grid =
                     static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
                 kv_cache_append_full_i8_kernel<Geometry, Metadata, PackedValues, Keys>
-                    <<<fill_grid, kBlock, 0, stream>>>(
+                    <<<dim3(fill_grid, sequences), kBlock, 0, stream>>>(
                         static_cast<const __nv_bfloat16*>(k.data),
                         static_cast<const __nv_bfloat16*>(v.data),
                         static_cast<const std::int32_t*>(positions.data), metadata,
@@ -113,7 +116,7 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     if (cache.storage == KvCacheStorage::Float16) {
         using Stored = KvKeyCodeT<KvCacheStorage::Float16>;
         kv_cache_append_full_16bit_kernel<Geometry, Metadata, float, Stored>
-            <<<fill_grid, Block, 0, stream>>>(
+            <<<dim3(fill_grid, sequences), Block, 0, stream>>>(
                 static_cast<const float*>(k.data), static_cast<const float*>(v.data),
                 static_cast<const std::int32_t*>(positions.data), metadata,
                 static_cast<Stored*>(cache_k.data), static_cast<Stored*>(cache_v.data), tokens);
@@ -123,7 +126,8 @@ void launch_full(const Tensor& k, const Tensor& v, const Tensor& positions, Cach
     using CacheKey   = KvKeyCodeT<KvCacheStorage::BFloat16>;
     using CacheValue = KvValueCodeT<KvCacheStorage::BFloat16>;
     assert_kv_code_planes<KvCacheStorage::BFloat16, CacheKey, CacheValue>();
-    kv_cache_append_full_16bit_kernel<Geometry, Metadata><<<fill_grid, Block, 0, stream>>>(
+    kv_cache_append_full_16bit_kernel<Geometry, Metadata>
+        <<<dim3(fill_grid, sequences), Block, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
         static_cast<const std::int32_t*>(positions.data), metadata,
         static_cast<CacheKey*>(cache_k.data), static_cast<CacheValue*>(cache_v.data), tokens);

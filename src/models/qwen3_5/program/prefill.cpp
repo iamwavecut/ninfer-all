@@ -847,7 +847,10 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         return timing.finish();
     }
 
-    if (speculative_backend == SpeculativeBackend::None) {
+    // An ordinary round, also under MTP past kMaximumSpeculativeRows rows.
+    if (speculative_backend == SpeculativeBackend::None ||
+        (!lanes.empty() && lanes.front() < max_concurrency &&
+         requests[lanes.front()].pending.kind == PendingKind::Ordinary)) {
         for (std::size_t row = 0; row < lanes.size(); ++row) {
             const std::uint32_t lane = lanes[row];
             if (lane >= max_concurrency || requests[lane].lifecycle != Lifecycle::Pending ||
@@ -1208,9 +1211,12 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                     const std::int32_t next  = mtp_host_egress->next_extents[row];
                     sequence.mtp_draft_count    = static_cast<std::uint32_t>(next);
                     sequence.mtp_drafts_pending = false;
+                    // Step-major at the frame's rows: at most kMaximumSpeculativeRows.
+                    const auto frame_rows =
+                        static_cast<std::uint32_t>(io.mtp_decode->next_drafts.ne[0]);
                     for (std::uint32_t step = 0; step < sequence.mtp_draft_count; ++step) {
                         sequence.mtp_drafts[step] =
-                            mtp_host_egress->next_drafts[step * max_concurrency + row];
+                            mtp_host_egress->next_drafts[step * frame_rows + row];
                     }
                     // Context lookup, preferred over the draft head's guess whenever the n-gram has
                     // been seen before. The two are complements: the head is weakest on output that

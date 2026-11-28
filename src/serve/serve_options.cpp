@@ -2097,16 +2097,18 @@ ServeOptions parse_serve_arguments(bool artifact_given, const std::vector<std::s
         throw std::invalid_argument("--max-concurrency must be in [1," +
                                     std::to_string(kMaximumConcurrency) + "] or auto");
     }
-    if (options.speculative.backend != SpeculativeBackend::None) {
+    // MTP drafts while at most kMaximumSpeculativeRows requests decode and runs ordinary rounds
+    // past that; a block drafter's slots serve at most that many requests.
+    if (options.speculative.backend != SpeculativeBackend::None &&
+        options.speculative.backend != SpeculativeBackend::Mtp) {
         if (options.max_concurrency_auto) {
             options.max_concurrency = std::min(options.max_concurrency, kMaximumSpeculativeRows);
         } else if (options.max_concurrency > kMaximumSpeculativeRows) {
             throw product::OptionConflict(
                 {"spec", "max-concurrency"},
-                "--spec runs at most " + std::to_string(kMaximumSpeculativeRows) +
-                    " requests at once; past that a round of drafts costs more than it saves. "
-                    "Use --max-concurrency " + std::to_string(kMaximumSpeculativeRows) +
-                    " or less, or --spec none");
+                "a block drafter runs at most " + std::to_string(kMaximumSpeculativeRows) +
+                    " requests at once. Use --max-concurrency " +
+                    std::to_string(kMaximumSpeculativeRows) + " or less, --spec mtp or --spec none");
         }
     }
     if (!options.max_pending_requests_given) {
