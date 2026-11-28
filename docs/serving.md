@@ -2680,7 +2680,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--rope-yarn-factor F` | YaRN at a fixed factor in `[1,4]` for every position whatever `--max-context` is, as Qwen documents one factor per deployment; it grows neither the default context nor the KV pool, and long-context extrapolation is not a quality guarantee | `1` (as `--rope-yarn` decides) |
 | `--rope-scaling-factor F` | instead of YaRN, linear position interpolation for the Qwen3.5 text and MTP layers: a position past `--rope-scaling-original-context` rotates at original + (position - original) / F, so positions up to it keep their exact angles; `[1,32]`, excludes `--rope-yarn` and `--rope-yarn-factor`, and raises neither the four-times-native window cap nor the KV pool. The DFlash adapter keeps its plain RoPE; Qwen3.8-Flash-Next and Gemma 4 refuse it and take YaRN only, Flint and Inkling 2 refuse both | `1` (off) |
 | `--rope-scaling-original-context N` | the interpolation threshold | the native window |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `auto` with the hybrid prefix cache and `--max-context` with the checkpoint catalog | `auto`; `--max-context` with the checkpoint catalog |
+| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `auto` with the hybrid prefix cache and `--max-context` with the checkpoint catalog up to 8 requests; past 8 the catalog's pool is `auto` too, since one window of 2048 tokens holds 32 pages of 64 tokens and every request needs one | `auto`; `--max-context` with the checkpoint catalog up to `--max-concurrency 8` |
 | `--kv-headroom-mib N` | device memory in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto`. `--vram-headroom-mib` is accepted as an alias | `1024` |
 | `--kv-host-mib N\|auto` | Qwen3.5 family on one device under Linux: continue the KV pool into N MiB of pinned host memory that the GPU reads in place, exact but slower for the part of a context there ([KV host tier](cli.md#kv-host-tier)); `auto` sizes it for every request to reach `--max-context` | `0` (off) |
 | `--max-concurrency N\|auto` | maximum admitted requests, `1..64`; `auto` admits as many as fit once the weights are loaded, each with its recurrent state and one `--max-context` KV window (with an explicit `--kv-capacity`, as many as its pages hold whole windows), and logs the count with each request's state and KV. With `--spec`, at most 8 (`auto` stops there); Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next take `1..8` and refuse `auto` | `1` |
@@ -2898,7 +2898,12 @@ without thinking, or one whose reasoning never closes, keeps its original sample
 `request_done` record reports `post_thinking_sampling` when the switch happened.
 
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`:
-`C` slots guarantee active requests and `H` is a global checkpoint pool. A Qwen3.5-core model keeps
+`C` slots guarantee active requests and `H` is a global checkpoint pool. A running request keeps
+its own checkpoints (its prompt's rewrite checkpoint, its long anchors) until it finishes, so a
+capture that would leave fewer free images than free request lanes goes to Host State, or without
+Host State is skipped: with `H` smaller than `C` (the default past eight requests) every lane is
+still admitted, and a request that skipped its capture resumes its next turn from an earlier
+checkpoint. A Qwen3.5-core model keeps
 `min(C, 8)` more images beside the catalog: the state where a stop string's match began, which a
 turn returns to when the stop string ends it rounds later, so the next turn resumes there. Up to
 eight requests each have one; past eight a request takes a free one when a stop string's match
