@@ -818,18 +818,23 @@ on another RTX 5090 (575 W) such a start held 106,368 tokens against 57,728 with
 device, and decoded 210.8, 883.9 and 1,369.7 tok/s for 1, 8 and 64 requests against 200.1, 877.9
 and 1,374.2 (November 28, one run each).
 
-Qwen3.8-27B's Q4 gate and up projection runs its small-T kernel up to 64 columns: 186 µs against
-319 µs for the 64-by-128 tile at 64 columns on the RTX 5090, 432 µs against 782 µs on the
-RTX 3090. The RTX 5090's profile routes 33 to 64 ternary columns to 64-column schedules. On the
-RTX 3090 those lose to two launches of 32 columns and the rest; its profile routes 33 to 56 columns
-to schedules of 40, 48 and 56 columns, which read the weights once for a round of up to that many
-requests and split K as the 32-column schedule does. Bonsai 2 then decodes 878.4 tok/s at 40
-requests, 891.8 at 48 and 923.8 at 56 against 780.4, 840.1 and 849.3 on two launches (November 28,
-one run each; 64 requests keep the two launches, 903.5). At 64 requests a Qwen3.8-27B round on the RTX 5090
-takes 45.7 ms: recurrent state 11.5 ms, gate and up 11.3 ms, down 11.1 ms. `--max-concurrency auto --max-context 4096` admits 29 Qwen3.8-27B requests on the
-RTX 3090 (552.1 tok/s with 29 streams) and 60 on the RTX 5090 (1,111.1 tok/s with 60), 63 Bonsai 2
-requests on the RTX 3090 (891.4 tok/s): each request holds 146.8 MiB of recurrent state and
-102.0 MiB of KV.
+Qwen3.8-27B's Q4 gate and up projection runs its small-T kernel up to 64 columns: 186 µs against 319
+µs for the 64-by-128 tile at 64 columns on the RTX 5090, 432 µs against 782 µs on the RTX 3090. On
+the RTX 3090 single launches of 64 columns lose to two launches of 32 columns and the rest; its
+profile routes 33 to 56 columns to schedules of 40, 48 and 56 columns, which read the weights once
+for a round of up to that many requests and split K as the 32-column schedule does. Bonsai 2 then
+decodes 878.4 tok/s at 40 requests, 891.8 at 48 and 923.8 at 56 against 780.4, 840.1 and 849.3 on
+two launches (November 28, one run each; 64 requests keep the two launches, 903.5). The other cards'
+profiles choose among these schedules, the 64-column ones and the two launches by calibration, at
+each card's default power limit. On an RTX 5090 (575 W) whose profile had routed 33 to 64 columns to
+64-column schedules, Bonsai 2 at `--max-context 4096` decoded 1,774.4, 1,800.1, 1,857.0 and 1,935.0
+tok/s at 40, 48, 56 and 64 requests with the calibrated routes against 1,707.6, 1,789.2, 1,858.9 and
+1,933.8 with the 64-column ones (November 28, one run each; two more runs with the calibrated routes
+stayed within 0.4%). At 64 requests a Qwen3.8-27B round on the RTX 5090 takes 45.7 ms: recurrent
+state 11.5 ms, gate and up 11.3 ms, down 11.1 ms. `--max-concurrency auto --max-context 4096` admits
+29 Qwen3.8-27B requests on the RTX 3090 (552.1 tok/s with 29 streams) and 60 on the RTX 5090
+(1,111.1 tok/s with 60), 63 Bonsai 2 requests on the RTX 3090 (891.4 tok/s): each request holds
+146.8 MiB of recurrent state and 102.0 MiB of KV.
 
 ### RTX PRO 6000 against RTX 5090, October 2026
 
