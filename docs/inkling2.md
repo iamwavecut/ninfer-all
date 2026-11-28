@@ -42,8 +42,9 @@ tokenization, the chat template, output parsing and the serving protocols.
   exactly; it decodes such a vector from any other ggml block format as well (some GGUFs store
   Q4_K).
   Vector kernels multiply up to eight tokens (and the routed experts of decode and verification
-  calls of 9 to 64 where they are no slower, of host or disk experts the device cache does not hold
-  entirely), integer matrix kernels the prompt chunks and other wider calls, the expert
+  calls of 9 to 64 of host or disk experts the device cache does not hold entirely, while the CPU
+  computes a share of the misses, the default, otherwise where they are no slower), integer
+  matrix kernels the prompt chunks and other wider calls, the expert
   products the routed experts only; a layer's query, gate, relative, key and value products of one
   format share vector launches ([GGUF products](gguf.md#products)). The NVFP4 experts' matrix
   kernel stages its tiles through `cp.async` where the card's
@@ -1150,8 +1151,8 @@ threads compute, through the transport Gemma 4 and Flint use
 rounds and the growing KV): a whole-layer bank for a prompt chunk's missing experts, a cache of the
 experts decode routes most (`--expert-cache-mib`), and a CPU share of a decode call's misses
 (`--expert-dma-share`, `--expert-cpu-threads`; at 9 to 64 tokens when the call's experts take the
-vector kernels and it routes to fewer than half the layer's experts, [GGUF
-products](gguf.md#products)) computed from the stored blocks into the same 2^-32 fixed-point sums
+vector kernels, [GGUF products](gguf.md#products)) computed from the stored blocks into the same
+2^-32 fixed-point sums
 as the GPU's, so outputs do not depend on the split. A model whose calls run on
 BF16 rows (UD-Q8_K_XL, [above](#what-runs)) has no CPU share: the GPU copies every miss. At startup the cache takes
 the most routed experts of the build's routing profile for this geometry, recorded over four chat

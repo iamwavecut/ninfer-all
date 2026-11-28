@@ -1,6 +1,7 @@
 #include "ops/sparse_moe/streamed.h"
 
 #include "core/layout.h"
+#include "core/qtype.h"
 
 #include <algorithm>
 #include <array>
@@ -18,10 +19,19 @@ template <class Arena> Tensor allocate_products(Arena& arena, std::int32_t token
 
 } // namespace
 
+bool sparse_moe_stream_uses_prefill(std::int32_t tokens, QType routed_gate_up, QType routed_down,
+                                    bool small_t_wide) noexcept {
+    // NVFP4 keeps its W4A4 prefill route from T=13 (Blackwell).
+    if (small_t_wide && tokens <= kSparseMoeStreamSmallTMax && routed_gate_up != QType::NVFP4) {
+        return false;
+    }
+    return sparse_moe_uses_prefill(tokens, routed_gate_up, routed_down);
+}
+
 std::size_t sparse_moe_stream_workspace_bytes(std::int32_t tokens, QType routed_gate_up,
-                                              QType routed_down) {
+                                              QType routed_down, bool small_t_wide) {
     if (tokens < 1) { throw std::invalid_argument("streamed SparseMoe: tokens must be positive"); }
-    if (sparse_moe_uses_prefill(tokens, routed_gate_up, routed_down)) {
+    if (sparse_moe_stream_uses_prefill(tokens, routed_gate_up, routed_down, small_t_wide)) {
         return resolve_sparse_moe_prefill_plan(tokens, routed_gate_up, routed_down).workspace_bytes;
     }
     WorkspaceLayoutBuilder layout;
@@ -32,18 +42,18 @@ std::size_t sparse_moe_stream_workspace_bytes(std::int32_t tokens, QType routed_
 
 void sparse_moe_stream(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                        ExpertDelivery& delivery, std::size_t layer, WorkspaceArena& workspace,
-                       cudaStream_t stream, float route_bias) {
+                       cudaStream_t stream, float route_bias, bool small_t_wide) {
     const auto tokens = static_cast<std::int32_t>(x.ne[1]);
     const QType gate = weights.routed_gate_up.qtype, down = weights.routed_down.qtype;
     auto scope = workspace.scope();
-    if (sparse_moe_uses_prefill(tokens, gate, down)) {
+    if (sparse_moe_stream_uses_prefill(tokens, gate, down, small_t_wide)) {
         const auto plan  = resolve_sparse_moe_prefill_plan(tokens, gate, down);
         const auto views = allocate_sparse_moe_prefill_workspace(workspace, plan.slice_tokens, plan.nvfp4);
         sparse_moe_stream_prefill(x, weights, destination, plan, views, delivery, layer, stream,
                                   route_bias);
         return;
     }
-    if (tokens > kSparseMoeSmallTMax) {
+    if (tokens > kSparseMoeStreamSmallTMax) {
         throw std::invalid_argument("streamed SparseMoe: no Small-T route at this token count");
     }
     const auto views = allocate_sparse_moe_small_t_workspace(workspace, tokens);

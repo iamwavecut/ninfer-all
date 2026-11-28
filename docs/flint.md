@@ -19,8 +19,9 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
 - **The weights stay the GGUF's blocks.** Every matrix keeps its ggml format (UD-Q4_K_XL mixes Q8_0,
   Q6_K, Q5_K, Q4_K, IQ4_XS and IQ3_S), imported row for row without requantization and multiplied by
   the GGUF kernels: vector kernels for up to eight tokens and, for host or disk experts the device
-  cache does not hold entirely, for decode and verification calls of 9 to 64 where they are no
-  slower ([GGUF products](gguf.md#products)), integer matrix kernels for prompt chunks and other
+  cache does not hold entirely, for decode and verification calls of 9 to 64 while the CPU computes
+  a share of the misses (the default), otherwise where they are no slower ([GGUF
+  products](gguf.md#products)), integer matrix kernels for prompt chunks and other
   wider calls, the expert products over the routed experts only. The router, norms and sinks are
   FP32 vectors.
 - **Attention.** Prompt chunks run llama.cpp's tensor-core flash attention with the sinks added to
@@ -368,8 +369,7 @@ rounds and the growing KV):
   quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same 2^-32
   fixed-point sums, so outputs do not depend on the split. A decode or verification call of 9 to 64
   tokens has a CPU share when its experts take the vector kernels ([GGUF
-  products](gguf.md#products)) and it routes to fewer than half the layer's experts; a call on the
-  matrix kernel or routing to half of them or more, and every prompt chunk, use the GPU.
+  products](gguf.md#products)); a call on the matrix kernel and every prompt chunk use the GPU.
 - **Disk reads.** `--expert-mirror` spreads disk experts' reads over a second drive and
   `--expert-direct` lets the drive write them into device memory
   ([disk expert reads](expert-disk-reads.md)).

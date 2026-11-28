@@ -253,7 +253,10 @@ into cache slots, and the rest of a wide call into a whole-layer bank laid out l
 bank (expert e of each plane at a fixed stride), with one host copy per run of consecutive experts
 within one pinned allocation. Two banks let the next layer of a wide call (half the layer's experts
 or more: a prompt slice, a wide verification) arrive while the current layer computes; one bank
-remains where memory is short.
+remains where memory is short. A wide call that comes with the CPU's operands (a decode or
+verification call on the Small-T arithmetic, a round of many requests) does not bring in the next
+layer: that layer's misses are split between the CPU and the bus by the measured times instead of
+the whole layer crossing the bus.
 
 Calls below the codec's prefill frontier (compiled at 47 columns for Q4/Q5 and Q4/Q6, 20 for Q8 and
 13 for NVFP4; a device profile may move it, see [SparseMoe policy
@@ -261,7 +264,13 @@ keys](../device-profiles.md#sparsemoe-policy-keys)) route, run the cached pairs 
 expert while the rest arrive, then run the delivered pairs; both phases write per-rank FP32 products
 that one rank-order sum reduces, adds to the residual and rounds to BF16. This is the resident
 Small-T arithmetic; the Op test holds the streamed Q4/Q5, Q4/Q6 and Q8 outputs to the resident bits
-at every tested call width. Wider calls take the resident grouped prefill route with per-expert raw
+at every tested call width. A decode or verification call of 47 to 64 columns (up to 64 requests)
+whose experts can miss (the cache has fewer slots than the experts delivered to its device) takes
+the same arithmetic past the frontier, NVFP4 excepted: its router scores each token as a call of at
+most 46 tokens does, so the cached pairs start while the rest arrive and the CPU may take a share,
+as below. Such a call's bits differ from a resident call of the same width, which takes the prefill
+route; host and disk experts give the same bits. Wider calls, prompt calls past the frontier and
+calls of experts the cache holds whole take the resident grouped prefill route with per-expert raw
 pointer addressing, after one delivery request per bounded native slice (up to 4096 token rows)
 covers every selected expert. NVFP4 keeps its admitted W4A4 path. Grouped streaming does not take
 the resident adaptive narrow-job shortcut; it takes the same frontier and tile width as resident
@@ -275,10 +284,9 @@ a narrow call's miss takes a free slot, or the slot of the coldest expert the ca
 when its routes beat that expert's, and every four decode passes a round swaps the most routed
 missing experts in, copied behind the calls. A routing profile (`--expert-profile`, else the
 built-in one of the model family where the build has one) fills the slots at startup. On one
-device the CPU computes a share of the misses of a narrow call below the prefill frontier from
-their host bytes (a disk expert's read for the call) while the GPU runs the cached experts and the
-copies arrive
-(`ops/sparse_moe/streamed_cpu`, `--expert-dma-share`, by default the split whose copies and CPU
+device the CPU computes a share of the misses of a call on the Small-T arithmetic, narrow or wide,
+from their host bytes (a disk expert's read for the call) while the GPU runs the cached experts and
+the copies arrive (`ops/sparse_moe/streamed_cpu`, `--expert-dma-share`, by default the split whose copies and CPU
 products end soonest by earlier calls' times): each product row is the streamed d3/d4 kernels' warp
 arithmetic reproduced lane by lane (fused multiply-adds in lane order, the shfl_down tree,
 `ops::portable_silu`), so it is the GPU's bit for bit, and a placement kernel puts the rows into

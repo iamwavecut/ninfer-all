@@ -49,6 +49,11 @@ public:
     [[nodiscard]] ExpertRouteCounts totals() const;
     [[nodiscard]] ExpertDelivery& layer(std::size_t index) const;
     [[nodiscard]] std::size_t local_layer(std::size_t index) const;
+    // Whether expert layer `index`'s calls can miss: its rank's cache holds fewer slots than that
+    // rank's experts of every layer. Its slots change only between calls, so every step of one
+    // call reads the same answer. A decode or verification call of up to 64 columns of such
+    // experts runs the Small-T arithmetic (ops::detail::sparse_moe_stream_uses_prefill).
+    [[nodiscard]] bool can_miss(std::size_t index) const;
     [[nodiscard]] ExpertDeliveryMemory memory(std::size_t rank) const noexcept;
     [[nodiscard]] ExpertDeliveryStats stats() const;
     void check() const;
@@ -83,6 +88,7 @@ private:
     std::vector<Handle> handles_;
     std::vector<std::unique_ptr<ops::detail::SparseMoeStreamCpu>> cpu_;
     std::vector<std::unique_ptr<ExpertDelivery>> ranks_;
+    std::vector<std::uint64_t> delivered_experts_; // per rank, over its layers
     NativeExpertProfile profile_;
     bool elastic_ = false;
     float route_bias_        = 0.0F;

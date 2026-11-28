@@ -13,14 +13,24 @@ namespace ninfer::ops::detail {
 // the grouped prefill waits for the whole slice's experts (one call per bounded native slice).
 inline constexpr std::int32_t kSparseMoeStreamPairs = 8 * kSparseMoePrefillSliceMax;
 
+// Whether a streamed call of `tokens` columns runs the grouped prefill: from the codec's prefill
+// frontier on, except a call of up to kSparseMoeStreamSmallTMax columns with `small_t_wide` (a
+// decode or verification call of Q4, Q5, Q6 or Q8 experts the delivery can miss), which runs the
+// Small-T arithmetic so its cached pairs need not wait for its misses and the CPU can take a
+// share. Such a call rounds as Small-T does, not as the resident experts' prefill route at the
+// same width.
+[[nodiscard]] bool sparse_moe_stream_uses_prefill(std::int32_t tokens, QType routed_gate_up,
+                                                  QType routed_down, bool small_t_wide) noexcept;
 // Workspace of one streamed call of `tokens` columns.
 [[nodiscard]] std::size_t sparse_moe_stream_workspace_bytes(std::int32_t tokens, QType routed_gate_up,
-                                                            QType routed_down);
+                                                            QType routed_down,
+                                                            bool small_t_wide = false);
 // `route_bias` above 0: the routers' bias toward the experts the delivery holds
-// (ExpertDelivery::route_bias, core/expert_route_bias.h).
+// (ExpertDelivery::route_bias, core/expert_route_bias.h). `small_t_wide`:
+// sparse_moe_stream_uses_prefill.
 void sparse_moe_stream(const Tensor& x, const SparseMoeWeights& weights, Tensor& destination,
                        ExpertDelivery& delivery, std::size_t layer, WorkspaceArena& workspace,
-                       cudaStream_t stream, float route_bias = 0);
+                       cudaStream_t stream, float route_bias = 0, bool small_t_wide = false);
 
 void sparse_moe_stream_prefill(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,

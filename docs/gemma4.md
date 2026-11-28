@@ -22,8 +22,9 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
 - **The weights stay the release's blocks.** Every matrix is the GGUF's Q4_0 (the tied token table
   Q6_K), imported row for row without requantization (13.4 GiB) and multiplied by the GGUF kernels:
   vector kernels for up to eight tokens and, for host or disk experts the device cache does not hold
-  entirely, for decode and verification calls of 9 to 64 where they are no slower ([GGUF
-  products](gguf.md#products)), integer matrix kernels for prompt chunks and other wider calls, the
+  entirely, for decode and verification calls of 9 to 64 while the CPU computes a share of the
+  misses (the default), otherwise where they are no slower ([GGUF products](gguf.md#products)),
+  integer matrix kernels for prompt chunks and other wider calls, the
   expert products over the routed experts only. A mixed-format GGUF of the same model (a Q4_K_M
   quantization with Q6_K values, Q5_0 or Q8_0 expert down projections) converts and runs the same
   way, each matrix in its own format.
@@ -731,8 +732,7 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other layers
   copy every miss. An expert the CPU computed takes no slot; the cache's rounds decide whether it
   enters. A decode or verification call of 9 to 64 tokens has a CPU share when its experts take the
-  vector kernels ([GGUF products](gguf.md#products)) and it routes to fewer than half the layer's
-  experts; a call on the matrix kernel or routing to half of them or more copies every miss.
+  vector kernels ([GGUF products](gguf.md#products)); a call on the matrix kernel copies every miss.
 - **Calls.** Vector decode and verification run the cached pairs, then the block's dense MLP
   while the rest arrive, then the rest; both expert stages add to one fixed-point sum, so outputs
   equal resident execution bit for bit. A prompt chunk runs the dense MLP while its experts

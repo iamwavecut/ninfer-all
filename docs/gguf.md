@@ -80,21 +80,25 @@ sums](flint.md#f16-activation-sums)).
 - **Routed experts in decode and verification calls of 9 to 64 columns** (DeepSeek-V4.1, and
   Gemma 4, Flint and Inkling 2 host or disk experts the device cache does not hold entirely, serving
   more than eight requests or verifying more than eight draft rows) take the vector kernel in groups
-  of eight columns where it is no slower than the matrix kernel: a route table fitted on an RTX 3090
-  (`gguf::moe_vector_call_pays`) gives the vector kernel's time over the matrix kernel's for the
-  format, the expert shape, the call's pairs and the layer's experts, and the call takes the vector
-  kernels when the gate-and-up and down ratios weighted by their weights' bytes come to at most 1.
-  Other cards take the RTX 3090's table. A host or disk call on the vector kernels that routes to
-  fewer than half the layer's experts leaves part of its misses to the CPU share; one that routes to
-  half or more copies every miss into the layer's bank. Gemma 4, Flint and Inkling 2 device experts,
-  and host or disk experts a cache holds entirely, take the matrix kernel past eight columns: on an
-  A40 the vector kernels' rounds of 16 to 64 requests ran up to a quarter slower there end to end,
-  against the table's operator times. Calls that take the vector kernels round differently from the
-  device experts' matrix kernel; host and disk experts give the same bits. With a 4 GiB cache on an
-  A40, 16 requests decode Flint at 131.1 tok/s against 68.3 with the matrix kernel and every miss
-  copied, Inkling 2 at 35.5 against 31.6 and Gemma 4 26B at 58.7 against 59.0 (91.1 against 88.5
-  at 32); at 64 requests the two are within 4% (Flint 86.6 against 85.1, Inkling 2 80.9 against
-  83.5).
+  of eight columns. Gemma 4, Flint and Inkling 2 take it whenever the CPU computes a share of the
+  layer's misses (the default; `--expert-dma-share 1` turns the share off). DeepSeek-V4.1, and the
+  others without that share, take it where it is no slower than the matrix kernel: a route table
+  fitted on an RTX 3090 (`gguf::moe_vector_call_pays`) gives the vector kernel's time over the matrix
+  kernel's for the format, the expert shape, the call's pairs and the layer's experts, and the call
+  takes the vector kernels when the gate-and-up and down ratios weighted by their weights' bytes come
+  to at most 1. Other cards take the RTX 3090's table. A host or disk call on the vector kernels
+  leaves part of its misses to the CPU share, also one that routes to half the layer's experts or
+  more (a round of many requests), and copies the rest into the layer's bank without bringing in the
+  next layer's bank; a call on the matrix kernel copies every miss and, when it routes half the
+  experts or more, then brings in the next layer's whole bank. Gemma 4, Flint and Inkling 2 device
+  experts, and host or disk experts a cache holds entirely, take the matrix kernel past eight
+  columns: on an A40 the vector kernels' rounds of 16 to 64 requests ran up to a quarter slower
+  there end to end, against the table's operator times. Calls that take the vector kernels round
+  differently from the device experts' matrix kernel; host and disk experts give the same bits.
+  With a 4 GiB cache on an A40, 64 requests decode Gemma 4 26B at 528.9 tok/s, Flint at 238.6 and
+  Inkling 2 at 211.5, against 167.8-181.5 and 79.4-81.5 on either kernel and 78.7 on the vector
+  kernels before wide calls had the CPU share ([host experts at up to 64
+  requests](performance.md#gemma-4-flint-and-inkling-2-with-host-experts-at-up-to-64-requests)).
 - **Token table** rows are dequantized exactly; a Bonsai table of `PTQ1_0` rows, stored rotated,
   is restored by its Hadamard signs as it is gathered.
 

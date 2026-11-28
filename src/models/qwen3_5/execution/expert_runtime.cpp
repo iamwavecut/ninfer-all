@@ -39,6 +39,10 @@ NativeExpertRuntime::NativeExpertRuntime(const Model& model, DeviceContext& devi
     }
     ranks_.resize(device.size());
     cpu_.resize(device.size());
+    delivered_experts_.assign(device.size(), 0);
+    for (std::size_t rank = 0; rank < layers.size(); ++rank) {
+        for (const auto& layer : layers[rank]) { delivered_experts_[rank] += layer.experts.size(); }
+    }
     elastic_ = device.size() == 1 && vmm::granularity(device.rank(0).device) != 0;
     for (std::size_t rank = 0; rank < layers.size(); ++rank) {
         if (layers[rank].empty()) { continue; }
@@ -112,6 +116,10 @@ ExpertDelivery& NativeExpertRuntime::layer(std::size_t index) const {
 }
 std::size_t NativeExpertRuntime::local_layer(std::size_t index) const {
     return handles_.at(index).local;
+}
+bool NativeExpertRuntime::can_miss(std::size_t index) const {
+    const std::size_t rank = handles_.at(index).rank;
+    return std::uint64_t(ranks_.at(rank)->memory().cache_slots) < delivered_experts_.at(rank);
 }
 ExpertDeliveryMemory NativeExpertRuntime::memory(std::size_t rank) const noexcept {
     return rank < ranks_.size() && ranks_[rank] ? ranks_[rank]->memory() : ExpertDeliveryMemory{};

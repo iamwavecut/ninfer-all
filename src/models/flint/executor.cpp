@@ -1362,16 +1362,21 @@ struct Executor::Impl {
     // Whether a call of t tokens runs block p's routed experts on the vector kernels into the exact
     // fixed-point sum, the cached experts while the missing ones arrive and the CPU's share beside
     // them: up to 8 tokens always, a wider decode call where the layer's experts can miss
-    // (experts_can_miss) and the vector kernels are no slower than both products on the matrix
-    // kernel (gguf::moe_vector_call_pays). Resident or wholly cached experts take the matrix kernel
-    // past 8 tokens: on an A40 the vector kernels' rounds of 16 to 64 requests were up to a quarter
-    // slower there end to end, against the route table's op measurements.
+    // (experts_can_miss) when the CPU computes the layer's share (its misses then go to the CPU and
+    // the bus, not as the whole layer: on an A40 with a 4,096 MiB cache, 64 requests decoded
+    // 238.6 tok/s against 81.5 on the matrix kernel without the CPU's share), or else where the
+    // vector kernels are no slower than both products on the matrix kernel
+    // (gguf::moe_vector_call_pays).
+    // Resident or wholly cached experts take the matrix kernel past 8 tokens: on an A40 the vector
+    // kernels' rounds of 16 to 64 requests were up to a quarter slower there end to end, against
+    // the route table's op measurements.
     [[nodiscard]] bool vector_call(const LayerPlan& p, int t) const {
         if (t <= gguf::kMaxVectorColumns) { return true; }
+        if (prompt_pass || t > CpuExperts::kMaxTokens || !experts_can_miss(p)) { return false; }
+        if (cpu_experts && cpu_experts->supports(std::size_t(p.delivery_layer))) { return true; }
         const std::int64_t pairs   = std::int64_t(t) * config.top_k_experts;
         const std::int64_t experts = config.num_experts;
-        return !prompt_pass && t <= CpuExperts::kMaxTokens && experts_can_miss(p) &&
-               gguf::moe_vector_call_pays(p.gate_up_type, p.down_type, hidden,
+        return gguf::moe_vector_call_pays(p.gate_up_type, p.down_type, hidden,
                                           int(config.moe_intermediate_size), pairs, experts);
     }
 

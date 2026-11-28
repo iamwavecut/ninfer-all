@@ -79,12 +79,15 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
                                         tokens, streamed->weights.routed_gate_up.qtype,
                                         streamed->weights.routed_down.qtype));
         }
-        // Small-T grows with the column count up to the prefill frontier.
-        for (std::int32_t tokens = first; tokens <= std::min(last, ops::detail::kSparseMoeSmallTMax);
-             ++tokens) {
-            bytes = std::max(bytes, ops::detail::sparse_moe_stream_workspace_bytes(
-                                        tokens, streamed->weights.routed_gate_up.qtype,
-                                        streamed->weights.routed_down.qtype));
+        // Small-T grows with the column count up to the prefill frontier, and for a decode or
+        // verification call of experts that can miss up to kSparseMoeStreamSmallTMax columns.
+        for (std::int32_t tokens = first;
+             tokens <= std::min(last, ops::detail::kSparseMoeStreamSmallTMax); ++tokens) {
+            for (const bool small_t_wide : {false, true}) {
+                bytes = std::max(bytes, ops::detail::sparse_moe_stream_workspace_bytes(
+                                            tokens, streamed->weights.routed_gate_up.qtype,
+                                            streamed->weights.routed_down.qtype, small_t_wide));
+            }
         }
         return bytes;
     }
@@ -235,9 +238,12 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         }
         auto& delivery = experts->layer(moe->delivery_layer);
         delivery.check();
+        // A decode or verification call (the Verify phase) of experts that can miss runs Small-T
+        // up to 64 columns: its cached pairs start while the misses arrive, the CPU taking a share.
         ops::detail::sparse_moe_stream(hidden, moe->weights, residual, delivery,
                                        experts->local_layer(moe->delivery_layer), workspace, stream,
-                                       mtp ? 0.0F : experts->route_bias(verify));
+                                       mtp ? 0.0F : experts->route_bias(verify),
+                                       verify && experts->can_miss(moe->delivery_layer));
         return;
     }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {

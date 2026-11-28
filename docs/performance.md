@@ -951,6 +951,31 @@ probabilities. Every answer differs from `c04ea310`'s, whose GPU computed SiLU w
 `expf` (an approximate hardware exponential); the current kernels compute it from correctly rounded
 operations, as the CPU does. Startup took 1.2-1.7 s longer and device memory was unchanged (22,860 MiB).
 
+### Up to 64 requests with host experts
+
+`ninfer-serve --max-concurrency 64 --max-context 2048 --kv-dtype rk8v4 --expert-residency host
+--expert-cache-mib 3072` with the official `groupwise-int` artifact, `serve_load.py --profile
+chat`: N short-chat requests of 256 tokens arrive together, EOS ignored; tok/s while all N decode
+at once (`steady_tps`), November 28, one run each. In `5d2358f4` a decode call that routed half a
+layer's experts or more (from about 32 requests) left the CPU no share of its misses, copied every
+one into the layer's bank and then brought in the next layer's whole bank; the current build gives
+such a call the CPU's share and does not bring in the next layer, and runs calls of 47 to 64
+tokens on the Small-T arithmetic.
+
+| Card | Build | 8 | 16 | 32 | 48 | 64 |
+|---|---|---:|---:|---:|---:|---:|
+| RTX 3090 (390 W, PCIe 4.0 x16, Ryzen 9 3900X) | `5d2358f4` | 124.95 | 149.84 | 121.50 | 92.86 | 101.15 |
+| | current | 127.38 | 149.06 | 161.58 | 192.75 | 206.57 |
+| A40 (300 W, PCIe 4.0 x16, 61 of 2x EPYC 7662's threads) | `5d2358f4` | 168.47 | 203.66 | 143.06 | 85.89 | 97.28 |
+| | current | 200.54 | 247.77 | 266.37 | 289.61 | 320.12 |
+
+A round of 64 requests takes 310 ms on the RTX 3090 (633 ms before) and 200 ms on the A40
+(658 ms). A second `5d2358f4` run at 8 requests on the A40 gave 185.76. On the RTX 3090 the
+slowest 1% of token gaps grew from 456 to 551 ms at 32 requests and from 748 to 844 ms at 64; on
+the A40 they went from 485 to 492 ms and from 842 to 700 ms. The median time to the first token at
+64 requests grew from 3.9 to 5.0 s on the RTX 3090 and from 5.4 to 6.7 s on the A40; at 8 to 48
+requests it moved both ways.
+
 ## Qwen3.8-Flash-Next
 
 ### Expert placements
@@ -1214,6 +1239,44 @@ short-chat requests of 256 tokens arrive together, EOS ignored; tok/s while all 
 |---|---:|---:|---:|---:|---:|---:|
 | RTX 3090, QAT Q4_0 | 1,024 | 499.7 | 705.1 | 1,079.4 | 1,374.8 | 1,656.0 |
 | RTX 5090, QAT Q4_0 | 1,024 | 1,193.0 | 1,790.4 | 2,804.7 | 3,551.4 | 4,273.8 |
+
+### Gemma 4, Flint and Inkling 2 with host experts at up to 64 requests
+
+`ninfer-serve --max-concurrency 64 --kv-dtype rk8v4 --expert-residency host --expert-cache-mib
+4096`, `--max-context` 1,024 for Gemma 4 26B and 2,048 for Flint and Inkling 2,
+`serve_load.py --profile chat`: N short-chat requests of 256 tokens arrive together, EOS ignored;
+tok/s while all N decode at once (`steady_tps`), November 28, one run each. Before, a wide call
+(half a layer's experts or more) left the CPU no share of its misses on either kernel; `5d2358f4`
+picked the kernel by the route table, and lab builds of that arithmetic forced each kernel on the
+A40. Current is the default: the vector kernels with the CPU share
+([GGUF products](gguf.md#products)).
+
+| Model | Card | Build | 32 | 48 | 64 |
+|---|---|---|---:|---:|---:|
+| Gemma 4 26B-A4B, QAT Q4_0 | A40 | before, vector kernels | | 127.49 | 167.81 |
+| | | before, matrix kernel | | 135.64 | 181.54 |
+| | | current | 360.12 | 452.78 | 528.85 |
+| Flint, UD-Q4_K_XL | A40 | before, vector kernels | | 53.62 | 79.40 |
+| | | before, matrix kernel | | 55.47 | 81.45 |
+| | | current | 149.76 | 179.33 | 238.57 |
+| Inkling 2 Mini, UD-IQ4_XS | A40 | before, vector kernels | 41.30 | 56.10 | 78.74 |
+| | | before, matrix kernel | 42.12 | 56.20 | 79.76 |
+| | | current | 150.61 | 176.55 | 211.46 |
+| Gemma 4 26B-A4B, QAT Q4_0 | RTX 3090 | `5d2358f4` | 92.61 | 138.73 | 183.87 |
+| | | current | 204.45 | 261.75 | 321.92 |
+
+The A40 and the RTX 3090 are the hosts of the Qwen3.6-35B-A3B table above. The matrix kernel's
+first run of Inkling 2 at 64 requests failed one request, whose prompt had waited 120 s for its
+turn; with the watchdog measuring only decoding requests, a second run served all 64 (79.76, the
+median first token after 45.3 s). The current rows were
+measured with the vector kernels forced, which the default now does: it gave 316.35 for Gemma 4
+26B at 64 on the RTX 3090. The route table alone picks the matrix kernel for Inkling 2 at 48 and 64
+requests and for Gemma 4 26B at 64; with the CPU share on vector calls but those calls on the matrix
+kernel, Inkling 2 decoded 61.85 and 79.11 on the A40 and Gemma 4 26B 185.01 on the RTX 3090, and
+with a 7,168 MiB cache Gemma 4 26B decoded 387.14 at 64 requests against 571.85 on the vector
+kernels. Flint on the RTX 3090 (`--max-context 1024`: 64 sequences of 2,048 tokens do not fit
+beside the cache) decoded 120.17 / 125.54 / 153.92 at 32 / 48 / 64 requests with the route table's
+kernel and 125.27 / 129.15 / 167.15 on the vector kernels, 167.54 with the default.
 
 ## Flint
 

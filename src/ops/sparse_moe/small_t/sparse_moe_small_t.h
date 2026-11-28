@@ -16,6 +16,10 @@ namespace ninfer::ops::detail {
 inline constexpr std::int32_t kSparseMoeSmallTMin = 2;
 // The fixed kernel domain covers the largest codec-specific small-T frontier.
 inline constexpr std::int32_t kSparseMoeSmallTMax = 46;
+// The widest call of delivered experts that may run the Small-T arithmetic: a decode or
+// verification call of up to 64 requests (ops::kMaximumDecodeRows). Its router runs in groups of
+// at most kSparseMoeSmallTMax tokens, each token's scores as in a call of its group alone.
+inline constexpr std::int32_t kSparseMoeStreamSmallTMax = 64;
 
 enum class SparseMoeSmallTD3Schedule : std::uint8_t {
     Paths1,
