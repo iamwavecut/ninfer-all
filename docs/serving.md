@@ -621,7 +621,7 @@ stops it, and it continues with another token. How each family goes back:
 | Family | Going back | Reach and cost |
 |---|---|---|
 | Qwen3.5, 3.6 and 3.8 (`Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`) | The request's sequence ends and the request queues again at the head of the queue: its prompt is the submitted one followed by the generated tokens it keeps, and its first draw is the rewound position. | Any distance. The context cache resumes the new prompt from the deepest state it holds: one token short of its end when the hold began in the round that completed the string, after that round's first token (a speculative round); otherwise a state at or before the submitted prompt's end, so the generated tokens up to the hold run again as prompt tokens (each requeue asks the cache for a resume point at its own prompt's end, for a later rewind). Without the context cache, or for a prompt that may not be reused, the whole prompt runs again. The result's timings add up every sequence's prefill and decode. |
-| Qwen3.8-Flash-Next and Edge0 | The recurrent state is copied when the hold begins, into the snapshot a stop string's hold uses, and restored; attention rows are kept by position. | Any distance. The snapshot takes 74 MiB a sequence, which `--structured-output` allocates also without the context cache. A hold that begins inside a speculative round ends that round's commit at the hold's token, and the tokens after it run in the next step. While a hold is alive a stop string keeps no state of its own, so a turn it cuts there leaves no resume point at the cut. |
+| Qwen3.8-Flash-Next, Edge0 and dense Qwen4 | The recurrent state is copied when the hold begins, into the snapshot a stop string's hold uses, and restored; attention rows are kept by position. | Any distance. The snapshot takes a sequence's recurrent state (74 MiB for Flash-Next), which `--structured-output` allocates also without the context cache. A hold that begins inside a speculative round ends that round's commit at the hold's token, and the tokens after it run in the next step. While a hold is alive a stop string keeps no state of its own, so a turn it cuts there leaves no resume point at the cut. |
 | Gemma 4 | The windowed blocks' rings keep rows past the window; full-attention rows are kept by position. No state is copied. | With drafts (`--spec mtp`, `dspine`, `dflash` or `dspark`; rings of 1280 rows for a window of 1024), 256 positions less a round's drafts; without drafts, the 32 decode steps after the hold begins, whose overwritten rows a hold keeps. |
 | Flint | The rings keep 768 positions for a window of 513; full-attention rows are kept by position. No state is copied. | 255 positions less a round's drafts. |
 | DeepSeek-V4.1 | The window rings and compressor tails are copied when the hold begins and restored; compressed rows are kept by position. | Any distance. With `--structured-output` and the context cache off, the copies take two more copies of each sequence's window rings (5.3 MiB each), as the context cache's checkpoints do. A hold that begins inside a speculative round is copied as the round commits, with no extra pass. |
@@ -3209,12 +3209,12 @@ against Windows headers but has not been run.
 
 ### Context cache of the other families
 
-Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next keep a context cache of their own:
-images of a sequence's whole state in pinned host memory, within `--host-kv-mib` (or
-`--host-cache-mib`, 8 GiB by default). A sequence's state goes to an image before another request
-takes the sequence, and so does the state where the frontend marks a prefix that requests share,
-when copying it back costs less than computing it again; each family's guide says what an image
-holds ([Gemma 4](gemma4.md#prefix-reuse), [Flint](flint.md#prefix-reuse),
+Gemma 4, Flint, DeepSeek-V4.1, Inkling 2 and Qwen3.8-Flash-Next (with [dense Qwen4](qwen4-dense.md))
+keep a context cache of their own: images of a sequence's whole state in pinned host memory, within
+`--host-kv-mib` (or `--host-cache-mib`, 8 GiB by default). A sequence's state goes to an image
+before another request takes the sequence, and so does the state where the frontend marks a prefix
+that requests share, when copying it back costs less than computing it again; each family's guide
+says what an image holds ([Gemma 4](gemma4.md#prefix-reuse), [Flint](flint.md#prefix-reuse),
 [DeepSeek-V4.1](deepseek-v41.md#prefix-reuse), [Inkling 2](inkling2.md#prefix-reuse),
 [Qwen3.8-Flash-Next](qwen3-8-flash-next.md#sequences-kv-and-the-context-cache)). A prompt on any
 sequence resumes from the longest image it starts with. An image larger than the budget is not

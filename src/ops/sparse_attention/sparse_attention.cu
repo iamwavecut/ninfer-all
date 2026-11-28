@@ -1,11 +1,12 @@
 // ninfer::ops - Qwen3.8-Flash-Next sparse attention over selected blocks and the query's own
-// incomplete block (contract in include/ninfer/ops/sparse_attention.h), over both KV heads or one
-// (a tensor-parallel share). A CTA takes one (query, KV head): its twelve query heads, one warp
-// each, stream positions in 32-key tiles staged in shared memory, each lane scoring one key and
-// accumulating eight output dims online. Up to eight queries split their positions over CTAs of 64
-// positions each (a grid fixed for any position, so a graph replays it), and a second launch
-// merges the partial softmaxes; wider calls run the whole list in one CTA per (query, KV head), on
-// tensor cores from Ampere on (sparse_attention_tc_kernel, below).
+// incomplete block (contract in include/ninfer/ops/sparse_attention.h), over every KV head or a
+// tensor-parallel share of them. A CTA takes one (query, KV head): its query heads (twelve of each
+// of two KV heads, or six of each of four), one warp each, stream positions in 32-key tiles staged
+// in shared memory, each lane scoring one key and accumulating eight output dims online. Up to
+// eight queries split their positions over CTAs of 64 positions each (a grid fixed for any
+// position, so a graph replays it), and a second launch merges the partial softmaxes; wider calls
+// run the whole list in one CTA per (query, KV head), on tensor cores from Ampere on
+// (sparse_attention_tc_kernel, below).
 //
 // A quantized cache is decoded while a tile is staged, sixteen dimensions per thread, to FP16 in
 // shared memory: keys in the rotated basis the append stored them in, against a query rotated by
@@ -45,11 +46,12 @@ namespace {
 
 constexpr int kHeadDim     = 256;
 constexpr int kQueryHeads  = 24;
-constexpr int kKvHeads     = 2;
-constexpr int kGroup       = kQueryHeads / kKvHeads; // 12; a share of one KV head has 12 queries
+// Query heads per KV head: 12 of each of two KV heads (Qwen3.8-Flash-Next) or 6 of each of four
+// (dense Qwen4); a tensor-parallel share holds whole KV heads with their queries.
+constexpr int kWideGroup   = 12;
+constexpr int kNarrowGroup = 6;
 constexpr int kTopBlocks   = 512;
 constexpr int kTile        = 32;
-constexpr int kThreads     = kGroup * 32;
 constexpr int kRowStride   = kHeadDim + 2; // BF16 elements; 129 words per row spreads the banks
 constexpr int kSplitTokens    = 8;
 constexpr int kSplitPositions = 2 * kTile;
@@ -68,13 +70,13 @@ __device__ __forceinline__ int position_at(const int* blocks, int count, int tai
 }
 
 // The four planes of one paged KV layer; the scale planes are null where the storage has none.
-// `heads` KV heads per page: both, or the one of a tensor-parallel share.
+// `heads` KV heads per page: every one, or a tensor-parallel share's.
 struct KvPlanes {
     const void* k       = nullptr;
     const void* v       = nullptr;
     const void* k_scale = nullptr;
     const void* v_scale = nullptr;
-    int heads           = kKvHeads;
+    int heads           = 1;
 };
 
 // Element offset of `leading` in the row of position `p` and KV head `head`, for a plane whose
@@ -219,8 +221,8 @@ __device__ __forceinline__ float2 to_float2(const __half2& pair) { return __half
 
 // Split: this CTA takes positions [64 z, 64 z + 64) of the list and leaves its partial softmax in
 // `partial`; otherwise the whole list, normalised into `out`.
-template <bool Split, KvCacheStorage Storage, int Shift>
-__global__ void __launch_bounds__(kThreads)
+template <int Group, bool Split, KvCacheStorage Storage, int Shift>
+__global__ void __launch_bounds__(Group * 32)
     sparse_attention_kernel(const __nv_bfloat16* __restrict__ q, const int* __restrict__ first,
                             const int* __restrict__ selected, const int* __restrict__ counts,
                             KvPlanes planes, const std::int32_t* __restrict__ block_table,
@@ -235,7 +237,8 @@ __global__ void __launch_bounds__(kThreads)
     // NVFP4 and K8V4 store their values rotated as well as their keys.
     constexpr bool kRotatedValues =
         Storage == KvCacheStorage::Nvfp4Group16 || Storage == KvCacheStorage::Fp8KeyNvfp4Value;
-    __shared__ float query[kGroup][kHeadDim];
+    constexpr int kThreads = Group * 32;
+    __shared__ float query[Group][kHeadDim];
     __shared__ Element keys[kTile * kRowStride];
     __shared__ Element values[kTile * kRowStride];
 
@@ -243,7 +246,7 @@ __global__ void __launch_bounds__(kThreads)
     const int kv_head  = blockIdx.y;
     const int warp     = threadIdx.x >> 5;
     const int lane     = threadIdx.x & 31;
-    const int q_head   = kv_head * kGroup + warp;
+    const int q_head   = kv_head * Group + warp;
     const int position   = *first + t;
     const int count    = counts[t];
     const int tail_begin = (position + 1) / 4 * 4;
@@ -422,10 +425,11 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // ---- Prompt calls on tensor cores ----------------------------------------------------------------
-// Block (query, KV head) of four warps. The KV head's twelve query heads are rows 0..11 of a 16-row
-// tile (rows 12..15 are zero). Positions pass through shared memory in tiles of 32: warp w scores
-// keys 8 w .. 8 w + 7 of a tile on m16n8k16 MMAs against the whole query, the block shares each
-// row's tile maximum, and warp w then adds P V for dimensions 64 w .. 64 w + 63 over all 32 keys.
+// Block (query, KV head) of four warps. The KV head's query heads, twelve or six, are the first
+// rows of a 16-row tile (the other rows are zero). Positions pass through shared memory in tiles of
+// 32: warp w scores keys 8 w .. 8 w + 7 of a tile on m16n8k16 MMAs against the whole query, the
+// block shares each row's tile maximum, and warp w then adds P V for dimensions 64 w .. 64 w + 63
+// over all 32 keys.
 // A BF16 cache's query is BF16 already, so a score sums exact products of Q and K in FP32; FP16
 // tiles (an F16 cache, or a quantized one decoded as the SIMT kernel decodes it) take Q in two FP16
 // parts, Q rounded and its remainder times 2^12 rounded again (about 22 bits of Q). The
@@ -453,8 +457,6 @@ struct TcLayout {
     static constexpr int kPBytes     = kPParts * kTcRows * kTcPStride * 2;
     static constexpr int kRowBytes   = kTcWarps * kTcRows * 4;
     static constexpr int kBytes      = kQueryBytes + 2 * kTileBytes + kPBytes + 2 * kRowBytes;
-    static_assert(kGroup * kHeadDim * 4 <= 2 * kTileBytes,
-                  "the twelve rotated output rows fit the two tiles");
 };
 
 template <class Element>
@@ -487,7 +489,7 @@ __device__ __forceinline__ void tc_mma(float (&c)[4], unsigned a0, unsigned a1, 
     }
 }
 
-template <KvCacheStorage Storage, int Shift>
+template <int Group, KvCacheStorage Storage, int Shift>
 __global__ void __launch_bounds__(kTcThreads)
     sparse_attention_tc_kernel(const __nv_bfloat16* __restrict__ q, const int* __restrict__ first,
                                const int* __restrict__ selected, const int* __restrict__ counts,
@@ -504,6 +506,8 @@ __global__ void __launch_bounds__(kTcThreads)
     constexpr bool kTwoPart  = !kBf16;
     constexpr float kPScale  = kTwoPart ? kTcRemainder : 1.0f;
     using Layout             = TcLayout<kTwoPart>;
+    static_assert(Group <= kTcRows && Group * kHeadDim * 4 <= 2 * Layout::kTileBytes,
+                  "the group's query rows fit the tile, and its rotated output rows the two tiles");
     extern __shared__ __align__(16) unsigned char tc_shared[];
     auto* queries = reinterpret_cast<Element*>(tc_shared);
     auto* keys    = reinterpret_cast<Element*>(tc_shared + Layout::kQueryBytes);
@@ -594,9 +598,11 @@ __global__ void __launch_bounds__(kTcThreads)
         for (int i = threadIdx.x; i < kTcRows * (kHeadDim / 8); i += kTcThreads) {
             const int row = i / (kHeadDim / 8), piece = i % (kHeadDim / 8);
             uint4 words   = make_uint4(0, 0, 0, 0);
-            if (row < kGroup) {
+            if (row < Group) {
                 words = *reinterpret_cast<const uint4*>(
-                    q + (static_cast<std::int64_t>(t) * q_heads + kv_head * kGroup + row) * kHeadDim +
+                    q +
+                    (static_cast<std::int64_t>(t) * q_heads + kv_head * Group + row) *
+                        kHeadDim +
                     piece * 8);
             }
             *reinterpret_cast<uint4*>(queries + row * kTcStride + piece * 8) = words;
@@ -607,9 +613,9 @@ __global__ void __launch_bounds__(kTcThreads)
 #pragma unroll
             for (int r = 0; r < kHeadDim / 32; ++r) {
                 values_of_row[r] =
-                    row < kGroup
+                    row < Group
                         ? __bfloat162float(q[(static_cast<std::int64_t>(t) * q_heads +
-                                              kv_head * kGroup + row) *
+                                              kv_head * Group + row) *
                                                  kHeadDim +
                                              lane + 32 * r])
                         : 0.0f;
@@ -777,10 +783,10 @@ __global__ void __launch_bounds__(kTcThreads)
         for (int w = 0; w < kTcWarps; ++w) { sum += sums[w * kTcRows + row]; }
         return sum > 0.0f ? 1.0f / sum : 0.0f;
     };
-    const std::int64_t out_row0 = static_cast<std::int64_t>(t) * q_heads + kv_head * kGroup;
+    const std::int64_t out_row0 = static_cast<std::int64_t>(t) * q_heads + kv_head * Group;
     if constexpr (kRotatedValues) {
-        // The values were stored rotated, so the reduction is too: the twelve rows meet in shared
-        // memory (over the tiles) and each warp takes three of them back through the transform.
+        // The values were stored rotated, so the reduction is too: the group's rows meet in shared
+        // memory (over the tiles) and the warps take them back through the transform in turn.
         auto* rows_out = reinterpret_cast<float*>(keys);
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
@@ -788,14 +794,14 @@ __global__ void __launch_bounds__(kTcThreads)
 #pragma unroll
             for (int r = 0; r < 2; ++r) {
                 const int row = g + 8 * r;
-                if (row < kGroup) {
+                if (row < Group) {
                     rows_out[row * kHeadDim + d]     = acc[j][2 * r];
                     rows_out[row * kHeadDim + d + 1] = acc[j][2 * r + 1];
                 }
             }
         }
         __syncthreads();
-        for (int row = warp; row < kGroup; row += kTcWarps) {
+        for (int row = warp; row < Group; row += kTcWarps) {
             float values_of_row[kHeadDim / 32];
 #pragma unroll
             for (int r = 0; r < kHeadDim / 32; ++r) {
@@ -814,7 +820,7 @@ __global__ void __launch_bounds__(kTcThreads)
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             const int row = g + 8 * r;
-            if (row >= kGroup) { continue; }
+            if (row >= Group) { continue; }
             const float inverse = inverse_of(row);
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
@@ -870,32 +876,55 @@ void require_plane(const Tensor& plane, DType dtype, std::int32_t leading,
             message);
 }
 
-// Wider calls run on tensor cores where the gate below measured them faster than the SIMT kernel
-// for the device's tier and the cache's storage.
-template <KvCacheStorage Storage, int Shift>
+// Wider calls run on tensor cores where they measured faster than the SIMT kernel for the call's
+// query heads per KV head, the device's tier and the cache's storage, at 1,024 queries over 2,051
+// positions.
+template <int Group, KvCacheStorage Storage>
+bool tensor_cores_faster(DeviceTier tier) {
+    constexpr bool kBf16Tiles = std::is_same_v<TileElement<Storage>, __nv_bfloat16>;
+    if constexpr (Group == kWideGroup) {
+        // Twelve query heads (Qwen3.8-Flash-Next, dense Qwen4 with two KV heads): an RTX PRO 4500
+        // Blackwell ran every storage faster here (1.07-3.15 times). An RTX 3090 ran BF16 2.76
+        // times, FP16 1.67, bf16p 1.18 and the 4-bit keys (nvfp4, rk4v4, rk4v4-e8, rk2v4-e8)
+        // 1.04-1.07 times, but the 8-bit keys (int8, rk8v4, fp8, k8v4) at 0.94-0.99, whose decode
+        // the four warps here hide worse than the SIMT kernel's twelve. An RTX 2080 Ti ran the
+        // FP16 tiles (FP16 and every decoded storage) 1.21-1.73 times, but BF16 and bf16p at 0.32
+        // and 0.20 on its emulated BF16 MMAs. Volta emulates every MMA.
+        constexpr bool kByteKeys  = Storage == KvCacheStorage::Int8Group64 ||
+                                   Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
+                                   Storage == KvCacheStorage::Fp8E4M3Row256 ||
+                                   Storage == KvCacheStorage::Fp8KeyNvfp4Value;
+        switch (tier) {
+        case DeviceTier::Blackwell: return true;
+        case DeviceTier::Ampere: return !kByteKeys;
+        case DeviceTier::Turing: return !kBf16Tiles;
+        case DeviceTier::Volta: return false;
+        }
+        return false;
+    } else {
+        // Six query heads (dense Qwen4 with four KV heads): the 16-row tile holds six queries, so
+        // each staged K and V tile serves half as many rows, while the SIMT kernel's work follows
+        // the query heads. An RTX 3090 ran BF16 2.54 times, FP16 1.51 and bf16p 1.09 here, every
+        // other storage 0.79-0.86; an RTX 5080 ran BF16 2.83 and FP16 1.46, bf16p 0.98 and the
+        // others 0.66-0.72. A TITAN RTX ran the FP16 tiles 1.13-1.53 times (FP16 1.53, every
+        // decoded storage 1.13-1.24), BF16 and bf16p at 0.29 and 0.22. Volta emulates every MMA.
+        constexpr bool kHalfTiles =
+            Storage == KvCacheStorage::BFloat16 || Storage == KvCacheStorage::Float16;
+        switch (tier) {
+        case DeviceTier::Blackwell: return kHalfTiles;
+        case DeviceTier::Ampere: return kHalfTiles || Storage == KvCacheStorage::Bf16Packed;
+        case DeviceTier::Turing: return !kBf16Tiles;
+        case DeviceTier::Volta: return false;
+        }
+        return false;
+    }
+}
+
+template <int Group, KvCacheStorage Storage, int Shift>
 bool launch_tensor_cores(const __nv_bfloat16* q, const int* first, const int* selected,
                          const int* counts, const KvPlanes& planes, const std::int32_t* table,
                          float scale, std::int32_t tokens, __nv_bfloat16* out, cudaStream_t stream) {
-    // The faster kernel per tier and storage, at 1,024 queries over 2,051 positions against the
-    // SIMT kernel: an RTX PRO 4500 Blackwell ran every storage faster here (1.07-3.15 times). An
-    // RTX 3090 ran BF16 2.76 times, FP16 1.67, bf16p 1.18 and the 4-bit keys (nvfp4, rk4v4,
-    // rk4v4-e8, rk2v4-e8) 1.04-1.07 times, but the 8-bit keys (int8, rk8v4, fp8, k8v4) at
-    // 0.94-0.99, whose decode the four warps here hide worse than the SIMT kernel's twelve. An
-    // RTX 2080 Ti ran the FP16 tiles (FP16 and every decoded storage) 1.21-1.73 times, but BF16
-    // and bf16p at 0.32 and 0.20 on its emulated BF16 MMAs. Volta emulates every MMA.
-    constexpr bool kBf16Tiles = std::is_same_v<TileElement<Storage>, __nv_bfloat16>;
-    constexpr bool kByteKeys  = Storage == KvCacheStorage::Int8Group64 ||
-                               Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
-                               Storage == KvCacheStorage::Fp8E4M3Row256 ||
-                               Storage == KvCacheStorage::Fp8KeyNvfp4Value;
-    bool faster = false;
-    switch (current_device_tier()) {
-    case DeviceTier::Blackwell: faster = true; break;
-    case DeviceTier::Ampere: faster = !kByteKeys; break;
-    case DeviceTier::Turing: faster = !kBf16Tiles; break;
-    case DeviceTier::Volta: faster = false; break;
-    }
-    if (!faster) { return false; }
+    if (!tensor_cores_faster<Group, Storage>(current_device_tier())) { return false; }
     constexpr int kBytes = TcLayout<!std::is_same_v<TileElement<Storage>, __nv_bfloat16>>::kBytes;
     constexpr int kDevices = 64;
     static std::array<std::once_flag, kDevices> opted;
@@ -903,40 +932,52 @@ bool launch_tensor_cores(const __nv_bfloat16* q, const int* first, const int* se
     CUDA_CHECK(cudaGetDevice(&device));
     require(device >= 0 && device < kDevices, "device index out of range");
     std::call_once(opted[static_cast<std::size_t>(device)], [] {
-        CUDA_CHECK(cudaFuncSetAttribute(sparse_attention_tc_kernel<Storage, Shift>,
+        CUDA_CHECK(cudaFuncSetAttribute(sparse_attention_tc_kernel<Group, Storage, Shift>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, kBytes));
     });
-    sparse_attention_tc_kernel<Storage, Shift>
+    sparse_attention_tc_kernel<Group, Storage, Shift>
         <<<dim3(tokens, planes.heads), kTcThreads, kBytes, stream>>>(
-            q, first, selected, counts, planes, table, scale, out, planes.heads * kGroup);
+            q, first, selected, counts, planes, table, scale, out, planes.heads * Group);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
 
-template <KvCacheStorage Storage, int Shift>
-void launch(const __nv_bfloat16* q, const int* first, const int* selected, const int* counts,
-            const KvPlanes& planes, const std::int32_t* table, float scale, std::int32_t tokens,
-            float* partial, __nv_bfloat16* out, cudaStream_t stream) {
-    const int q_heads = planes.heads * kGroup;
+template <int Group, KvCacheStorage Storage, int Shift>
+void launch_group(const __nv_bfloat16* q, const int* first, const int* selected,
+                  const int* counts, const KvPlanes& planes, const std::int32_t* table,
+                  float scale, std::int32_t tokens, float* partial, __nv_bfloat16* out,
+                  cudaStream_t stream) {
+    const int q_heads = planes.heads * Group;
     if (partial == nullptr) {
-        if (launch_tensor_cores<Storage, Shift>(q, first, selected, counts, planes, table, scale,
-                                                tokens, out, stream)) {
+        if (launch_tensor_cores<Group, Storage, Shift>(q, first, selected, counts, planes, table,
+                                                       scale, tokens, out, stream)) {
             return;
         }
-        sparse_attention_kernel<false, Storage, Shift>
-            <<<dim3(tokens, planes.heads), kThreads, 0, stream>>>(
+        sparse_attention_kernel<Group, false, Storage, Shift>
+            <<<dim3(tokens, planes.heads), Group * 32, 0, stream>>>(
                 q, first, selected, counts, planes, table, scale, out, nullptr, q_heads);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    sparse_attention_kernel<true, Storage, Shift>
-        <<<dim3(tokens, planes.heads, kSplits), kThreads, 0, stream>>>(
+    sparse_attention_kernel<Group, true, Storage, Shift>
+        <<<dim3(tokens, planes.heads, kSplits), Group * 32, 0, stream>>>(
             q, first, selected, counts, planes, table, scale, out, partial, q_heads);
     CUDA_CHECK(cudaGetLastError());
-    const auto merge = planes.heads == 1 ? sparse_attention_merge_kernel<kGroup>
-                                         : sparse_attention_merge_kernel<kQueryHeads>;
+    const auto merge = q_heads == 6    ? sparse_attention_merge_kernel<6>
+                       : q_heads == 12 ? sparse_attention_merge_kernel<12>
+                       : q_heads == 18 ? sparse_attention_merge_kernel<18>
+                                       : sparse_attention_merge_kernel<kQueryHeads>;
     merge<<<dim3(tokens, q_heads), kHeadDim, 0, stream>>>(partial, out);
     CUDA_CHECK(cudaGetLastError());
+}
+
+template <KvCacheStorage Storage, int Shift>
+void launch(int group, const __nv_bfloat16* q, const int* first, const int* selected,
+            const int* counts, const KvPlanes& planes, const std::int32_t* table, float scale,
+            std::int32_t tokens, float* partial, __nv_bfloat16* out, cudaStream_t stream) {
+    (group == kWideGroup ? launch_group<kWideGroup, Storage, Shift>
+                         : launch_group<kNarrowGroup, Storage, Shift>)(
+        q, first, selected, counts, planes, table, scale, tokens, partial, out, stream);
 }
 
 } // namespace
@@ -952,15 +993,17 @@ std::size_t sparse_softmax_attention_workspace_bytes(std::int32_t tokens) {
 void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, const Tensor& selected,
                               const Tensor& counts, const PagedKVLayerView& cache, float scale,
                               WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
-    require(cache.head_dim == kHeadDim &&
-                (cache.num_kv_heads == kKvHeads || cache.num_kv_heads == 1) &&
+    require(cache.head_dim == kHeadDim && cache.num_kv_heads >= 1 &&
                 cache.block_table.dtype == DType::I32 && cache.block_table.data != nullptr,
-            "cache must be a paged layer of 2 heads of 256, or a share of 1");
+            "cache must be a paged layer of KV heads of 256");
     const std::int32_t heads   = cache.num_kv_heads;
-    const std::int32_t q_heads = heads * kGroup;
+    const std::int32_t q_heads = q.ne[1];
+    // The query heads per KV head: 12 for two KV heads in all, 6 for four.
+    const std::int32_t group = heads > 0 && q_heads % heads == 0 ? q_heads / heads : 0;
     require(q.dtype == DType::BF16 && q.is_contiguous() && q.data != nullptr &&
-                q.ne[0] == kHeadDim && q.ne[1] == q_heads && q.ne[2] > 0 && q.ne[3] == 1,
-            "q must be contiguous BF16 [256, 12 per KV head, tokens]");
+                q.ne[0] == kHeadDim && (group == kWideGroup || group == kNarrowGroup) &&
+                q_heads <= kQueryHeads && q.ne[2] > 0 && q.ne[3] == 1,
+            "q must be contiguous BF16 [256, 12 or 6 per KV head, tokens], at most 24 heads");
     const std::int32_t tokens = q.ne[2];
     require(first_position.dtype == DType::I32 && first_position.data != nullptr &&
                 first_position.numel() >= 1,
@@ -973,7 +1016,7 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
             "counts must be contiguous I32 [tokens]");
     require(out.dtype == DType::BF16 && out.is_contiguous() && out.data != nullptr &&
                 out.ne[0] == kHeadDim && out.ne[1] == q_heads && out.ne[2] == tokens,
-            "out must be contiguous BF16 [256, 12 per KV head, tokens]");
+            "out must be contiguous BF16 [256, q heads, tokens]");
     const PagedKVStorageLayout layout = paged_kv_storage_layout(cache.storage, kHeadDim);
     const std::int32_t page_tokens   = cache.k_pages.ne[1];
     require(page_tokens == kPagedKVPageSize || page_tokens == kKvStreamPageTokens,
@@ -1015,8 +1058,8 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
 #define NINFER_SPARSE_ATTENTION_CASE(STORAGE)                                                      \
     case KvCacheStorage::STORAGE:                                                                  \
         (streamed ? launch<KvCacheStorage::STORAGE, 2> : launch<KvCacheStorage::STORAGE, 6>)(      \
-            q_p, first_p, select_p, counts_p, planes, table_p, scale, tokens, partial_p, out_p,    \
-            stream);                                                                               \
+            group, q_p, first_p, select_p, counts_p, planes, table_p, scale, tokens, partial_p,    \
+            out_p, stream);                                                                        \
         return;
         NINFER_SPARSE_ATTENTION_CASE(BFloat16)
         NINFER_SPARSE_ATTENTION_CASE(Float16)

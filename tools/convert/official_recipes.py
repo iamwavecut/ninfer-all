@@ -244,6 +244,90 @@ def qwen3_8_flash_next(model, recipe, sources):
         configure_ngram(model, recipe, sources["ngram"])
 
 
+def _hc8_source(parameter):
+    """A hyper-connection matrix as Q8_0 blocks, HC8's rounding (qwen4_exp_preserve.hc8_source):
+    an FP16 scale absmax / 127, then nearest-even codes against that rounded scale."""
+    import numpy as np
+    import torch
+
+    from .gguf_blocks import dequantize_q8_0
+    from .sources.logical import EncodedRows, LogicalSource
+
+    source, shape = parameter.source, parameter.shape
+    width = shape[1]
+    if width % 32:
+        raise ValueError(f"{parameter.name}: HC8 needs whole 32-value blocks")
+
+    def encoded(first, last):
+        values = source.rows(first, last).float().numpy().reshape(last - first, width // 32, 32)
+        scale = (np.abs(values).max(axis=-1) / np.float32(127)).astype("<f2")
+        if not np.isfinite(scale).all():
+            raise ValueError(f"{parameter.name}: HC8 scale exceeds FP16")
+        divisor = scale.astype(np.float32)[..., None]
+        normalized = np.divide(values, divisor, out=np.zeros_like(values), where=divisor > 0)
+        blocks = np.empty((*scale.shape, 34), dtype=np.uint8)
+        blocks[..., :2] = scale[..., None].view(np.uint8)
+        blocks[..., 2:] = np.clip(np.rint(normalized), -127, 127).astype(np.int8).view(np.uint8)
+        return EncodedRows("gguf_q8_0", torch.from_numpy(blocks.reshape(last - first, -1)),
+                           torch.empty(0, dtype=torch.float16))
+
+    def values(first, last):
+        low, high = first // width, -(-last // width)
+        decoded = dequantize_q8_0(encoded(low, high).codes.numpy()).reshape(-1)
+        return torch.from_numpy(decoded[first - low * width:last - low * width])
+
+    return LogicalSource(shape, parameter.source.label + "[HC8]", values, encoded)
+
+
+def qwen4_dense(model, recipe, sources):
+    """Dense Qwen4 (Qwen4ForCausalLM) from its HF BF16 checkpoint, sized for one 24 GB card at the
+    27B's geometry: Q4 MLP gate/up and Q5 down; GDN/QSA query and key Q4, their other projections
+    Q5 (Qwen3.8-27B's policy); hyper-connection matrices HC8 Q8_0 (the Flash-Next GGUF releases'
+    kernels, half the BF16 bytes); embedding Q8 and head Q6; the MTP block's MLP and attention Q8.
+    The indexer, PLE, vision, norms and the small GDN gates keep their direct representation. The
+    table, when the model has PLE, comes from sharded HF BF16 rows (written as FP8) or an IQ4_NL
+    GGUF."""
+    from .methods import import_encoded
+    from .qwen4_exp_ngram import configure_ngram
+
+    if "text" in model.components and model.config.get("architectures") != ["Qwen4ForCausalLM"]:
+        raise ValueError("qwen4_dense requires dense Qwen4 mathematics")
+    for name, parameter in model.parameters.items():
+        if not name.startswith(("text/", "mtp/")):
+            continue
+        if name == "text/token_embedding":
+            _assign(recipe, name, Q8)
+            continue
+        if name == "text/output_head":
+            _assign(recipe, name, Q6)
+            continue
+        if not parameter.projection:
+            continue
+        mtp = name.startswith("mtp/")
+        role = name.rsplit("/", 2)
+        if role[-2] in ("attn_hc", "mlp_hc", "final_mixer") and role[-1] in ("down", "up",
+                                                                             "inject"):
+            recipe.assign(name, format="gguf_q8_0", method=import_encoded,
+                          source=_hc8_source(parameter))
+            continue
+        if name.endswith(("/mlp/gate", "/mlp/up")):
+            format = Q8 if mtp else Q4
+        elif name.endswith("/mlp/down"):
+            format = Q8 if mtp else Q5
+        elif "/gdn/" in name and name.endswith(("/a_projection", "/b_projection")):
+            continue
+        elif "/attention/" in name or "/gdn/" in name:
+            format = Q8 if mtp else (
+                Q4 if name.endswith(("/attention/query", "/attention/key", "/gdn/query",
+                                     "/gdn/key")) else Q5)
+        else:
+            continue
+        _assign(recipe, name, format)
+        recipe.assign(name, activation_policy="AllowA8")
+    if "ngram" in model.components:
+        configure_ngram(model, recipe, sources["ngram"])
+
+
 def qwen3_6_27b_nvfp4(model, recipe, sources):
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
@@ -457,6 +541,7 @@ def qwen3_6_35b_a3b_nvfp4(model, recipe, sources):
 
 RECIPES = {
     "qwen3_8_flash_next": qwen3_8_flash_next,
+    "qwen4_dense": qwen4_dense,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,

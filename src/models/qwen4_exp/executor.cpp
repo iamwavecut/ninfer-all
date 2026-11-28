@@ -38,6 +38,7 @@
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/kv_stream.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/moe_experts.h"
 #include "ninfer/ops/moe_route.h"
 #include "ninfer/ops/ngram_rows.h"
@@ -342,8 +343,8 @@ struct GdnPlan {
     std::int32_t key_heads = 0, value_heads = 0;
 };
 
-// A sparse-attention mixer's operands: both KV heads, or a tensor-parallel rank's one with its
-// query heads (the indexer whole either way).
+// A sparse-attention mixer's operands: every KV head, or a tensor-parallel rank's with their query
+// heads (the indexer whole either way).
 struct QsaPlan {
     Projection query, gate, key, value, index, output;
     Tensor query_norm, key_norm, index_query_norm, index_key_norm;
@@ -354,6 +355,30 @@ struct PlePlan {
     Projection key, value;
     Tensor norm_key, norm_query, norm_conv, convolution;
 };
+
+// Dense Qwen4's MLP on its rank: gate and up as one GGUF parent (one SwiGLU call that quantizes
+// its input once) or as two operands (the two-parent SwiGLU, which takes any stored format and
+// shape: a tensor-parallel rank's run of the rows, NInfer's own formats), and down. `rows` is the
+// middle width the rank holds.
+struct DensePlan {
+    ops::SingleProjectionWeight gate_up; // the joined parent, or the gate alone beside `up`
+    std::optional<ops::SingleProjectionWeight> up;
+    ops::SingleProjectionWeight down;
+    std::int32_t rows = 0;
+};
+
+// The workspace a DensePlan's call of up to `tokens` columns needs, its activation aside.
+std::size_t dense_workspace(const DensePlan& d, std::int32_t tokens) {
+    const Weight& gu   = d.gate_up.weight;
+    const std::size_t swiglu =
+        d.up ? ops::linear_swiglu_pair_workspace_capacity_bytes(gu.qtype, d.up->weight.qtype, gu.n,
+                                                                gu.k, d.gate_up.policy, 1, tokens)
+             : ops::linear_swiglu_workspace_capacity_bytes(gu.qtype, gu.n, gu.k, d.gate_up.policy,
+                                                           1, tokens);
+    const Weight& down = d.down.weight;
+    return std::max(swiglu, ops::linear_workspace_capacity_bytes(down.qtype, down.n, down.k,
+                                                                 d.down.policy, 1, tokens));
+}
 
 // One projection of every expert of a layer, as a device table of expert base pointers on the
 // layer's device.
@@ -628,7 +653,8 @@ struct LayerPlan {
     std::optional<GdnPlan> gdn;
     std::optional<QsaPlan> qsa;
     std::optional<PlePlan> ple;
-    MoePlan moe;
+    MoePlan moe;                   // empty where `dense` is set
+    std::optional<DensePlan> dense; // dense Qwen4
 };
 
 // One plane of a sparse-attention layer's paged KV, [leading, 64, heads, pages]: device memory,
@@ -1234,7 +1260,9 @@ struct Executor::Impl {
 
     Impl(const Model& m, DeviceContext& d, ExecutorOptions o)
         : model(m), device(d), options(std::move(o)), config(m.config()),
-          ngram(derive_ngram_hash_constants(config.ngram)) {
+          // Dense Qwen4 without PLE has no n-gram hash: its constants stay empty.
+          ngram(config.ple_embed_dim != 0 ? derive_ngram_hash_constants(config.ngram)
+                                          : NgramHashConstants{}) {
         if (options.prefill_chunk == 0 || options.prefill_chunk > kMaxChunk || options.sequences == 0 ||
             options.max_context == 0) {
             throw std::invalid_argument("qwen4_exp executor: chunk must be in [1, 4096]");
@@ -1724,6 +1752,10 @@ struct Executor::Impl {
                 {static_cast<std::int32_t>(config.ple_conv_kernel_size), width}, scalar_dtype());
             plan.ple = std::move(ple);
         }
+        if (lw.dense) {
+            plan.dense = make_dense_plan(*lw.dense);
+            return plan;
+        }
         const auto h    = static_cast<std::int32_t>(config.hidden_size);
         plan.moe.router = direct(model, lw.moe.router, {h, static_cast<std::int32_t>(experts)});
         plan.moe.shared_gate = direct(model, lw.moe.shared_score, {h});
@@ -1785,6 +1817,26 @@ struct Executor::Impl {
         plan.moe.shared_up_table   = make_table(model, std::span(&lw.moe.shared_up, 1));
         plan.moe.shared_down_table = make_table(model, std::span(&lw.moe.shared_down, 1));
         return plan;
+    }
+
+    // Dense Qwen4's MLP operands on the layer's device (DensePlan).
+    [[nodiscard]] DensePlan make_dense_plan(const DenseWeights& w) const {
+        const ops::WeightInput gate = model.input(w.gate);
+        const ops::WeightInput up   = model.input(w.up);
+        const auto gguf             = [](const ops::WeightInput& input) {
+            return !input.weight.parts.empty() && input.weight.parts.front().parent != nullptr &&
+                   is_gguf(input.weight.parts.front().parent->geometry.format);
+        };
+        DensePlan out;
+        if (const std::array inputs{gate, up}; gguf(gate) && ops::joins(inputs)) {
+            out.gate_up = ops::prepare_linear_swiglu_weight(gate, up);
+        } else {
+            out.gate_up = ops::prepare_linear_weight(gate);
+            out.up      = ops::prepare_linear_weight(up);
+        }
+        out.down = ops::prepare_linear_weight(model.input(w.down));
+        out.rows = out.down.weight.k;
+        return out;
     }
 
     // A layer's latent operands on its device: the groups [begin, end) of its encoder and decoder
@@ -1859,10 +1911,12 @@ struct Executor::Impl {
             static_cast<std::int32_t>(config.hc_count),
             static_cast<std::int32_t>(config.hidden_size),
             static_cast<std::int32_t>(config.hc_lowrank), t);
-        bytes = std::max(
-            {bytes, ops::moe_experts_gguf_workspace_bytes(t, config.expert_output_scales),
-             ops::moe_route_workspace_bytes(t, static_cast<std::int32_t>(config.num_experts))});
-        if (tensor()) {
+        if (!config.dense()) {
+            bytes = std::max(
+                {bytes, ops::moe_experts_gguf_workspace_bytes(t, config.expert_output_scales),
+                 ops::moe_route_workspace_bytes(t, static_cast<std::int32_t>(config.num_experts))});
+        }
+        if (tensor() && !config.dense()) {
             // A rank's experts' fixed-point part, held beside the part's own workspace.
             bytes = std::max(
                 bytes, ops::moe_experts_gguf_part_workspace_bytes(t, config.expert_output_scales) +
@@ -1878,10 +1932,18 @@ struct Executor::Impl {
         }
         if (mtp && rank == model.head_rank()) {
             planned.push_back(&mtp->layer);
+            if (!config.dense()) {
+                bytes = std::max(
+                    {bytes,
+                     ops::moe_route_workspace_bytes(
+                         t, static_cast<std::int32_t>(model.mtp_config()->num_experts)),
+                     // The MTP block's calls over cached experts only: their kept ids and weights.
+                     ops::moe_experts_gguf_workspace_bytes(t) +
+                         2 * ((std::size_t(config.num_experts_per_tok) * t * 4 + 255) / 256 *
+                              256)});
+            }
             bytes = std::max(
                 {bytes,
-                 ops::moe_route_workspace_bytes(
-                     t, static_cast<std::int32_t>(model.mtp_config()->num_experts)),
                  projection_workspace(mtp->fc_embedding, t),
                  projection_workspace(mtp->fc_hidden,
                                       t * static_cast<std::int32_t>(config.hc_count)),
@@ -1892,13 +1954,11 @@ struct Executor::Impl {
                            static_cast<std::int32_t>(model.resources().public_token_count), 1,
                            static_cast<std::int32_t>(options.sequences)) +
                            round_up(std::uint64_t(options.sequences) * 4)
-                     : 0,
-                 // The MTP block's calls over cached experts only: their kept ids and weights.
-                 ops::moe_experts_gguf_workspace_bytes(t) +
-                     2 * ((std::size_t(config.num_experts_per_tok) * t * 4 + 255) / 256 * 256)});
+                     : 0});
         }
         for (const LayerPlan* layer : planned) {
             const LayerPlan& plan = *layer;
+            if (plan.dense) { bytes = std::max(bytes, dense_workspace(*plan.dense, t)); }
             if (plan.moe.native) {
                 bytes = std::max(bytes, ops::moe_experts_native_workspace_bytes(t));
             }
@@ -1948,9 +2008,10 @@ struct Executor::Impl {
                                   ops::sparse_softmax_attention_workspace_bytes(t)});
             }
             if (plan.ple) {
-                bytes = std::max({bytes,
-                                  projections_workspace({&plan.ple->key, &plan.ple->value}, t),
-                                  ops::ple_inject_workspace_bytes(t)});
+                bytes = std::max(
+                    {bytes, projections_workspace({&plan.ple->key, &plan.ple->value}, t),
+                     ops::ple_inject_workspace_bytes(static_cast<std::int32_t>(config.hidden_size),
+                                                     t)});
             }
         }
         if (tensor()) {
@@ -2018,8 +2079,14 @@ struct Executor::Impl {
         const std::uint64_t h     = config.hidden_size;
         const std::uint64_t width = std::uint64_t(config.hc_count) * h;
         // Flash-Next FP32 K/V plus BF16 index projections occupy 5,376 bytes/column;
-        // even the 6,144-row BF16 floor below covers them and the FP32 key-norm plane.
-        const std::uint64_t plane = std::max<std::uint64_t>(width, 6144); // widest BF16 plane rows
+        // even the 6,144-row BF16 floor below covers them and the FP32 key-norm plane. Dense
+        // Qwen4's MLP activation takes plane a.
+        std::uint64_t middle = config.intermediate_size;
+        if (mtp && config.dense()) {
+            middle = std::max<std::uint64_t>(middle, model.mtp_config()->intermediate_size);
+        }
+        const std::uint64_t plane =
+            std::max<std::uint64_t>({width, 6144, middle}); // widest BF16 plane rows
         const std::uint64_t row_b = options.ngram ? ops::ngram_row_bytes(options.ngram->format) : 0;
         if (tensor()) {
             RankBinding bind(device, 0);
@@ -2685,6 +2752,8 @@ struct Executor::Impl {
     }
 
     void allocate_cache() {
+        // Dense Qwen4 routes nothing.
+        if (config.dense()) { return; }
         const std::uint64_t pairs =
             std::uint64_t(config.num_experts_per_tok) * options.prefill_chunk;
         const auto expert = expert_layers();
@@ -3245,7 +3314,9 @@ struct Executor::Impl {
         auto& sequence    = sequences.at(s);
         if (std::find(verified.begin(), verified.end(), &sequence) != verified.end()) { verified.clear(); }
         sequence.position = 0;
-        sequence.context  = NgramContext::sequence_start(ngram, config.eos_token_id);
+        sequence.context  = ngram.order != 0
+                                ? NgramContext::sequence_start(ngram, config.eos_token_id)
+                                : NgramContext{};
         sequence.media_columns.clear();
         sequence.media_rope.clear();
         sequence.rope_delta  = 0;
@@ -3932,8 +4003,12 @@ struct Executor::Impl {
         const ops::RopeYarn& yarn = options.rope_yarn;
         // A tensor-parallel share of the heads leaves the fused norm and rotation's head counts.
         const bool share = nk != static_cast<std::int32_t>(config.num_key_value_heads);
+        // The fused norm and rotation fixes theta 1e7 over the first 64 dimensions.
+        const bool fused_rotation =
+            config.rope_theta == 1.0e7F &&
+            static_cast<int>(float(d) * config.partial_rotary_factor) == 64;
         if (mrope || yarn.active() || share || config.fp32_direct || !config.norm_unit_offset ||
-            kv_type == DType::FP32) {
+            kv_type == DType::FP32 || !fused_rotation) {
             // A media prompt: the three-axis positions of its images and video, each pair of
             // rotated dimensions on axis i % 3 (the interleaved MRoPE sections). Under YaRN, text
             // too: the fused norm and rotation fixes the unscaled one, so the rotation is its own
@@ -4341,7 +4416,33 @@ struct Executor::Impl {
                        *rank.workspace, ids, weights, shared, rank.stream, route_done(rank), held);
     }
 
+    // Dense Qwen4's MLP of `mixed` (BF16 [hidden, n] on the rank) into `y` (FP32 [hidden, n]):
+    // the SwiGLU of gate and up into plane a, then down. Under tensor parallelism `y` is the
+    // rank's partial: the products of its run of the middle rows.
+    void run_dense(const DensePlan& d, RankState& rank, const Tensor& mixed, Tensor& y) {
+        WorkspaceArena& ws   = *rank.workspace;
+        const cudaStream_t s = rank.stream;
+        Tensor activation(rank.a, DType::BF16, {d.rows, mixed.ne[1]});
+        {
+            auto scope = ws.scope();
+            if (d.up) {
+                ops::linear_swiglu(mixed, d.gate_up.weight, d.up->weight, activation,
+                                   d.gate_up.policy, ws, s);
+            } else {
+                ops::linear_swiglu(mixed, d.gate_up.weight, activation, d.gate_up.policy, ws, s);
+            }
+        }
+        auto scope = ws.scope();
+        ops::linear(activation, d.down.weight, y, d.down.policy, ws, s);
+    }
+
     void run_moe(const LayerPlan& plan, RankState& rank, std::int32_t t, std::size_t index) {
+        if (plan.dense) {
+            const auto h = static_cast<std::int32_t>(config.hidden_size);
+            Tensor y(rank.y, DType::FP32, {h, t});
+            run_dense(*plan.dense, rank, Tensor(rank.mixed, DType::BF16, {h, t}), y);
+            return;
+        }
         const MoePlan& m     = plan.moe;
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
@@ -5190,6 +5291,15 @@ struct Executor::Impl {
     // fixed-point part, and stores the part in those columns of its FP32 `partial` [hidden, t].
     void run_moe_share(const LayerPlan& plan, RankState& rank, std::size_t index, float* partial,
                        const ColumnRun& run) {
+        if (plan.dense) {
+            const auto h = static_cast<std::int32_t>(config.hidden_size);
+            Tensor y(partial + std::size_t(h) * std::size_t(run.column), DType::FP32,
+                     {h, run.count});
+            run_dense(*plan.dense, rank,
+                      Tensor(columns(rank.mixed, h, run.column, 2), DType::BF16, {h, run.count}),
+                      y);
+            return;
+        }
         const MoePlan& m     = plan.moe;
         WorkspaceArena& ws   = *rank.workspace;
         const cudaStream_t s = rank.stream;
@@ -6836,7 +6946,7 @@ struct Executor::Impl {
         if (drafting) {
             run_moe(plan, rank, n, layers.size());
             ops::hyper_connection_write(stack, Tensor(rank.y, DType::FP32, {h, n}), inject, s);
-        } else {
+        } else if (!plan.dense) {
             route(plan.moe, rank, n, layers.size());
         }
         record_mtp_routes(n);

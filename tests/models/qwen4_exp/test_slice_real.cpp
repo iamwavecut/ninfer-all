@@ -228,7 +228,7 @@ void ple(Context& c, int layer, const fs::path& rows_file) {
     Tensor t_nk(nk.buffer.p, DType::BF16, {kWidth}), t_nq(nq.buffer.p, DType::BF16, {kWidth}),
         t_nc(nc.buffer.p, DType::BF16, {kWidth}), t_conv(conv.buffer.p, DType::BF16, {4, kWidth}),
         t_history(history.buffer.p, DType::FP32, {kWidth, 9});
-    WorkspaceArena workspace(ops::ple_inject_workspace_bytes(c.tokens));
+    WorkspaceArena workspace(ops::ple_inject_workspace_bytes(2560, c.tokens));
     ops::ple_inject(c.stack, key, value, {&t_nk, &t_nq, &t_nc, &t_conv}, kEps, t_history, workspace, c.device.stream);
     c.device.synchronize();
 }

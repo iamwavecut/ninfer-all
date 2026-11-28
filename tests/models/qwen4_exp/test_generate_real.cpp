@@ -1,25 +1,27 @@
-// Qwen3.8-Flash-Next end to end on a real artifact: load it (experts on the stage devices, in
-// pinned host memory or on disk), feed chat prompts and greedy-decode short answers, checking that
-// each answer names the expected fact and reporting prefill and decode throughput. Where decode
-// replays CUDA graphs (experts not on disk), the prompts run again on an eager executor and every
-// generated token must be the same. Sequences that take single steps or speculative rounds in
-// turn, which moves the graphs the sequences share from one to the next at every step, must decode
-// exactly as each did alone. An artifact with its MTP block also decodes the prompts by
-// speculative rounds (MTP drafts, one verification, the greedy run kept, the rest dropped by the
-// commit), alone and two sequences at once (also with each row verifying its own number of drafts,
-// from none to all): fixed-mode repeats must match; differences from plain
-// decode or another batch composition are reported. After plain steps of two sequences at once,
-// which advance the MTP block by its catch-up alone, drafts must survive at least half as often
-// as after the prompts. An artifact with its DFlash2 drafter takes the same checks with the
-// DFlash2 block proposing the drafts from its ring of committed target features. Prompts of
-// several sequences packed in one span (host or disk experts on one device) must leave each piece
-// the logits it gets alone, bit for bit, and a span that keeps the state at a cut inside it the
-// logits and the state of two calls split there (plain, with MTP and with DFlash2). A prompt fed
-// in steps that leave no logits, whose last layer then runs its appends alone, must leave the
-// state and logits of steps that leave them, byte for byte. The context cache's sequence images
-// (live and at a snapshot) must continue as the sequence they were taken from.
+// Qwen3.8-Flash-Next or dense Qwen4 end to end on a real artifact: load it (experts on the stage
+// devices, in pinned host memory or on disk), feed chat prompts and greedy-decode short answers,
+// checking that each answer names the expected fact and reporting prefill and decode throughput.
+// Where decode replays CUDA graphs (experts not on disk), the prompts run again on an eager
+// executor and every generated token must be the same. Sequences that take single steps or
+// speculative rounds in turn, which moves the graphs the sequences share from one to the next at
+// every step, must decode exactly as each did alone. An artifact with its MTP block also decodes
+// the prompts by speculative rounds (MTP drafts, one verification, the greedy run kept, the rest
+// dropped by the commit), alone and two sequences at once (also with each row verifying its own
+// number of drafts, from none to all): fixed-mode repeats must match; differences from plain decode
+// or another batch composition are reported. After plain steps of two sequences at once, which
+// advance the MTP block by its catch-up alone, drafts must survive at least half as often as after
+// the prompts. An artifact with its DFlash2 drafter takes the same checks with the DFlash2 block
+// proposing the drafts from its ring of committed target features. Prompts of several sequences
+// packed in one span (host or disk experts on one device) must leave each piece the logits it gets
+// alone, bit for bit, and a span that keeps the state at a cut inside it the logits and the state
+// of two calls split there (plain, with MTP and with DFlash2). A prompt fed in steps that leave no
+// logits, whose last layer then runs its appends alone, must leave the state and logits of steps
+// that leave them, byte for byte. The context cache's sequence images (live and at a snapshot) must
+// continue as the sequence they were taken from.
 //
 //   NINFER_QWEN4_EXP_ARTIFACT  the model's .ninfer (required; skips without it)
+//   NINFER_QWEN4_EXP_FACTS     0: weights that know no facts (a synthetic checkpoint); every
+//                              check but the expected facts runs
 //   NINFER_QWEN4_EXP_DRAFTS    MTP drafts a round (default 3; 0 skips the speculative check)
 //   NINFER_QWEN4_EXP_DFLASH2_DRAFTS  DFlash2 drafts a round (default 7; 0 skips its check)
 //   NINFER_QWEN4_EXP_DEVICES   comma-separated device ids, one pipeline stage each (default 0)
@@ -57,6 +59,7 @@
 #include <filesystem>
 #include <iostream>
 #include <numeric>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -76,6 +79,15 @@ double seconds(Clock::time_point a, Clock::time_point b) {
 std::string env_or(const char* name, const char* fallback) {
     const char* value = std::getenv(name);
     return value != nullptr ? value : fallback;
+}
+
+// The tokens' bytes as the output channel stores them, without Tokenizer::decode's UTF-8 check:
+// a synthetic checkpoint (NINFER_QWEN4_EXP_FACTS=0) decodes byte tokens that need not form UTF-8.
+std::string text_of(const ninfer::models::qwen3_5::frontend::Tokenizer& tokenizer,
+                    std::span<const int> ids) {
+    std::string out;
+    for (const int id : ids) { out += tokenizer.decode_token_bytes(id); }
+    return out;
 }
 
 std::vector<int> device_list() {
@@ -153,7 +165,7 @@ std::vector<std::vector<int>> generate(const Model& model, DeviceContext& device
             next = argmax(logits, domain);
         }
         const auto decode_end  = Clock::now();
-        const std::string text = tokenizer.decode(generated);
+        const std::string text = text_of(tokenizer, generated);
         const bool ok          = text.find(prompt.expect) != std::string::npos;
         std::cout << (ok ? "OK   " : "FAIL ") << tokens.size() << " prompt tokens in "
                   << seconds(prefill_start, prefill_end) << " s, " << generated.size()
@@ -283,7 +295,7 @@ int check_batch_and_snapshot(const Model& model, DeviceContext& device, Executor
     for (std::size_t s = 0; s < texts.size(); ++s) {
         const bool same = together[s] == alone[s];
         std::cout << (same ? "SAME " : "DIFF ") << "batched versus alone, sequence " << s << ": \""
-                  << model.resources().tokenizer->decode(together[s]) << "\"\n";
+                  << text_of(*model.resources().tokenizer, together[s]) << "\"\n";
         const bool repeat = together[s] == first_batch[s];
         std::cout << (repeat ? "OK   " : "FAIL ") << "batched fixed-mode repeat " << s << '\n';
         failures += repeat ? 0 : 1;
@@ -685,8 +697,8 @@ int check_speculative(const Model& model, DeviceContext& device, ExecutorOptions
         const bool same = rows[0] == plain[i];
         std::cout << (same ? "SAME " : "DIFF ") << "speculative versus plain, prompt " << i << " ("
                   << prompt_accepted << " of " << prompt_drafted << " drafts accepted): \""
-                  << model.resources().tokenizer->decode(rows[0]) << "\"\n";
-        const bool fact = model.resources().tokenizer->decode(rows[0]).find(prompts[i].expect) !=
+                  << text_of(*model.resources().tokenizer, rows[0]) << "\"\n";
+        const bool fact = text_of(*model.resources().tokenizer, rows[0]).find(prompts[i].expect) !=
                           std::string::npos;
         speculative.push_back(rows[0]);
         executor.reset(0);
@@ -722,7 +734,7 @@ int check_speculative(const Model& model, DeviceContext& device, ExecutorOptions
         decode_speculative(executor, model, std::span(&sequence, 1), wrong_repeat,
                            int(plain[0].size()), ignored, kept, true);
         const bool same = wrong_repeat[0] == wrong[0] &&
-            model.resources().tokenizer->decode(wrong[0]).find(prompts[0].expect) != std::string::npos;
+            text_of(*model.resources().tokenizer, wrong[0]).find(prompts[0].expect) != std::string::npos;
         std::cout << (same ? "OK   " : "FAIL ") << "forced-wrong repeat and expected fact\n";
         failures += same ? 0 : 1;
         executor.restore(0, snapshot);
@@ -756,7 +768,7 @@ int check_speculative(const Model& model, DeviceContext& device, ExecutorOptions
         const bool same = rows[s] == plain[s];
         std::cout << (same ? "SAME " : "DIFF ") << "batched speculative versus plain, sequence "
                   << s << "\n";
-        const bool fact = model.resources().tokenizer->decode(rows[s]).find(prompts[s].expect) !=
+        const bool fact = text_of(*model.resources().tokenizer, rows[s]).find(prompts[s].expect) !=
                           std::string::npos;
         std::cout << ((repeat && fact) ? "OK   " : "FAIL ")
                   << "batched speculative repeat and expected fact " << s << '\n';
@@ -776,7 +788,7 @@ int check_speculative(const Model& model, DeviceContext& device, ExecutorOptions
         answer.resize(std::min(answer.size(), plain[s].size()));
         std::cout << (answer == plain[s] ? "SAME " : "DIFF ")
                   << "packed speculative versus plain, sequence " << s << "\n";
-        const bool fact = model.resources().tokenizer->decode(answer).find(prompts[s].expect) !=
+        const bool fact = text_of(*model.resources().tokenizer, answer).find(prompts[s].expect) !=
                           std::string::npos;
         std::cout << ((repeat && fact) ? "OK   " : "FAIL ")
                   << "packed speculative repeat and expected fact " << s << '\n';
@@ -846,7 +858,7 @@ int check_speculative(const Model& model, DeviceContext& device, ExecutorOptions
             double(later_accepted) / double(std::max<std::uint64_t>(later_drafted, 1));
         bool facts = true;
         for (std::uint32_t s = 0; s < 2; ++s) {
-            facts = facts && model.resources().tokenizer->decode(resumed[s]).find(
+            facts = facts && text_of(*model.resources().tokenizer, resumed[s]).find(
                                  prompts[longest].expect) != std::string::npos;
         }
         const bool kept_up = later_drafted > 0 && after >= 0.5 * before;
@@ -1015,8 +1027,11 @@ int run(const char* artifact_path) {
         options.expert_cache_bytes = std::uint64_t(std::stoull(cache)) << 20;
     }
     const char* table     = std::getenv("NINFER_QWEN4_EXP_NGRAM_TABLE");
-    options.ngram         = ngram_table_source(reader, artifact_path, model->config(),
-                                               table != nullptr ? table : "");
+    // A dense model or slice without PLE layers reads no table.
+    if (!model->config().ple_layers.empty()) {
+        options.ngram = ngram_table_source(reader, artifact_path, model->config(),
+                                           table != nullptr ? table : "");
+    }
     const std::string rows_from  = env_or("NINFER_QWEN4_EXP_NGRAM_RESIDENCY", "disk");
     const std::string rows_io    = env_or("NINFER_QWEN4_EXP_NGRAM_IO", "buffered");
     options.ngram_read.residency = rows_from == "ram"       ? NgramResidency::Ram
@@ -1030,10 +1045,14 @@ int run(const char* artifact_path) {
         options.ngram_read.hot_rows     = profile.rows;
         options.ngram_read.budget_bytes = std::uint64_t{4} << 30U;
     }
-    std::cout << "n-gram table: " << options.ngram->layout.rows << " rows of "
-              << options.ngram->layout.row_bytes << " bytes in "
-              << options.ngram->layout.segments.size() << " file segment(s) of "
-              << options.ngram->layout.segments.front().path.filename().string() << "\n";
+    if (options.ngram) {
+        std::cout << "n-gram table: " << options.ngram->layout.rows << " rows of "
+                  << options.ngram->layout.row_bytes << " bytes in "
+                  << options.ngram->layout.segments.size() << " file segment(s) of "
+                  << options.ngram->layout.segments.front().path.filename().string() << "\n";
+    } else {
+        std::cout << "n-gram table: none (no PLE layers)\n";
+    }
     if (const char* output = std::getenv("NINFER_QWEN4_EXP_LOGITS_REPORT")) {
         return record_logits(*model, device, options, output, residency);
     }
@@ -1066,6 +1085,10 @@ int run(const char* artifact_path) {
              "\nWhat is the vault combination? Reply with the number only.<|im_end|>\n"
              "<|im_start|>assistant\n<think>\n\n</think>\n\n",
          "4771"});
+    if (env_or("NINFER_QWEN4_EXP_FACTS", "1") == "0") {
+        std::cout << "expected facts: not checked (NINFER_QWEN4_EXP_FACTS=0)\n";
+        for (Prompt& prompt : prompts) { prompt.expect.clear(); }
+    }
     int failures = 0;
     const auto replayed = generate(*model, device, options, prompts, failures);
     failures += check_batch_and_snapshot(*model, device, options);

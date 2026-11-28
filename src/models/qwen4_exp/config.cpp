@@ -42,27 +42,54 @@ void require_value(std::uint32_t actual, std::uint32_t implemented, const char* 
 } // namespace
 
 TextConfig parse_text_config(const Json& value) {
-    artifact::require_members(
-        value,
-        {"architectures", "model_type", "hidden_size", "vocab_size", "num_hidden_layers",
-         "max_position_embeddings", "tie_word_embeddings", "rms_norm_eps", "eos_token_id",
-         "layer_types", "num_attention_heads", "num_key_value_heads", "head_dim",
-         "rope_parameters", "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio",
-         "indexer_budget", "linear_num_key_heads", "linear_key_head_dim",
-         "linear_num_value_heads", "linear_value_head_dim", "linear_conv_kernel_dim",
-         "num_experts", "num_experts_per_tok", "moe_intermediate_size",
-         "shared_expert_intermediate_size", "hc_count", "hc_lowrank", "ple_layers",
-         "ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram",
-         "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "ngram_seed"},
-        {"latent_moe", "fp32_direct", "norm_unit_offset", "hc_prefill_inject", "gdn_a_is_log",
-         "expert_output_scales"},
-        "Qwen4Exp text config");
+    if (!value.is_object() || !value.contains("architectures") || !value.contains("model_type")) {
+        throw ArtifactError("Qwen4 text config: missing architectures or model_type");
+    }
     const auto& architectures = value.at("architectures");
-    if (!architectures.is_array() || architectures.size() != 1 ||
-        architectures[0] != "Qwen4ExpForCausalLM" || value.at("model_type") != "qwen4_exp_text") {
-        throw ArtifactError("Qwen4Exp text config: architecture/model_type mismatch");
+    if (!architectures.is_array() || architectures.size() != 1) {
+        throw ArtifactError("Qwen4 text config: architectures must name one architecture");
+    }
+    const bool dense = architectures[0] == "Qwen4ForCausalLM";
+    if (dense ? value.at("model_type") != "qwen4_text"
+              : architectures[0] != "Qwen4ExpForCausalLM" ||
+                    value.at("model_type") != "qwen4_exp_text") {
+        throw ArtifactError("Qwen4 text config: architecture/model_type mismatch");
+    }
+    if (dense) {
+        // The MoE fields are absent; the PLE and n-gram fields are present exactly when
+        // ple_layers names a block (checked below).
+        artifact::require_members(
+            value,
+            {"architectures", "model_type", "hidden_size", "vocab_size", "num_hidden_layers",
+             "max_position_embeddings", "tie_word_embeddings", "rms_norm_eps", "eos_token_id",
+             "layer_types", "num_attention_heads", "num_key_value_heads", "head_dim",
+             "rope_parameters", "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio",
+             "indexer_budget", "linear_num_key_heads", "linear_key_head_dim",
+             "linear_num_value_heads", "linear_value_head_dim", "linear_conv_kernel_dim",
+             "intermediate_size", "hc_count", "hc_lowrank", "ple_layers"},
+            {"ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram",
+             "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "ngram_seed",
+             "fp32_direct", "norm_unit_offset", "hc_prefill_inject", "gdn_a_is_log"},
+            "Qwen4 text config");
+    } else {
+        artifact::require_members(
+            value,
+            {"architectures", "model_type", "hidden_size", "vocab_size", "num_hidden_layers",
+             "max_position_embeddings", "tie_word_embeddings", "rms_norm_eps", "eos_token_id",
+             "layer_types", "num_attention_heads", "num_key_value_heads", "head_dim",
+             "rope_parameters", "indexer_n_heads", "indexer_head_dim", "indexer_compress_ratio",
+             "indexer_budget", "linear_num_key_heads", "linear_key_head_dim",
+             "linear_num_value_heads", "linear_value_head_dim", "linear_conv_kernel_dim",
+             "num_experts", "num_experts_per_tok", "moe_intermediate_size",
+             "shared_expert_intermediate_size", "hc_count", "hc_lowrank", "ple_layers",
+             "ple_embed_dim", "ple_conv_kernel_size", "ngram_size", "heads_per_ngram",
+             "ngram_vocab_size_base", "make_ngram_vocab_size_divisible_by", "ngram_seed"},
+            {"latent_moe", "fp32_direct", "norm_unit_offset", "hc_prefill_inject",
+             "gdn_a_is_log", "expert_output_scales"},
+            "Qwen4Exp text config");
     }
     TextConfig out;
+    out.ffn = dense ? FfnKind::Dense : FfnKind::Moe;
     const auto boolean = [&](const char* name, bool fallback) {
         if (!value.contains(name)) { return fallback; }
         if (!value.at(name).is_boolean()) {
@@ -133,27 +160,45 @@ TextConfig parse_text_config(const Json& value) {
     out.linear_num_value_heads = integer(value, "linear_num_value_heads");
     out.linear_value_head_dim  = integer(value, "linear_value_head_dim");
     out.linear_conv_kernel_dim = integer(value, "linear_conv_kernel_dim");
-    out.num_experts                     = integer(value, "num_experts");
-    out.num_experts_per_tok             = integer(value, "num_experts_per_tok");
-    out.moe_intermediate_size           = integer(value, "moe_intermediate_size");
-    out.shared_expert_intermediate_size = integer(value, "shared_expert_intermediate_size");
-    out.hc_count             = integer(value, "hc_count");
-    out.hc_lowrank           = integer(value, "hc_lowrank");
-    out.ple_embed_dim        = integer(value, "ple_embed_dim");
-    out.ple_conv_kernel_size = integer(value, "ple_conv_kernel_size");
-    out.ngram                = NgramHashSpec{
-        .vocab_size      = out.vocab_size,
-        .ngram_size      = integer(value, "ngram_size"),
-        .heads_per_ngram = integer(value, "heads_per_ngram"),
-        .ple_layer_index = 0,
-        .vocab_base      = artifact::require_u64(value.at("ngram_vocab_size_base"),
-                                                 "ngram_vocab_size_base", true),
-        .divisible_by    = artifact::require_u64(value.at("make_ngram_vocab_size_divisible_by"),
-                                                 "make_ngram_vocab_size_divisible_by", true),
-        .seed = artifact::require_u64(value.at("ngram_seed"), "ngram_seed", false),
-    };
+    if (dense) {
+        out.intermediate_size = integer(value, "intermediate_size");
+    } else {
+        out.num_experts                     = integer(value, "num_experts");
+        out.num_experts_per_tok             = integer(value, "num_experts_per_tok");
+        out.moe_intermediate_size           = integer(value, "moe_intermediate_size");
+        out.shared_expert_intermediate_size = integer(value, "shared_expert_intermediate_size");
+    }
+    out.hc_count   = integer(value, "hc_count");
+    out.hc_lowrank = integer(value, "hc_lowrank");
     const auto& ple = value.at("ple_layers");
     if (!ple.is_array()) { throw ArtifactError("ple_layers must be an array of blocks"); }
+    // Dense Qwen4 without PLE carries no PLE or n-gram fields.
+    const bool ple_fields = !dense || !ple.empty();
+    for (const char* name : {"ple_embed_dim", "ple_conv_kernel_size", "ngram_size",
+                             "heads_per_ngram", "ngram_vocab_size_base",
+                             "make_ngram_vocab_size_divisible_by", "ngram_seed"}) {
+        if (value.contains(name) != ple_fields) {
+            throw ArtifactError(std::string(name) +
+                                (ple_fields ? ": required with PLE blocks"
+                                            : ": a model without PLE blocks has no PLE fields"));
+        }
+    }
+    if (ple_fields) {
+        out.ple_embed_dim        = integer(value, "ple_embed_dim");
+        out.ple_conv_kernel_size = integer(value, "ple_conv_kernel_size");
+        out.ngram                = NgramHashSpec{
+            .vocab_size      = out.vocab_size,
+            .ngram_size      = integer(value, "ngram_size"),
+            .heads_per_ngram = integer(value, "heads_per_ngram"),
+            .ple_layer_index = 0,
+            .vocab_base      = artifact::require_u64(value.at("ngram_vocab_size_base"),
+                                                     "ngram_vocab_size_base", true),
+            .divisible_by    = artifact::require_u64(
+                value.at("make_ngram_vocab_size_divisible_by"),
+                "make_ngram_vocab_size_divisible_by", true),
+            .seed = artifact::require_u64(value.at("ngram_seed"), "ngram_seed", false),
+        };
+    }
     for (const auto& block : ple) {
         const auto index = artifact::require_u64(block, "PLE block", false);
         if (index >= out.num_hidden_layers ||
@@ -164,10 +209,30 @@ TextConfig parse_text_config(const Json& value) {
         out.ple_layers.push_back(static_cast<std::uint32_t>(index));
     }
 
-    // The implemented geometry (Ops registered for these shapes only).
-    require_value(out.hidden_size, 2560, "hidden_size");
+    // The implemented geometry (Ops registered for these shapes only). Dense Qwen4 may also take
+    // hidden 5120 with its hyper-connection rank 640, and four KV heads of six query heads each.
+    if (dense) {
+        if (out.hidden_size != 2560 && out.hidden_size != 5120) {
+            throw ArtifactError("hidden_size is " + std::to_string(out.hidden_size) +
+                                "; this engine implements 2560 or 5120");
+        }
+        require_value(out.hc_lowrank, out.hidden_size / 8, "hc_lowrank");
+        if (out.num_key_value_heads != 2 && out.num_key_value_heads != 4) {
+            throw ArtifactError("num_key_value_heads is " +
+                                std::to_string(out.num_key_value_heads) +
+                                "; this engine implements 2 or 4");
+        }
+        // Whole 256-value blocks of every stored format along the down projection's inputs.
+        if (out.intermediate_size % 256 != 0) {
+            throw ArtifactError("intermediate_size is " + std::to_string(out.intermediate_size) +
+                                "; this engine implements multiples of 256");
+        }
+    } else {
+        require_value(out.hidden_size, 2560, "hidden_size");
+        require_value(out.hc_lowrank, 320, "hc_lowrank");
+        require_value(out.num_key_value_heads, 2, "num_key_value_heads");
+    }
     require_value(out.num_attention_heads, 24, "num_attention_heads");
-    require_value(out.num_key_value_heads, 2, "num_key_value_heads");
     require_value(out.head_dim, 256, "head_dim");
     require_value(out.indexer_n_heads, 4, "indexer_n_heads");
     require_value(out.indexer_head_dim, 128, "indexer_head_dim");
@@ -178,21 +243,27 @@ TextConfig parse_text_config(const Json& value) {
     require_value(out.linear_num_value_heads, 48, "linear_num_value_heads");
     require_value(out.linear_value_head_dim, 128, "linear_value_head_dim");
     require_value(out.linear_conv_kernel_dim, 4, "linear_conv_kernel_dim");
-    // 512 experts, or fewer in an expert-pruned release (the router keeps one row per expert).
-    if (out.num_experts < out.num_experts_per_tok || out.num_experts > 512) {
-        throw ArtifactError("num_experts is " + std::to_string(out.num_experts) +
-                            "; this engine implements 10 to 512");
+    if (!dense) {
+        // 512 experts, or fewer in an expert-pruned release (the router keeps one row per
+        // expert).
+        if (out.num_experts < out.num_experts_per_tok || out.num_experts > 512) {
+            throw ArtifactError("num_experts is " + std::to_string(out.num_experts) +
+                                "; this engine implements 10 to 512");
+        }
+        require_value(out.num_experts_per_tok, 10, "num_experts_per_tok");
+        require_value(out.moe_intermediate_size, 640, "moe_intermediate_size");
+        require_value(out.shared_expert_intermediate_size, 640,
+                      "shared_expert_intermediate_size");
     }
-    require_value(out.num_experts_per_tok, 10, "num_experts_per_tok");
-    require_value(out.moe_intermediate_size, 640, "moe_intermediate_size");
-    require_value(out.shared_expert_intermediate_size, 640, "shared_expert_intermediate_size");
     require_value(out.hc_count, 4, "hc_count");
-    require_value(out.hc_lowrank, 320, "hc_lowrank");
-    require_value(out.ple_embed_dim, 2560, "ple_embed_dim");
-    require_value(out.ple_conv_kernel_size, 4, "ple_conv_kernel_size");
-    require_value(out.ngram.ngram_size, 3, "ngram_size");
-    require_value(out.ngram.heads_per_ngram, 8, "heads_per_ngram");
-    require_value(out.ple_embed_dim / out.ngram_heads(), 160, "n-gram head width");
+    if (ple_fields) {
+        // The n-gram rows of 160 values per head (ngram_rows) and their 2560-wide embedding.
+        require_value(out.ple_embed_dim, 2560, "ple_embed_dim");
+        require_value(out.ple_conv_kernel_size, 4, "ple_conv_kernel_size");
+        require_value(out.ngram.ngram_size, 3, "ngram_size");
+        require_value(out.ngram.heads_per_ngram, 8, "heads_per_ngram");
+        require_value(out.ple_embed_dim / out.ngram_heads(), 160, "n-gram head width");
+    }
     if (value.contains("latent_moe")) {
         if (out.expert_output_scales) {
             throw ArtifactError("expert_output_scales requires ordinary, not latent experts");
@@ -225,20 +296,34 @@ TextConfig parse_text_config(const Json& value) {
 }
 
 MtpConfig parse_mtp_config(const Json& value, const TextConfig& text) {
-    artifact::require_members(value, {"architectures", "rope_theta", "num_experts"}, {},
-                              "Qwen4Exp MTP config");
+    if (text.dense()) {
+        artifact::require_members(value, {"architectures", "rope_theta", "intermediate_size"}, {},
+                                  "Qwen4 MTP config");
+    } else {
+        artifact::require_members(value, {"architectures", "rope_theta", "num_experts"}, {},
+                                  "Qwen4Exp MTP config");
+    }
     const auto& architectures = value.at("architectures");
     if (!architectures.is_array() || architectures.size() != 1 ||
-        architectures[0] != "Qwen4ExpMTP") {
-        throw ArtifactError("Qwen4Exp MTP config: architecture mismatch");
+        architectures[0] != (text.dense() ? "Qwen4MTP" : "Qwen4ExpMTP")) {
+        throw ArtifactError("Qwen4 MTP config: architecture mismatch");
     }
     MtpConfig out;
-    out.rope_theta  = positive_float(value, "rope_theta");
-    out.num_experts = integer(value, "num_experts");
+    out.rope_theta = positive_float(value, "rope_theta");
     // The sparse-attention kernels rotate at the text model's theta.
     if (out.rope_theta != text.rope_theta) {
         throw ArtifactError("the MTP block's rope_theta differs from the text model's");
     }
+    if (text.dense()) {
+        out.intermediate_size = integer(value, "intermediate_size");
+        if (out.intermediate_size % 256 != 0) {
+            throw ArtifactError("the MTP block's intermediate_size is " +
+                                std::to_string(out.intermediate_size) +
+                                "; this engine implements multiples of 256");
+        }
+        return out;
+    }
+    out.num_experts = integer(value, "num_experts");
     if (out.num_experts < text.num_experts_per_tok || out.num_experts > 512) {
         throw ArtifactError("the MTP block keeps " + std::to_string(out.num_experts) +
                             " experts; this engine implements 10 to 512");

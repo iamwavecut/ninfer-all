@@ -57,6 +57,12 @@ release folders (`text_config.latent_moe`): each text layer's routed experts are
 8 groups (NVFP4, or Q3_K and IQ4_NL) between Q8_0 or Q4_0 group encoders and decoders, which
 `moe_latent_gguf` runs with the family's placements, CPU share and tensor parallelism by whole
 groups.
+Dense Qwen4 (`Qwen4ForCausalLM`, `docs/qwen4-dense.md`) is another form of this family: the same
+blocks with a SwiGLU MLP in every layer and in the MTP block in place of the MoE, hidden 2560 or
+5120, 2 or 4 sparse-attention KV heads and an optional PLE layer, converted from its safetensors
+checkpoint. No checkpoint is public; its geometry is inferred from third-party code. It has no
+routed experts (device weights only, no CPU share), and several GPUs divide its GDN key heads,
+sparse-attention KV heads and MLP rows (`--tensor-parallel`).
 Native Qwen MoE, Gemma MoE, Flint and Inkling 2 also support host/disk expert placements, with
 whole-layer device banks beside the optional persistent cache and the same CPU share of decode
 misses.
