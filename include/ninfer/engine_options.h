@@ -669,7 +669,7 @@ struct EngineOptions {
     // Qwen3.5-family models only.
     std::uint32_t prefill_stall_budget_ms = 0;
     // Where prefill_stall_budget_ms is 0: cut such a step to about one decode round's measured
-    // time instead (a multiple of 128 tokens, at least 128), so that a stream waits about two
+    // time instead (a multiple of 128 tokens, at least 256), so that a stream waits about two
     // rounds for a token while a prompt prefills beside it. Unset: on past 8 requests. Qwen3.5-
     // family models only.
     std::optional<bool> prefill_stall_round_budget;

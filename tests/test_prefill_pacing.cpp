@@ -86,23 +86,23 @@ int main() {
                       "an empty or unmeasured step must not move the correction");
 
     // The round budget: off until a decode round has been measured, then the rounds' moving
-    // average, with steps down to 128 tokens. 30 ms fits 1 + 0.1 t ms up to 290 tokens: 256.
+    // average, with steps down to 256 tokens. 50 ms fits 1 + 0.1 t ms up to 490 tokens: 384.
     PrefillPacing rounds(0, true, model);
     failures += check(rounds.round_budget() && !rounds.enabled() &&
                           rounds.step_cap(0, 2048) == 0,
                       "the round budget waits for a measured round");
-    rounds.round_done(30'000'000);
-    failures += check(rounds.enabled() && rounds.step_cap(0, 2048) == 256,
+    rounds.round_done(50'000'000);
+    failures += check(rounds.enabled() && rounds.step_cap(0, 2048) == 384,
                       "a step is cut to one decode round in 128s");
-    failures += check(rounds.step_cap(0, 128) == 0, "a step of 128 tokens is never cut");
+    failures += check(rounds.step_cap(0, 256) == 0, "a step of 256 tokens is never cut");
     PrefillPacing lone(0, true, model);
     lone.round_done(1'000'000);
-    failures += check(lone.step_cap(0, 2048) == 128,
-                      "a round budget never cuts a step below 128 tokens");
-    // Rounds of 30 then 60 ms: the average moves a quarter of the way in log space, 35.7 ms, which
-    // fits up to 346 tokens: 256.
-    rounds.round_done(60'000'000);
-    failures += check(rounds.step_cap(0, 2048) == 256, "the round budget follows the rounds");
+    failures += check(lone.step_cap(0, 2048) == 256,
+                      "a round budget never cuts a step below 256 tokens");
+    // Rounds of 50 then 100 ms: the average moves a quarter of the way in log space, 59.5 ms,
+    // which fits up to 585 tokens: 512.
+    rounds.round_done(100'000'000);
+    failures += check(rounds.step_cap(0, 2048) == 512, "the round budget follows the rounds");
     // An explicit budget wins over the round budget, and rounds do not move it.
     PrefillPacing fixed(60, true, model);
     fixed.round_done(1'000'000);

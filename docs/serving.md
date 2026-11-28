@@ -2706,7 +2706,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--prefill-chunk N` | text-prefill chunk; with an `int8` or `rk*` KV cache a Qwen3.5-core model runs the nearby multiple of 128 that best fills the GPU's prompt-attention waves, up to 256 tokens more (see [device profiles](device-profiles.md)) | `1024`; `4096` for native MoE experts in host memory or files; `2048` for Qwen3.8-Flash-Next with `--tensor-parallel` when every device has room ([prompt pieces](maintainer/pipeline-stages.md#tensor-parallelism-of-qwen38-flash-next)); `2048` for DeepSeek-V4.1, which takes at most `4096` and a narrower chunk where the card lacks room ([its prompt chunks](deepseek-v41.md#prompt-spans)) |
 | `--prefill-tail exact\|full\|N` | DeepSeek-V4.1: the prompt rows that blocks 21 to 39, which keep no compressed cache, run: `exact` runs those the kept state and the last token's logits depend on, from the prompt chunk at or below them, so the output is `full`'s; `full` runs every row; `N` (at least 128) runs the last `N` rows before each kept state, a lossy mode: the output changes ([the prefill tail](deepseek-v41.md#the-prefill-tail)) | `exact` |
 | `--decode-rounds-per-prefill N` | Decode rounds that run before each prefill chunk while other requests generate, so a long prompt does not leave them one token per chunk; proportionally fewer, at least one, before a shorter prefill unit, so a short prompt gets in after one round; `1` alternates strictly, a larger value keeps streams responsive and makes the prompt finish later. Qwen3.8-Flash-Next counts a speculative round as the tokens its requests fed on average | `0` (`--prefill-chunk` / 64) |
-| `--prefill-stall-budget-ms N\|round` | While other requests generate, cut each prefill step to the largest multiple of 128 tokens, at least 512, that the prefill cost model predicts to take at most N ms; the model's costs are scaled by the ratio of observed to predicted step times. Every token of the other streams then waits about N ms instead of a whole chunk, and the new prompt prefills slower; a lone prompt keeps the whole chunk. `round` takes the decode rounds' measured time as the budget and cuts down to 128 tokens, so a stream waits for one decode round and one step of at least 128 prompt tokens ([measured](#execution-behavior)). Qwen3.5-family models only | `round` past `--max-concurrency 8`, else `0` (off) |
+| `--prefill-stall-budget-ms N\|round` | While other requests generate, cut each prefill step to the largest multiple of 128 tokens, at least 512, that the prefill cost model predicts to take at most N ms; the model's costs are scaled by the ratio of observed to predicted step times. Every token of the other streams then waits about N ms instead of a whole chunk, and the new prompt prefills slower; a lone prompt keeps the whole chunk. `round` takes the decode rounds' measured time as the budget and cuts down to 256 tokens, so a stream waits for one decode round and one step of at least 256 prompt tokens ([measured](#execution-behavior)). Qwen3.5-family models only | `round` past `--max-concurrency 8`, else `0` (off) |
 | `--fast-prefill-kernel` | prefill an `int8` or `rk*` KV cache with the fast prompt-attention kernel (FP16 PV accumulation per 64-key tile), an `fp8` cache with its in-register dequant kernel, and, on Blackwell, an `nvfp4` cache past 2048 visible keys with its fast kernel (QK on block-scaled FP4 Tensor Cores); a small perplexity cost (see [perplexity](perplexity.md)). Without the flag the [device profile](device-profiles.md)'s `attn_prompt_fast` decides for the `int8`/`rk*` and `nvfp4` caches, and the built-in profiles turn the kernel on where it measured faster; the `fp8` cache never takes the fast kernel from the profile, because that key was measured on the INT8-family kernel only and the fast kernel changes the output, so a default `--kv-dtype fp8` run keeps the standard kernel and the flag (or `NINFER_PROMPT_FAST=1` for diagnosis) is the only route to it | the device profile for the `int8`/`rk*` and `nvfp4` caches; the standard kernel for `fp8` |
 | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
 | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
@@ -3341,20 +3341,29 @@ a generating stream paused that stream for up to 0.83 s per step without a budge
 250 ms and 0.59-0.62 s at 500 ms; the new prompt's first token came 11% and 2% later.
 
 Past `--max-concurrency 8` the budget is `round`: the decode rounds' measured time, with steps
-down to 128 tokens. A step of 128 tokens still takes several rounds, so the pause stays above two
-rounds; it is the step that bounds it. On an RTX 3090 with Ternary Bonsai 2 (`--max-concurrency 64`,
-`--kv-dtype rk8v4`), 64 clients that each send a 2,000-token conversation history and read 256
-tokens, one run each:
+down to 256 tokens. A step of 256 tokens still takes several rounds, so the pause stays above two
+rounds; it is the step that bounds it. On an RTX 3090 (`--kv-dtype rk8v4`), clients that each send
+a 2,000-token document and read 256 tokens (`serve_load.py --profile document`), November 28, one
+run each; the shortest step is set at 128, 256 and 384 tokens to show the trade:
 
-| Prefill steps | Inter-token p50 / p99 | First token p50 | Output |
-|---|---:|---:|---:|
-| whole chunks (`--prefill-stall-budget-ms 0`) | 18.2 / 461.6 ms | 38.4 s | 204.9 tok/s |
-| `round` (the default) | 18.2 / 105.2 ms | 46.4 s | 172.9 tok/s |
+| Model, requests | Prefill steps | Inter-token p50 / p99 | First token p50 | Output |
+|---|---|---:|---:|---:|
+| Ternary Bonsai 2, 64 | whole chunks (`--prefill-stall-budget-ms 0`) | 17.6 / 438.0 ms | 35.5 s | 219.4 tok/s |
+| Ternary Bonsai 2, 64 | `round`, steps down to 384 tokens | 15.5 / 160.8 ms | 37.2 s | 211.3 tok/s |
+| Ternary Bonsai 2, 64 | `round`, steps down to 256 tokens (the default) | 15.8 / 122.1 ms | 38.5 s | 206.1 tok/s |
+| Ternary Bonsai 2, 64 | `round`, steps down to 128 tokens | 17.7 / 100.9 ms | 42.9 s | 184.1 tok/s |
+| Qwen3.8-27B, 32 | whole chunks | 30.5 / 752.5 ms | 32.7 s | 110.3 tok/s |
+| Qwen3.8-27B, 32 | `round`, steps down to 384 tokens | 26.5 / 393.3 ms | 33.8 s | 109.5 tok/s |
+| Qwen3.8-27B, 32 | `round`, steps down to 256 tokens (the default) | 26.4 / 267.5 ms | 33.9 s | 108.1 tok/s |
+| Qwen3.8-27B, 32 | `round`, steps down to 128 tokens | 29.9 / 200.1 ms | 38.9 s | 94.7 tok/s |
 
-The paced run cut 1,017 steps. Streams that decode beside new prompts pause under a quarter as
-long at the 99th percentile; the prompts finish later and the GPU delivers 15.6% fewer tokens,
-since each cut step reads the weights again for fewer tokens. `--prefill-stall-budget-ms 0` gives
-the throughput back.
+Qwen3.8-27B ran its default drafts with `--max-concurrency 32 --max-context 2560` (64 requests'
+recurrent state does not fit a 24 GB card beside its weights); one of its 32 documents exceeded
+2,560 tokens and was refused, so its rows count 31. Streams that decode beside new prompts pause
+a third (Qwen3.8-27B) to a quarter (Bonsai 2) as long at the 99th percentile as with whole chunks,
+and the GPU delivers 2.0% and 6.1% fewer tokens: each cut step adds a decode round that reads the
+weights for the few requests then generating. Steps down to 128 tokens pause 25% and 17% shorter
+for 12.5% and 10.7% fewer tokens than 256. `--prefill-stall-budget-ms 0` gives the throughput back.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media requests additionally share one preparation permit, so a waiting
