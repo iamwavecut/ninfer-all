@@ -1207,7 +1207,8 @@ short-chat requests of 256 tokens arrive together, EOS ignored; tok/s while all 
 
 | Card | `--max-context` | 8 | 16 | 32 | 48 | 64 |
 |---|---:|---:|---:|---:|---:|---:|
-| RTX 3090, QAT Q4_0 | 1,024 | 515.1 | 598.7 | 962.4 | 1,247.9 | 1,528.5 |
+| RTX 3090, QAT Q4_0 | 1,024 | 499.7 | 705.1 | 1,079.4 | 1,374.8 | 1,656.0 |
+| RTX 5090, QAT Q4_0 | 1,024 | 1,193.0 | 1,790.4 | 2,804.7 | 3,551.4 | 4,273.8 |
 
 ## Flint
 
@@ -1243,10 +1244,7 @@ short-chat requests of 256 tokens arrive together, EOS ignored; tok/s while all 
 
 | Card | `--max-context` | 8 | 16 | 32 | 48 | 64 |
 |---|---:|---:|---:|---:|---:|---:|
-| RTX 5090, UD-Q4_K_XL | 2,048 | 1,204.4 | 882.1 | 1,441.2 | 1,877.7 | 2,299.6 |
-
-Sixteen requests decode slower than eight: a round of 16 takes 18.1 ms against 6.6 ms for 8. Past
-eight columns the routed experts leave the vector kernel for the integer matrix kernel.
+| RTX 5090, UD-Q4_K_XL | 2,048 | 1,202.0 | 1,527.9 | 2,198.5 | 2,685.2 | 3,194.2 |
 
 ## DeepSeek-V4.1-Flash
 
@@ -1332,11 +1330,11 @@ short-chat requests of 256 tokens arrive together, EOS ignored; tok/s while all 
 
 | Card | `--max-context` | 8 | 16 | 32 | 48 | 64 |
 |---|---:|---:|---:|---:|---:|---:|
-| A40, IQ1_M | 2,048 | 73.3 | 46.6 | 54.1 | 61.6 | 61.3 |
+| A40, IQ1_M | 2,048 | 74.6 | 97.6 | 122.1 | 130.9 | 131.6 |
 
-More than eight requests decode slower than eight: the CPU share takes misses only of calls of
-at most eight tokens, so a round of 16 copies every miss over PCIe and takes 343 ms against
-109 ms for 8. With host experts `--max-concurrency 8` gives the most tok/s.
+Rounds of more than eight requests run the routed experts on the vector kernels with the CPU's
+share of their misses ([GGUF products](gguf.md#products)): a round of 16 takes 164 ms, one of 64
+486 ms.
 
 ## Inkling 2 Mini
 

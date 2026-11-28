@@ -42,7 +42,8 @@ tokenization, the chat template, output parsing and the serving protocols.
   exactly; it decodes such a vector from any other ggml block format as well (some GGUFs store
   Q4_K).
   Vector kernels multiply up to eight tokens (and the routed experts of decode and verification
-  calls of 9 to 64 where they are no slower), integer matrix kernels the prompt chunks, the expert
+  calls of 9 to 64 where they are no slower, of host or disk experts the device cache does not hold
+  entirely), integer matrix kernels the prompt chunks and other wider calls, the expert
   products the routed experts only; a layer's query, gate, relative, key and value products of one
   format share vector launches ([GGUF products](gguf.md#products)). The NVFP4 experts' matrix
   kernel stages its tiles through `cp.async` where the card's

@@ -18,9 +18,10 @@ the Qwen3.5 frontend for tokenization, chat templates, output parsing and the se
   beside an always-active shared SwiGLU expert (1024). An untied 150,144-token head.
 - **The weights stay the GGUF's blocks.** Every matrix keeps its ggml format (UD-Q4_K_XL mixes Q8_0,
   Q6_K, Q5_K, Q4_K, IQ4_XS and IQ3_S), imported row for row without requantization and multiplied by
-  the GGUF kernels: vector kernels for up to eight tokens and for decode and verification calls of 9
-  to 64 where they are no slower ([GGUF products](gguf.md#products)), integer matrix kernels for
-  prompt chunks, the expert products over the routed experts only. The router, norms and sinks are
+  the GGUF kernels: vector kernels for up to eight tokens and, for host or disk experts the device
+  cache does not hold entirely, for decode and verification calls of 9 to 64 where they are no
+  slower ([GGUF products](gguf.md#products)), integer matrix kernels for prompt chunks and other
+  wider calls, the expert products over the routed experts only. The router, norms and sinks are
   FP32 vectors.
 - **Attention.** Prompt chunks run llama.cpp's tensor-core flash attention with the sinks added to
   its softmax; decode runs a kernel of its own: one block per sequence, KV head and key split, whose
