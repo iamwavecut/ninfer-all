@@ -19,24 +19,30 @@ Up to three layers answer, per route key:
    else `~/.cache/ninfer/device-profiles.json` (`%LOCALAPPDATA%\ninfer\device-profiles.json` on
    Windows). `--device-profile-path` names another file.
 2. **The built-in table.** Profiles measured on 67 GPU models ship inside the binary
-   (`src/runtime/engine/device_profiles.json`); the Profile column of the
-   [card tables](gpus.md#cards) shows which. Each desktop, workstation and data-center entry was
-   measured at the card's default power limit. 48 entries were measured on November 23, 2026 by the
-   release image of master 5342f9f, whose one executable serves every card (`cuda13.4` with
+   (`src/runtime/engine/device_profiles.json`); the Profile column of the [card
+   tables](gpus.md#cards) shows which. Each desktop, workstation and data-center entry was measured
+   at the card's default power limit. 48 entries were measured on November 23, 2026 by the release
+   image of master 5342f9f, whose one executable serves every card (`cuda13.4` with
    `75;80;86;89;120a`; `cuda12.9` with `70` for the Tesla V100-SXM2-32GB), with that build's route
    catalog. 11 were measured on November 24, 2026 the same way by the release image of master
-   6e1937e (`cuda12.9` for the Tesla V100s): the RTX 4070, 4070 Ti, 4070 Ti Super and 4080, RTX
-   3090 Ti, RTX A2000 12GB, RTX 2070, 2070 Super and TITAN RTX, Tesla V100-SXM2-16GB and
-   V100-FHHL-16GB. The other 8 keep the measurements of earlier builds, because Vast.ai and RunPod
-   had none of these cards at its default power limit on either day, or the rented host did not
-   start: the RTX 5090 D v2, RTX PRO 4500 Blackwell Server Edition, RTX 3050, RTX A4500, RTX 2060,
-   Tesla T4, Tesla V100-PCIE-32GB, and the RTX 4080 Laptop GPU, whose entry comes from a CUDA 12.8
-   build on one laptop whose power limit is not recorded. A measured entry keeps the
-   built-in bands of the keys calibration does not measure (below), and the RTX 3090 entry also
-   keeps its `gguf_vector/*` bands, which whole-model decode chose. Variants that report different
-   names have their own entries, such as the PRO 6000's Workstation (600 W), Max-Q (300 W) and
-   Server editions. The Turing entries come from the `75` code, the only code that runs on them;
-   its route catalog lacks the keys a Turing build never selects.
+   6e1937e (`cuda12.9` for the Tesla V100s): the RTX 4070, 4070 Ti, 4070 Ti Super and 4080, RTX 3090
+   Ti, RTX A2000 12GB, RTX 2070, 2070 Super and TITAN RTX, Tesla V100-SXM2-16GB and V100-FHHL-16GB.
+   The other 8 keep the measurements of earlier builds, because Vast.ai and RunPod had none of these
+   cards at its default power limit on either day, or the rented host did not start: the RTX 5090 D
+   v2, RTX PRO 4500 Blackwell Server Edition, RTX 3050, RTX A4500, RTX 2060, Tesla T4, Tesla
+   V100-PCIE-32GB, and the RTX 4080 Laptop GPU, whose entry comes from a CUDA 12.8 build on one
+   laptop whose power limit is not recorded. The ternary small-T bands past 32 columns
+   (`t2_i8_small/*`) of 54 entries were measured again on November 28, 2026, at each card's default
+   power limit, by the release image of master d1d25da, whose catalog has the 40-, 48- and 56-column
+   schedules; the RTX 3090's were chosen by whole-model decode the same day. The four Tesla V100
+   entries have no such keys. Vast.ai had none of the RTX 5090 D v2, RTX PRO 4500 Blackwell Server
+   Edition, A10, A100 80GB PCIe, RTX A4500, Quadro RTX 4000 or Tesla T4 at its default power limit
+   that day; their entries and the RTX 4080 Laptop GPU's keep the compiled route past 32 columns. A
+   measured entry keeps the built-in bands of the keys calibration does not measure (below), and the
+   RTX 3090 entry also keeps its `gguf_vector/*` bands, which whole-model decode chose. Variants
+   that report different names have their own entries, such as the PRO 6000's Workstation (600 W),
+   Max-Q (300 W) and Server editions. The Turing entries come from the `75` code, the only code that
+   runs on them; its route catalog lacks the keys a Turing build never selects.
 3. **The compiled route** of each operation, for a key neither names.
 
 For a key both the file and the built-in table name, the file's bands answer up to their last width
