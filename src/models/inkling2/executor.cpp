@@ -267,6 +267,8 @@ struct Executor::Impl {
     std::uint64_t history_bytes = 0;
     std::unique_ptr<CpuExperts> cpu_experts;
     std::unique_ptr<ExpertDelivery> delivery;
+    // This rank's experts over every delivered layer.
+    std::uint64_t delivered_experts = 0;
     // A one-row decode call's read-ahead of each visit's likely experts into L2
     // (ops/moe_expert_prefetch.h): while visit v's experts run, visit v + 1's router guesses from
     // v's MoE input on guess_stream; visit v + 1 reads the guessed experts there once its
@@ -1453,6 +1455,7 @@ struct Executor::Impl {
             transport.cpu.balance       = !options.expert_dma_share;
             transport.cpu.threads       = options.expert_cpu_threads;
         }
+        for (const auto& source : sources) { delivered_experts += source.experts.size(); }
         delivery = std::make_unique<ExpertDelivery>(device.rank(0), model.expert_files(),
                                                     std::move(sources), transport);
         for (auto& p : layers) {
@@ -2799,14 +2802,26 @@ struct Executor::Impl {
         CUDA_CHECK(cudaStreamWaitEvent(stream, guess_done, 0));
     }
 
+    // Whether block p's decode calls can miss experts: host or disk experts while the device cache
+    // holds fewer slots than this rank's experts of every delivered layer. A cache that holds them
+    // all serves calls as resident experts do. Its slots change only between calls, so every rank
+    // and step of one call reads the same answer.
+    [[nodiscard]] bool experts_can_miss(const LayerPlan& p) const {
+        return p.delivery_layer >= 0 && delivery &&
+               std::uint64_t(delivery->memory().cache_slots) < delivered_experts;
+    }
+
     // Whether call c runs layer p's routed experts on the vector kernels into the exact fixed-point
     // sum, the cached experts while the missing ones arrive and the CPU's share beside them: a call
-    // with q8_1 rows (up to 8 tokens) always, a wider decode call of GGUF experts where that is no
-    // slower than both products on the matrix kernel (gguf::moe_vector_call_pays).
+    // with q8_1 rows (up to 8 tokens) always, a wider decode call of GGUF experts that can miss
+    // (experts_can_miss) where the vector kernels are no slower than both products on the matrix
+    // kernel (gguf::moe_vector_call_pays). Resident or wholly cached experts take the matrix kernel
+    // past 8 tokens: on an A40 the vector kernels' rounds of 16 to 64 requests were up to a fifth
+    // slower there end to end, against the route table's op measurements.
     [[nodiscard]] bool vector_call(const LayerPlan& p, const Call& c) const {
         if (c.q8) { return true; }
         if (c.chunk || bf16_rows || p.bf16 || p.mxfp8 || c.t <= gguf::kMaxVectorColumns ||
-            c.t > CpuExperts::kMaxTokens) {
+            c.t > CpuExperts::kMaxTokens || !experts_can_miss(p)) {
             return false;
         }
         const std::int64_t pairs   = std::int64_t(c.t) * config.top_k_experts;
