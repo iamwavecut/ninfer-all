@@ -49,7 +49,7 @@ struct ExpertDeliveryLayer {
 };
 class CpuSpinPool;
 
-// A family's CPU products of the routed experts a narrow call leaves to the CPU: computed from the
+// A family's CPU products of the routed experts a call leaves to the CPU: computed from the
 // experts' stored bytes in host memory for the call's inputs that begin() copied to the host, into
 // the products the family's second stage adds after await(). They reproduce the GPU's products bit
 // for bit, so how a call splits its misses never changes a result.
@@ -84,7 +84,7 @@ public:
 struct ExpertCpuOptions {
     ExpertCpuProducts* products = nullptr; // null: the GPU copies every miss
     std::size_t input_bytes = 0, product_bytes = 0;
-    double share = 0;          // the share of a narrow call's missing experts the CPU computes
+    double share = 0;          // the share of a call's missing experts the CPU computes
     bool balance = false;      // instead, the split whose copies and products end soonest
     std::uint32_t threads = 0; // the CPU pool, the service thread included; 0: pool_cpu_count()
 };
@@ -198,19 +198,21 @@ struct ExpertDeliveryMemory {
 // largest bytes and tail): every layer holds about as many slots as any other whatever its
 // experts' size, and an expert enters only a slot of its own pool.
 //
-// Each call splits its routes into experts the persistent cache holds and the rest. A narrow call
-// (decode, verification) leaves a share of its missing experts to the CPU when the family computes
-// them there (ExpertCpuOptions): those cross no bus and take no slot. Its other misses enter a free
-// cache slot, else the slot of the coldest expert the call does not route when the expert tier
-// admits them, else a layer bank. The tier counts the narrow calls' routes; a call to a layer
+// Each call splits its routes into experts the persistent cache holds and the rest. A call that
+// comes with the CPU's operands (decode, verification) leaves a share of its missing experts to the
+// CPU when the family computes them there (ExpertCpuOptions): those cross no bus and take no slot.
+// A narrow call's other misses enter a free cache slot, else the slot of the coldest expert the
+// call does not route when the expert tier admits them, else a layer bank. The tier counts the narrow calls' routes; a call to a layer
 // below the last narrow call's ends a pass, and every few passes a round swaps the most routed
 // experts the cache lacks into the slots of the least routed ones, copied on a side stream a few
 // at a time after the calls' own work, each candidate's entries moved once its copy has landed.
-// A wide call (half the layer's experts or more: a prompt chunk) brings its misses into a layer
-// bank, laid out like a resident bank (expert e of blob b at a fixed stride) with one copy per run
-// of consecutive experts (repeated wide calls to one layer, a prompt span's chunks, fill only what
-// its bank lacks), starts the bank of the other layer whose wide call followed its last wide call
-// (narrow calls between prompts do not change that order), and promotes its most routed experts
+// A wide call (half the layer's experts or more: a prompt chunk, a decode round of many requests)
+// brings its misses into a layer bank, laid out like a resident bank (expert e of blob b at a fixed
+// stride) with one copy per run of consecutive experts (repeated wide calls to one layer, a prompt
+// span's chunks, fill only what its bank lacks). One without the CPU's operands starts the bank of
+// the other layer whose wide call followed its last wide call (narrow calls between prompts do not
+// change that order); one with them leaves the next layer's misses to the CPU and the bus by the
+// measured split instead of bringing in the whole layer. A wide call promotes its most routed experts
 // from the bank by device copies: into free cache slots up to the layer's share, then, with top_k,
 // into the slots of colder experts under the tier's rule, its routes joining the tier's counts
 // scaled down to the decode's steady sum (ExpertTier::prompt). A prompt so places the cache its

@@ -673,7 +673,8 @@ int tier_policy(DeviceContext& device) {
     return failures ? 1 : 0;
 }
 
-// The CPU's products partition a narrow call with the cache and the copies: every pair is cached,
+// The CPU's products partition a call with the cache and the copies, a narrow or a wide one (half
+// the layer's experts or more, a decode round of many requests): every pair is cached,
 // missing or computed on the CPU, which reads each expert's stored bytes (pinned or from the
 // files) and the call's inputs, joined in order; and a routing profile seeds the cache, so the
 // first call of its experts hits.
@@ -720,8 +721,11 @@ __global__ void partition(const std::int32_t* ids, const std::int32_t* cached, c
     if (u) { atomicAdd(cpu_pairs, 1ull); }
 }
 
-// With every miss on the CPU, only the profile and the tier's rounds fill the cache.
-int cpu_share(DeviceContext& device, bool disk, double share, const std::filesystem::path& path) {
+// With every miss on the CPU, only the profile and the tier's rounds fill the cache. Wide calls
+// (`routed` ten of the sixteen experts) leave the CPU its share too and bring in no other layer's
+// bank.
+int cpu_share(DeviceContext& device, bool disk, double share, const std::filesystem::path& path,
+              int routed = 6) {
     Fixture fixture(disk, path);
     PairEcho echo;
     ExpertDeliveryOptions options;
@@ -747,8 +751,8 @@ int cpu_share(DeviceContext& device, bool disk, double share, const std::filesys
     std::vector<std::int32_t> routes(kPairs);
     std::uint64_t seeded_hits = 0;
     for (int iteration = 0; iteration < 8; ++iteration) {
-        // Narrow calls: six experts, one shifted each time.
-        for (int p = 0; p < kPairs; ++p) { routes[p] = (iteration + p % 6) % kExperts; }
+        // Narrow calls of six experts or wide calls of ten, one shifted each time.
+        for (int p = 0; p < kPairs; ++p) { routes[p] = (iteration + p % routed) % kExperts; }
         ids.copy_from_host(routes.data(), ids.bytes);
         for (int l = 0; l < kLayers; ++l) {
             const auto before = delivery.stats();
@@ -782,17 +786,19 @@ int cpu_share(DeviceContext& device, bool disk, double share, const std::filesys
     cpu_pairs.copy_to_host(&computed, 8);
     const auto stats = delivery.stats();
     // Seeded experts 0..2 of layer 0 serve six routed experts' calls; with every miss on the CPU,
-    // more hits come only from slots a round filled.
+    // more hits come only from slots a round filled (narrow calls teach the tier, wide ones do not).
+    const bool wide = 2 * routed >= kExperts;
     const bool ok = !bad && !echo.bad && echo.calls != 0 && computed == stats.cpu_pairs &&
                     stats.cpu_experts != 0 && seeded_hits == 3 &&
-                    (share < 1 || stats.hits > 6) &&
+                    (wide ? stats.prefetched_layers == 0 : share < 1 || stats.hits > 6) &&
                     delivery.cpu_description().find("2 ") == 0;
     std::printf(
-        "%s cpu share %.1f bad=%llu echo_bad=%llu cpu_experts=%llu cpu_pairs=%llu hits=%llu "
-        "seeded_hits=%llu %s\n",
-        disk_label(disk), share, bad, (unsigned long long)echo.bad,
+        "%s cpu share %.1f %s bad=%llu echo_bad=%llu cpu_experts=%llu cpu_pairs=%llu hits=%llu "
+        "seeded_hits=%llu prefetched=%llu %s\n",
+        disk_label(disk), share, wide ? "wide" : "narrow", bad, (unsigned long long)echo.bad,
         (unsigned long long)stats.cpu_experts, computed, (unsigned long long)stats.hits,
-        (unsigned long long)seeded_hits, ok ? "PASS" : "FAIL");
+        (unsigned long long)seeded_hits, (unsigned long long)stats.prefetched_layers,
+        ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
 
@@ -1293,7 +1299,11 @@ int main(int argc, char** argv) {
                     failures += run(device, disk, cache, path);
                 }
                 failures += run(device, disk, 6ULL << 20, path, true);
-                for (const double share : {0.5, 1.0}) { failures += cpu_share(device, disk, share, path); }
+                for (const double share : {0.5, 1.0}) {
+                    for (const int routed : {6, 10}) {
+                        failures += cpu_share(device, disk, share, path, routed);
+                    }
+                }
                 failures += elastic_cache(device, disk, path);
                 failures += lent_banks(device, disk, path);
                 failures += span_prefetch(device, disk, path);

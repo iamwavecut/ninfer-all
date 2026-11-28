@@ -418,7 +418,8 @@ struct ExpertDelivery::Impl {
     ExpertDeliveryStats counters;
     ExpertDeliveryMemory allocation;
     bool released = false;
-    // The call being served and its post work: layer, bank, whether wide, and its routed experts.
+    // The call being served and its post work: layer, bank, whether wide, whether it came with
+    // the CPU's operands, and its routed experts.
     // Between a call's ready signal and the next request the GPU may read any layer's table (the
     // next split, then that call's cached pairs), so post work writes only free slots. Cached
     // experts are replaced only while a request is served, never one it routes.
@@ -429,6 +430,7 @@ struct ExpertDelivery::Impl {
     std::size_t call_layer      = 0;
     int call_bank               = 0;
     bool call_wide              = false;
+    bool call_cpu_operands      = false;
     std::vector<unsigned char> call_routed, call_cpu;
     std::vector<std::uint32_t> call_count;
     std::vector<Piece> pieces;
@@ -1600,7 +1602,7 @@ struct ExpertDelivery::Impl {
         ++delta.admissions;
     }
 
-    // The CPU's share of a narrow call's misses that neither a slot nor the layer's bank holds:
+    // The CPU's share of a call's misses that neither a slot nor the layer's bank holds:
     // the experts with the fewest pairs (a copy serves all of an expert's pairs at once, the CPU's
     // work grows with each). Marks them in call_cpu.
     std::vector<std::int32_t> cpu_share(std::size_t li, const std::uint32_t* needed, int held) {
@@ -1782,8 +1784,10 @@ struct ExpertDelivery::Impl {
         }
         const bool lent = !wide && any_lent();
         std::vector<std::int32_t> lent_taken;
-        const auto cpu = !wide && layer.cpu && (request.flags & kCpuCall) ? cpu_share(li, needed, held)
-                                                                          : std::vector<std::int32_t>{};
+        // A call that came with the CPU's operands (a decode or verification call on the products
+        // the CPU reproduces) leaves the CPU its share of the misses however many experts it routes.
+        const bool cpu_operands = layer.cpu && (request.flags & kCpuCall);
+        const auto cpu = cpu_operands ? cpu_share(li, needed, held) : std::vector<std::int32_t>{};
         if (!cpu.empty()) { cpu_until = started + std::chrono::milliseconds(500); }
         std::vector<std::int32_t> to_bank;
         for (int e = 0; e < experts; ++e) {
@@ -1860,7 +1864,8 @@ struct ExpertDelivery::Impl {
         for (const auto e : to_bank) { point_bank(li, e, k); }
         if (k >= 0 && (held >= 0 || !to_bank.empty())) { last_bank = k; }
         call_bank = (held >= 0 || !to_bank.empty()) ? k : -1;
-        call_wide = wide;
+        call_wide         = wide;
+        call_cpu_operands = cpu_operands;
         if (!to_bank.empty()) { fill_bank(k, li, to_bank); }
         const bool timed = options.cpu.balance && !cpu.empty() && !pieces.empty();
         const auto copied_before = delta.copied_bytes;
@@ -1940,7 +1945,10 @@ struct ExpertDelivery::Impl {
                 deferred.push_back({li, e, s});
             }
         }
-        if (bank_state.size() == 2 && layer.successor >= 0) {
+        // A wide call with the CPU's operands does not bring in the next layer's bank: the next
+        // call's misses are then split between the CPU and the bus by the measured times (a
+        // decode round of many requests), where the whole layer would cross the bus.
+        if (bank_state.size() == 2 && layer.successor >= 0 && !call_cpu_operands) {
             const auto next = std::size_t(layer.successor);
             const bool held = std::any_of(bank_state.begin(), bank_state.end(),
                                           [&](const Bank& b) { return b.layer == std::int64_t(next); });
