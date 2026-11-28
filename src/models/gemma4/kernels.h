@@ -221,10 +221,12 @@ void attn_residual(const AttnResidualArgs& args, cudaStream_t stream);
 // logits = router . x (FP32 router [E][H]); the top_k experts by softmax, their weights
 // renormalized over the top_k and multiplied by expert_scale. ids/weights [T][top_k]; logits is
 // FP32 scratch [T][E]. With `held` (core/expert_route_bias.h), the top_k by softmax probability
-// plus held.bias for a held expert, weighted as without.
+// plus held.bias for a held expert, weighted as without. A `decode` call of up to 64 tokens
+// computes each token's logits as a call of at most 8 tokens does (a prompt chunk's tiled product
+// rounds them differently).
 void route(const float* x, int hidden, int tokens, const float* router, const float* expert_scale,
            int experts, int top_k, float* logits, std::int32_t* ids, float* weights,
-           cudaStream_t stream, const ExpertRouteBias& held = {});
+           cudaStream_t stream, const ExpertRouteBias& held = {}, bool decode = false);
 
 // route() for at most 8 tokens, with the pairs also grouped by expert into the arrays of a
 // gguf::MoeRouting (bounds [E + 1], sorted [T * top_k], active [E], active_count [1]), as

@@ -1390,7 +1390,8 @@ struct Executor::Impl {
                                   base + e + 1, base + e + 1 + pairs, base + e + 1 + pairs + e,
                                   static_cast<std::uint32_t*>(route_done.p), stream, held);
         } else {
-            kernels::route(router_x, hidden, t, p.router, e, k, logits, ids, weights, stream, held);
+            kernels::route(router_x, hidden, t, p.router, e, k, logits, ids, weights, stream, held,
+                           !prompt_pass);
             if (!model.expert_parallel()) {
                 routing = gguf::moe_sort_routes(ids, pairs, e, routing_space, stream);
             }

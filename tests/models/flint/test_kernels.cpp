@@ -8,7 +8,8 @@
 //    K and V rows at their cache slots (ring, two sequences, a branch pass's own slots).
 //  - route and route_select: sigmoid scores of the top six logits renormalized, the expert
 //    grouping of the pairs, the decode and the tiled prompt logits; route_select's logits, experts
-//    and weights equal to route()'s bit for bit, its block count zero again after each launch;
+//    and weights equal to route()'s bit for bit, its block count zero again after each launch; a
+//    decode call of 9 to 64 tokens routing each group of eight as a call of those alone does;
 //    with a NaN row (an overflowed hidden state), that token's experts 0..top_k-1, the other
 //    tokens' as without it.
 //  - rms_norm and ffn_combine with their BF16, q8_1 and FP32 rows; the weighted FP32 expert rows
@@ -32,6 +33,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <map>
 #include <random>
@@ -405,6 +407,49 @@ void route(int tokens, bool select, std::mt19937& rng) {
              bounds[kExperts] == pairs;
     }
     report(ok, std::string(select ? "route_select" : "route") + " T=" + std::to_string(tokens));
+}
+
+// A decode call of 9 to 64 tokens: each group of eight tokens gets the logits, experts and weights
+// a call of those tokens alone gets, bit for bit.
+void route_decode_rows(int tokens, std::mt19937& rng) {
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> x(std::size_t(tokens) * kHidden), router(std::size_t(kExperts) * kHidden);
+    for (auto& v : x) { v = normal(rng); }
+    for (auto& v : router) { v = 0.02f * normal(rng); }
+    const int pairs = tokens * kTopK;
+    DeviceBuffer dx(x.size() * 4), dr(router.size() * 4),
+        logits(std::size_t(tokens) * kExperts * 4), ids(pairs * 4), weights(pairs * 4);
+    dx.copy_from_host(x.data(), x.size() * 4);
+    dr.copy_from_host(router.data(), router.size() * 4);
+    k::route(static_cast<const float*>(dx.p), kHidden, tokens, static_cast<const float*>(dr.p),
+             kExperts, kTopK, static_cast<float*>(logits.p), static_cast<std::int32_t*>(ids.p),
+             static_cast<float*>(weights.p), nullptr, {}, true);
+    check(cudaDeviceSynchronize(), "route decode");
+    std::vector<float> got_l(std::size_t(tokens) * kExperts), got_w(pairs);
+    std::vector<std::int32_t> got_ids(pairs);
+    logits.copy_to_host(got_l.data(), got_l.size() * 4);
+    ids.copy_to_host(got_ids.data(), pairs * 4);
+    weights.copy_to_host(got_w.data(), pairs * 4);
+    bool ok = true;
+    for (int first = 0; first < tokens; first += 8) {
+        const int n = std::min(8, tokens - first);
+        DeviceBuffer l8(std::size_t(n) * kExperts * 4), i8(n * kTopK * 4), w8(n * kTopK * 4);
+        k::route(static_cast<const float*>(dx.p) + std::size_t(first) * kHidden, kHidden, n,
+                 static_cast<const float*>(dr.p), kExperts, kTopK, static_cast<float*>(l8.p),
+                 static_cast<std::int32_t*>(i8.p), static_cast<float*>(w8.p), nullptr);
+        check(cudaDeviceSynchronize(), "route group");
+        std::vector<float> want_l(std::size_t(n) * kExperts), want_w(n * kTopK);
+        std::vector<std::int32_t> want_ids(n * kTopK);
+        l8.copy_to_host(want_l.data(), want_l.size() * 4);
+        i8.copy_to_host(want_ids.data(), want_ids.size() * 4);
+        w8.copy_to_host(want_w.data(), want_w.size() * 4);
+        ok = ok &&
+             std::memcmp(want_l.data(), got_l.data() + std::size_t(first) * kExperts,
+                         want_l.size() * 4) == 0 &&
+             std::equal(want_ids.begin(), want_ids.end(), got_ids.begin() + first * kTopK) &&
+             std::memcmp(want_w.data(), got_w.data() + first * kTopK, want_w.size() * 4) == 0;
+    }
+    report(ok, "route decode T=" + std::to_string(tokens) + " as groups of eight");
 }
 
 // A NaN input row (an overflowed hidden state) through route() and route_select(): every expert
@@ -931,6 +976,7 @@ int main() {
 
         for (const int tokens : {1, 3, 8}) { route(tokens, true, rng); }
         for (const int tokens : {1, 8, 9, 100}) { route(tokens, false, rng); }
+        for (const int tokens : {9, 16, 37, 64}) { route_decode_rows(tokens, rng); }
         route_nan(false, rng);
         route_nan(true, rng);
 
