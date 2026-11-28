@@ -368,8 +368,7 @@ rounds and the growing KV):
   quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same 2^-32
   fixed-point sums, so outputs do not depend on the split. A decode or verification call of 9 to 64
   tokens has a CPU share when its experts take the vector kernels ([GGUF
-  products](gguf.md#products)) and it routes to fewer than half the layer's experts; a call on the
-  matrix kernel or routing to half of them or more, and every prompt chunk, use the GPU.
+  products](gguf.md#products)); a call on the matrix kernel and every prompt chunk use the GPU.
 - **Disk reads.** `--expert-mirror` spreads disk experts' reads over a second drive and
   `--expert-direct` lets the drive write them into device memory
   ([disk expert reads](expert-disk-reads.md)).

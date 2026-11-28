@@ -84,9 +84,10 @@ sums](flint.md#f16-activation-sums)).
   (`gguf::moe_vector_call_pays`) gives the vector kernel's time over the matrix kernel's for the
   format, the expert shape, the call's pairs and the layer's experts, and the call takes the vector
   kernels when the gate-and-up and down ratios weighted by their weights' bytes come to at most 1.
-  Other cards take the RTX 3090's table. A host or disk call on the vector kernels that routes to
-  fewer than half the layer's experts leaves part of its misses to the CPU share; one that routes to
-  half or more copies every miss into the layer's bank. Gemma 4, Flint and Inkling 2 device experts,
+  Other cards take the RTX 3090's table. A host or disk call on the vector kernels leaves part of its
+  misses to the CPU share, also one that routes to half the layer's experts or more (a round of many
+  requests), which then copies the rest into the layer's bank without bringing in the next layer's
+  bank. Gemma 4, Flint and Inkling 2 device experts,
   and host or disk experts a cache holds entirely, take the matrix kernel past eight columns: on an
   A40 the vector kernels' rounds of 16 to 64 requests ran up to a quarter slower there end to end,
   against the table's operator times. Calls that take the vector kernels round differently from the
