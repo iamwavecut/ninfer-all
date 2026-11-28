@@ -924,6 +924,9 @@ __launch_bounds__(kRowThreads) __global__ void attn_residual_kernel(AttnResidual
 // thread (row group ty, expert tx) keeps kRouteTileT / 8 token sums of one expert.
 constexpr int kRouteTileT = 64, kRouteTileE = 32, kRouteTileK = 32;
 constexpr int kRouteTokens = 8; // decode: the small kernel below covers up to this many tokens
+// A decode or verification call of up to this many tokens runs the small kernel in groups of
+// kRouteTokens: the tiled kernel's few blocks take a router read each and leave most SMs idle.
+constexpr int kRouteDecodeTokens = 64;
 
 __global__ void route_logits_kernel(const float* __restrict__ x, int hidden, int tokens,
                                     const float* __restrict__ router, int experts,
@@ -975,7 +978,9 @@ __global__ void route_logits_kernel(const float* __restrict__ x, int hidden, int
 }
 
 // Router logits for up to kRouteTokens tokens (decode): one block per expert, its row split over
-// four warps, so every SM streams part of the router.
+// four warps, so every SM streams part of the router. Block (e, g) takes the g-th kRouteTokens
+// tokens, so each token's logits are the ones a call of at most kRouteTokens tokens computes,
+// whatever the call's width.
 constexpr int kRouteSmallThreads = 256;
 
 __global__ void route_logits_small_kernel(const float* __restrict__ x, int hidden, int tokens,
@@ -984,6 +989,10 @@ __global__ void route_logits_small_kernel(const float* __restrict__ x, int hidde
     ninfer::pdl::arch_enter_glue();
     __shared__ float part[kRouteSmallThreads / 32][kRouteTokens];
     const int e = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int first = int(blockIdx.y) * kRouteTokens;
+    x += std::int64_t(first) * hidden;
+    logits += std::int64_t(first) * experts;
+    tokens = min(tokens - first, kRouteTokens);
     const float4* w = reinterpret_cast<const float4*>(router + std::int64_t(e) * hidden);
     const int quads = hidden / 4;
     float dot[kRouteTokens] = {};
@@ -1521,13 +1530,14 @@ void attn_residual(const AttnResidualArgs& args, cudaStream_t stream) {
 
 void route(const float* x, int hidden, int tokens, const float* router, const float* expert_scale,
            int experts, int top_k, float* logits, std::int32_t* ids, float* weights,
-           cudaStream_t stream, const ExpertRouteBias& held) {
+           cudaStream_t stream, const ExpertRouteBias& held, bool decode) {
     if (top_k > 8 || top_k > experts || experts > kTopkMaxExperts || hidden % 4 != 0) {
         throw std::invalid_argument("gemma4 route: at most 8 of 256 experts over whole float4s");
     }
-    if (tokens <= kRouteTokens) {
-        ninfer::pdl::launch_arch(experts, kRouteSmallThreads, 0, stream, route_logits_small_kernel,
-                                 x, hidden, tokens, router, experts, logits);
+    if (tokens <= kRouteTokens || (decode && tokens <= kRouteDecodeTokens)) {
+        const dim3 grid(unsigned(experts), unsigned(blocks_for(tokens, kRouteTokens)), 1);
+        ninfer::pdl::launch_arch(grid, kRouteSmallThreads, 0, stream, route_logits_small_kernel, x,
+                                 hidden, tokens, router, experts, logits);
     } else {
         const dim3 grid(blocks_for(experts, kRouteTileE), blocks_for(tokens, kRouteTileT), 1);
         ninfer::pdl::launch_arch(grid, 256, 0, stream, route_logits_kernel, x, hidden, tokens,

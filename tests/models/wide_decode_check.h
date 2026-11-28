@@ -2,10 +2,12 @@
 
 // A decode step of more rows than the vector kernels take (an ordinary round of 9..64 requests)
 // on a family executor with `sequences` sequences: every row reads only its own sequence and
-// token, so a row gives the same bits in a step of 9 rows as in a step of every sequence, in any
-// place, and the same step twice gives the same bits. Against the prompt route of the same tokens
-// it lies within twice the spread of the vector route (8 rows), and each row lies nearer to its own
-// sequence's logits on the vector and the prompt route than to any other sequence's.
+// token, so a row gives the same bits in two steps of 9 rows, in any place and beside any other
+// sequences, and the same step twice gives the same bits. A call's route follows its width, so a
+// step of 9 rows and one of every sequence may round differently. Against the prompt route of the
+// same tokens and the 9-row step the wide step lies within twice the spread of the vector route
+// (8 rows), and each row lies nearer to its own sequence's logits on every route than to any other
+// sequence's.
 
 #include "core/device_launch.h"
 #include "core/tensor.h"
@@ -80,13 +82,17 @@ int wide_decode_check(Executor& executor, std::uint32_t sequences, std::int32_t 
     for (std::uint32_t r = 0; r < sequences; ++r) {
         wide_expect(wide[r] == again[r], "row " + std::to_string(r) + " repeats bit for bit");
     }
-    // Nine rows in another order: sequence 7 first, then 0..6 and 15.
+    // Nine rows in another order and with another ninth sequence: sequence 7 first, then 0..6 and
+    // the last, against 0..8. A call's route follows its width alone, so the eight sequences both
+    // steps hold read the same bits.
     const std::vector<std::uint32_t> nine{7, 0, 1, 2, 3, 4, 5, 6, sequences - 1};
-    const auto part = wide_step(executor, nine, sequences);
-    for (std::size_t i = 0; i < nine.size(); ++i) {
-        wide_expect(part[i] == wide[nine[i]], "sequence " + std::to_string(nine[i]) +
-                                                  " reads the same in 9 rows as in " +
-                                                  std::to_string(sequences));
+    const std::vector<std::uint32_t> first_nine{0, 1, 2, 3, 4, 5, 6, 7, 8};
+    const auto part  = wide_step(executor, nine, sequences);
+    const auto first = wide_step(executor, first_nine, sequences);
+    for (std::size_t i = 0; i + 1 < nine.size(); ++i) {
+        wide_expect(part[i] == first[nine[i]], "sequence " + std::to_string(nine[i]) +
+                                                   " reads the same in 9 rows in any place and "
+                                                   "beside any other sequence");
     }
     // The vector route (eight rows) and the prompt route (the prompt and its next token as one
     // chunk, a matrix-kernel pass like the wide step's) round differently from the wide step and
@@ -132,17 +138,34 @@ int wide_decode_check(Executor& executor, std::uint32_t sequences, std::int32_t 
         vector_agree += wide_argmax(vector[s], domain) == wide_argmax(wide[s], domain) ? 1 : 0;
         prompt_agree += wide_argmax(prompt[s], domain) == wide_argmax(wide[s], domain) ? 1 : 0;
     }
+    // A step of 9 rows may take another route than the wide step (the vector kernels where they
+    // are no slower at that width): equal bits, or within the same bounds as the vector route.
+    double nine_worst = 0, nine_margin = 1e30;
+    for (std::size_t i = 0; i < nine.size(); ++i) {
+        const double own = distance(part[i], wide[nine[i]]);
+        nine_worst       = std::max(nine_worst, own);
+        for (const std::uint32_t o : nine) {
+            if (o != nine[i]) {
+                nine_margin = std::min(nine_margin, distance(part[i], wide[o]) - own);
+            }
+        }
+    }
     std::cout << "largest logit difference from the wide rows: vector route " << vector_worst
               << " (argmax agrees on " << vector_agree << " of 8), prompt route " << prompt_worst
-              << " (" << prompt_agree << " of 8); vector against prompt route " << between
+              << " (" << prompt_agree << " of 8), 9 rows " << nine_worst
+              << "; vector against prompt route " << between
               << "; own sequence nearer than any other by at least " << vector_margin
-              << " (vector route), " << prompt_margin << " (prompt route)\n";
+              << " (vector route), " << prompt_margin << " (prompt route), " << nine_margin
+              << " (9 rows)\n";
     // The routes round differently (their spreads on these random tokens reach a few logits, and
     // random tokens give every sequence similar logits); a row that read another sequence lies
     // nearer that sequence's.
-    wide_expect(prompt_worst <= 2 * std::max(between, vector_worst),
+    const double spread = 2 * std::max(between, vector_worst);
+    wide_expect(prompt_worst <= spread,
                 "the wide rows lie within twice the vector route's spread of the prompt route");
-    wide_expect(vector_margin > 0 && prompt_margin > 0,
+    wide_expect(nine_worst <= spread,
+                "the 9-row step lies within twice the vector route's spread of the wide rows");
+    wide_expect(vector_margin > 0 && prompt_margin > 0 && nine_margin > 0,
                 "each wide row lies nearer its own sequence than any other sequence");
     return wide_failures;
 }

@@ -2524,6 +2524,9 @@ int main() {
         cpu_experts("IQ2_XXS/IQ1_S", QType::GGUF_IQ2_XXS, QType::GGUF_IQ1_S, 3, rng);
         cpu_experts("IQ1_M/IQ2_S", QType::GGUF_IQ1_M, QType::GGUF_IQ2_S, 8, rng);
         cpu_experts("IQ2_S/IQ2_XXS", QType::GGUF_IQ2_S, QType::GGUF_IQ2_XXS, 5, rng);
+        // A wide decode call (an ordinary round of 9..64 requests) on the vector kernels.
+        cpu_experts("IQ1_M/IQ2_S", QType::GGUF_IQ1_M, QType::GGUF_IQ2_S, 17, rng);
+        cpu_experts("IQ1_S/IQ1_M", QType::GGUF_IQ1_S, QType::GGUF_IQ1_M, 64, rng);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " DeepSeek-V4.1 kernels\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

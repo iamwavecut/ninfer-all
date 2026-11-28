@@ -4,8 +4,10 @@
 //    and long contexts and two sequences in one batch; the BF16 rows and the q8_1 rows; and keys
 //    derived from the values (K = V blocks: RoPE(V * k_norm), proportional over 64 of 256 pairs).
 //  - route_select: the logits, the top-k ids and weights and the expert grouping of the pairs, and
-//    the same ids and weights as route() bit for bit; route and route_select with a NaN row (an overflowed hidden state): that token selects
-//    experts 0..top_k-1, the other tokens as they do without it.
+//    the same ids and weights as route() bit for bit; a decode call of 9 to 64 tokens routing each
+//    group of eight as a call of those alone does; route and route_select with a NaN row (an
+//    overflowed hidden state): that token selects experts 0..top_k-1, the other tokens as they do
+//    without it.
 //  - a branch pass's rows (several branches one after another past the state, each continuing it
 //    at the state's end): qkv_post's rotation at the branch position with the value stored at the
 //    row's own slot, keys derived at the branch positions, and the prompt masks of a sliding ring
@@ -538,6 +540,56 @@ void route(int tokens, std::mt19937& rng) {
     failures += ok ? 0 : 1;
 }
 
+// A decode call of 9 to 64 tokens: each group of eight tokens gets the logits, experts and weights
+// a call of those tokens alone gets, bit for bit.
+void route_decode_rows(int tokens, std::mt19937& rng) {
+    constexpr int kHidden = 2816, kExperts = 128, kTopK = 8;
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> x(std::size_t(tokens) * kHidden), router(std::size_t(kExperts) * kHidden),
+        scale(kExperts);
+    for (auto& v : x) { v = normal(rng) * 0.02f; }
+    for (auto& v : router) { v = normal(rng); }
+    std::uniform_real_distribution<float> unit(0.5f, 1.5f);
+    for (auto& v : scale) { v = unit(rng); }
+    const int pairs = tokens * kTopK;
+    DeviceBuffer dx(x.size() * 4), dr(router.size() * 4), dsc(scale.size() * 4),
+        logits(std::size_t(tokens) * kExperts * 4), ids(pairs * 4), weights(pairs * 4);
+    dx.copy_from_host(x.data(), x.size() * 4);
+    dr.copy_from_host(router.data(), router.size() * 4);
+    dsc.copy_from_host(scale.data(), scale.size() * 4);
+    k::route(static_cast<const float*>(dx.p), kHidden, tokens, static_cast<const float*>(dr.p),
+             static_cast<const float*>(dsc.p), kExperts, kTopK, static_cast<float*>(logits.p),
+             static_cast<std::int32_t*>(ids.p), static_cast<float*>(weights.p), nullptr, {}, true);
+    check(cudaDeviceSynchronize(), "route decode");
+    std::vector<float> got_l(std::size_t(tokens) * kExperts), got_w(pairs);
+    std::vector<std::int32_t> got_ids(pairs);
+    logits.copy_to_host(got_l.data(), got_l.size() * 4);
+    ids.copy_to_host(got_ids.data(), pairs * 4);
+    weights.copy_to_host(got_w.data(), pairs * 4);
+    bool ok = true;
+    for (int first = 0; first < tokens; first += 8) {
+        const int n = std::min(8, tokens - first);
+        DeviceBuffer l8(std::size_t(n) * kExperts * 4), i8(n * kTopK * 4), w8(n * kTopK * 4);
+        k::route(static_cast<const float*>(dx.p) + std::size_t(first) * kHidden, kHidden, n,
+                 static_cast<const float*>(dr.p), static_cast<const float*>(dsc.p), kExperts,
+                 kTopK, static_cast<float*>(l8.p), static_cast<std::int32_t*>(i8.p),
+                 static_cast<float*>(w8.p), nullptr);
+        check(cudaDeviceSynchronize(), "route group");
+        std::vector<float> want_l(std::size_t(n) * kExperts), want_w(n * kTopK);
+        std::vector<std::int32_t> want_ids(n * kTopK);
+        l8.copy_to_host(want_l.data(), want_l.size() * 4);
+        i8.copy_to_host(want_ids.data(), want_ids.size() * 4);
+        w8.copy_to_host(want_w.data(), want_w.size() * 4);
+        ok = ok &&
+             std::memcmp(want_l.data(), got_l.data() + std::size_t(first) * kExperts,
+                         want_l.size() * 4) == 0 &&
+             std::equal(want_ids.begin(), want_ids.end(), got_ids.begin() + first * kTopK) &&
+             std::memcmp(want_w.data(), got_w.data() + first * kTopK, want_w.size() * 4) == 0;
+    }
+    std::cout << (ok ? "OK   " : "FAIL ") << "route decode T=" << tokens << " as groups of eight\n";
+    failures += ok ? 0 : 1;
+}
+
 // A NaN input row (an overflowed hidden state) through route() and route_select(): every expert
 // of its token ties at the lowest score, so the lower id wins and it selects experts
 // 0..top_k-1 (stale shared memory would leave other ids); the other tokens select as they do
@@ -848,6 +900,7 @@ int main() {
             row_kernels(5376, tokens, false, rng);
         }
         for (const int tokens : {1, 3, 8}) { route(tokens, rng); }
+        for (const int tokens : {9, 16, 37, 64}) { route_decode_rows(tokens, rng); }
         route_nan(false, rng);
         route_nan(true, rng);
         // A branch pass: rows 0..4, 5..12 and 13..19 continue a 300-position state.

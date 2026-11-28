@@ -534,6 +534,9 @@ __global__ void kv_load_kernel(KvLoadArgs a) {
 // thread (row group ty, expert tx) keeps kRouteTileT / 8 token sums of one expert.
 constexpr int kRouteTileT = 64, kRouteTileE = 32, kRouteTileK = 32;
 constexpr int kRouteTokens = 8; // decode: the small kernel below covers up to this many tokens
+// A decode or verification call of up to this many tokens runs the small kernel in groups of
+// kRouteTokens: the tiled kernel's few blocks take a router read each and leave most SMs idle.
+constexpr int kRouteDecodeTokens = 64;
 
 __global__ void route_logits_kernel(const float* __restrict__ x, int hidden, int tokens,
                                     const float* __restrict__ router, int experts,
@@ -621,11 +624,15 @@ __device__ __forceinline__ void router_row(const float* __restrict__ x, int hidd
     }
 }
 
+// Block (e, g) computes expert e's logits of the g-th kRouteTokens tokens, so each token's logits
+// are the ones a call of at most kRouteTokens tokens computes, whatever the call's width.
 __global__ void route_logits_small_kernel(const float* __restrict__ x, int hidden, int tokens,
                                           const float* __restrict__ router, int experts,
                                           float* __restrict__ logits) {
     ninfer::pdl::arch_enter_glue();
-    router_row(x, hidden, tokens, router, experts, blockIdx.x, logits);
+    const int first = int(blockIdx.y) * kRouteTokens;
+    router_row(x + std::int64_t(first) * hidden, hidden, min(tokens - first, kRouteTokens), router,
+               experts, blockIdx.x, logits + std::int64_t(first) * experts);
 }
 
 constexpr int kTopkMaxExperts = 256;
@@ -1037,13 +1044,14 @@ void kv_load(const KvLoadArgs& args, cudaStream_t stream) {
 
 void route(const float* x, int hidden, int tokens, const float* router, int experts, int top_k,
            float* logits, std::int32_t* ids, float* weights, cudaStream_t stream,
-           const ExpertRouteBias& held) {
+           const ExpertRouteBias& held, bool decode) {
     if (top_k > 8 || top_k > experts || experts > kTopkMaxExperts || hidden % 4 != 0) {
         throw std::invalid_argument("flint route: at most 8 of 256 experts over whole float4s");
     }
-    if (tokens <= kRouteTokens) {
-        ninfer::pdl::launch_arch(experts, kRouteSmallThreads, 0, stream, route_logits_small_kernel,
-                                 x, hidden, tokens, router, experts, logits);
+    if (tokens <= kRouteTokens || (decode && tokens <= kRouteDecodeTokens)) {
+        const dim3 grid(unsigned(experts), unsigned(blocks_for(tokens, kRouteTokens)), 1);
+        ninfer::pdl::launch_arch(grid, kRouteSmallThreads, 0, stream, route_logits_small_kernel, x,
+                                 hidden, tokens, router, experts, logits);
     } else {
         const dim3 grid(blocks_for(experts, kRouteTileE), blocks_for(tokens, kRouteTileT), 1);
         ninfer::pdl::launch_arch(grid, 256, 0, stream, route_logits_kernel, x, hidden, tokens,

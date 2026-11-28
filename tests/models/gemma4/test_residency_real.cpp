@@ -365,6 +365,11 @@ int main(int argc, char** argv) {
             {ExpertResidency::Disk, 1536ULL << 20, true, false, false, 8, "disk-mixed-graph"},
             {ExpertResidency::Host, std::nullopt, true, false, false, 8, "host-auto-graph"},
             {ExpertResidency::Disk, std::nullopt, true, false, true, 8, "disk-auto-graph"},
+            // Rounds of 16 rows: decode calls past the vector kernels' eight columns, with the
+            // CPU's share of the host and disk experts' misses.
+            {ExpertResidency::Device, 0, true, false, false, 16, "device-wide"},
+            {ExpertResidency::Host, 1536ULL << 20, true, false, false, 16, "host-mixed-wide"},
+            {ExpertResidency::Disk, 0, true, false, false, 16, "disk-zero-wide"},
             // The host and disk rounds run before any device-resident one: their verification graphs
             // wait on the device for the experts' service, so the Engine must have loaded every
             // round kernel at startup (a lazy load while such a graph waits never finishes).

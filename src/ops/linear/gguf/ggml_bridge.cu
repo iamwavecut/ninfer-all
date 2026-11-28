@@ -18,6 +18,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
 
 // ggml's GGML_ABORT/GGML_ASSERT land here; only the vendored headers' own invariants reach it.
@@ -1463,6 +1464,187 @@ bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail) {
 #undef NINFER_GGUF_MOE_FITS_CASE
     return false;
 }
+
+namespace {
+
+// The vector kernel's time over the matrix kernel's for one product of routed experts: a line in
+// the call's routed rows per expert of the layer, fitted for the 9 to 64 tokens of decode calls by
+// tools/bench/gguf_moe_route_table.py over ninfer_gguf_moe_matrix_bench on an RTX 3090 (350 W,
+// PCIe 4.0 x16), November 27, 2026, at the expert shapes of Flint (k 2048 and 512), Gemma 4 26B
+// (2816 and 704, 768 for the 256-value blocks), Inkling 2 (3072 and 1152, 1280 for the 256-value
+// blocks) and DeepSeek-V4.1 (5120 and 2304). Rows sorted by type and k.
+struct MoeRouteFit {
+    GgmlType type;
+    int k;
+    float intercept;
+    float slope;
+};
+
+constexpr MoeRouteFit kMoeRouteFits[] = {
+    {GgmlType::IQ1_M, 512, 1.321F, 0.320F},
+    {GgmlType::IQ1_M, 768, 1.065F, 0.267F},
+    {GgmlType::IQ1_M, 1280, 0.696F, 0.196F},
+    {GgmlType::IQ1_M, 2048, 0.807F, 0.198F},
+    {GgmlType::IQ1_M, 2304, 0.600F, 0.132F},
+    {GgmlType::IQ1_M, 2816, 0.568F, 0.134F},
+    {GgmlType::IQ1_M, 3072, 0.753F, 0.126F},
+    {GgmlType::IQ1_M, 5120, 0.677F, 0.109F},
+    {GgmlType::IQ1_S, 512, 1.422F, 0.430F},
+    {GgmlType::IQ1_S, 768, 1.046F, 0.307F},
+    {GgmlType::IQ1_S, 1280, 0.656F, 0.205F},
+    {GgmlType::IQ1_S, 2048, 0.841F, 0.226F},
+    {GgmlType::IQ1_S, 2304, 0.556F, 0.125F},
+    {GgmlType::IQ1_S, 2816, 0.493F, 0.152F},
+    {GgmlType::IQ1_S, 3072, 0.658F, 0.126F},
+    {GgmlType::IQ1_S, 5120, 0.579F, 0.112F},
+    {GgmlType::IQ2_S, 512, 1.252F, 0.267F},
+    {GgmlType::IQ2_S, 768, 0.945F, 0.263F},
+    {GgmlType::IQ2_S, 1280, 0.647F, 0.179F},
+    {GgmlType::IQ2_S, 2048, 0.756F, 0.164F},
+    {GgmlType::IQ2_S, 2304, 0.582F, 0.100F},
+    {GgmlType::IQ2_S, 2816, 0.512F, 0.136F},
+    {GgmlType::IQ2_S, 3072, 0.655F, 0.109F},
+    {GgmlType::IQ2_S, 5120, 0.600F, 0.088F},
+    {GgmlType::IQ2_XS, 512, 2.131F, 0.436F},
+    {GgmlType::IQ2_XS, 768, 1.416F, 0.252F},
+    {GgmlType::IQ2_XS, 1280, 1.144F, 0.217F},
+    {GgmlType::IQ2_XS, 2048, 0.775F, 0.176F},
+    {GgmlType::IQ2_XS, 2816, 0.692F, 0.140F},
+    {GgmlType::IQ2_XS, 3072, 0.650F, 0.117F},
+    {GgmlType::IQ2_XXS, 512, 1.437F, 0.390F},
+    {GgmlType::IQ2_XXS, 768, 1.166F, 0.331F},
+    {GgmlType::IQ2_XXS, 1280, 0.771F, 0.221F},
+    {GgmlType::IQ2_XXS, 2048, 0.841F, 0.223F},
+    {GgmlType::IQ2_XXS, 2304, 0.690F, 0.115F},
+    {GgmlType::IQ2_XXS, 2816, 0.641F, 0.164F},
+    {GgmlType::IQ2_XXS, 3072, 0.764F, 0.133F},
+    {GgmlType::IQ2_XXS, 5120, 0.700F, 0.103F},
+    {GgmlType::IQ3_S, 512, 1.253F, 0.281F},
+    {GgmlType::IQ3_S, 768, 0.967F, 0.273F},
+    {GgmlType::IQ3_S, 1280, 0.748F, 0.176F},
+    {GgmlType::IQ3_S, 2048, 0.797F, 0.144F},
+    {GgmlType::IQ3_S, 2816, 0.592F, 0.145F},
+    {GgmlType::IQ3_S, 3072, 0.685F, 0.111F},
+    {GgmlType::IQ3_XXS, 512, 1.358F, 0.331F},
+    {GgmlType::IQ3_XXS, 768, 1.097F, 0.288F},
+    {GgmlType::IQ3_XXS, 1280, 0.787F, 0.195F},
+    {GgmlType::IQ3_XXS, 2048, 0.846F, 0.186F},
+    {GgmlType::IQ3_XXS, 2816, 0.646F, 0.147F},
+    {GgmlType::IQ3_XXS, 3072, 0.767F, 0.123F},
+    {GgmlType::IQ4_NL, 512, 0.884F, 0.259F},
+    {GgmlType::IQ4_NL, 704, 0.726F, 0.198F},
+    {GgmlType::IQ4_NL, 1152, 0.516F, 0.123F},
+    {GgmlType::IQ4_NL, 2048, 0.563F, 0.151F},
+    {GgmlType::IQ4_NL, 2816, 0.460F, 0.094F},
+    {GgmlType::IQ4_NL, 3072, 0.503F, 0.093F},
+    {GgmlType::IQ4_XS, 512, 0.944F, 0.221F},
+    {GgmlType::IQ4_XS, 768, 0.702F, 0.209F},
+    {GgmlType::IQ4_XS, 1280, 0.533F, 0.130F},
+    {GgmlType::IQ4_XS, 2048, 0.563F, 0.146F},
+    {GgmlType::IQ4_XS, 2816, 0.457F, 0.096F},
+    {GgmlType::IQ4_XS, 3072, 0.513F, 0.089F},
+    {GgmlType::NVFP4, 512, 1.050F, 0.288F},
+    {GgmlType::NVFP4, 704, 0.792F, 0.192F},
+    {GgmlType::NVFP4, 1152, 0.638F, 0.140F},
+    {GgmlType::NVFP4, 2048, 0.655F, 0.133F},
+    {GgmlType::NVFP4, 2816, 0.621F, 0.105F},
+    {GgmlType::NVFP4, 3072, 0.587F, 0.089F},
+    {GgmlType::Q2_0, 512, 1.264F, 0.359F},
+    {GgmlType::Q2_0, 704, 0.902F, 0.245F},
+    {GgmlType::Q2_0, 1152, 0.654F, 0.151F},
+    {GgmlType::Q2_0, 2048, 0.762F, 0.184F},
+    {GgmlType::Q2_0, 2816, 0.634F, 0.126F},
+    {GgmlType::Q2_0, 3072, 0.700F, 0.116F},
+    {GgmlType::Q2_K, 512, 1.101F, 0.231F},
+    {GgmlType::Q2_K, 768, 0.676F, 0.129F},
+    {GgmlType::Q2_K, 1280, 0.609F, 0.100F},
+    {GgmlType::Q2_K, 2048, 0.491F, 0.102F},
+    {GgmlType::Q2_K, 2816, 0.353F, 0.068F},
+    {GgmlType::Q2_K, 3072, 0.417F, 0.072F},
+    {GgmlType::Q3_K, 512, 1.849F, 0.534F},
+    {GgmlType::Q3_K, 768, 1.512F, 0.425F},
+    {GgmlType::Q3_K, 1280, 1.058F, 0.304F},
+    {GgmlType::Q3_K, 2048, 1.018F, 0.275F},
+    {GgmlType::Q3_K, 2816, 0.848F, 0.221F},
+    {GgmlType::Q3_K, 3072, 1.001F, 0.143F},
+    {GgmlType::Q4_0, 512, 0.912F, 0.219F},
+    {GgmlType::Q4_0, 704, 0.726F, 0.194F},
+    {GgmlType::Q4_0, 1152, 0.516F, 0.117F},
+    {GgmlType::Q4_0, 2048, 0.582F, 0.130F},
+    {GgmlType::Q4_0, 2816, 0.460F, 0.088F},
+    {GgmlType::Q4_0, 3072, 0.509F, 0.091F},
+    {GgmlType::Q4_K, 512, 0.919F, 0.233F},
+    {GgmlType::Q4_K, 768, 0.785F, 0.186F},
+    {GgmlType::Q4_K, 1280, 0.587F, 0.127F},
+    {GgmlType::Q4_K, 2048, 0.633F, 0.152F},
+    {GgmlType::Q4_K, 2816, 0.530F, 0.087F},
+    {GgmlType::Q4_K, 3072, 0.590F, 0.088F},
+    {GgmlType::Q5_0, 512, 0.860F, 0.181F},
+    {GgmlType::Q5_0, 704, 0.722F, 0.155F},
+    {GgmlType::Q5_0, 1152, 0.522F, 0.106F},
+    {GgmlType::Q5_0, 2048, 0.552F, 0.142F},
+    {GgmlType::Q5_0, 2816, 0.481F, 0.077F},
+    {GgmlType::Q5_0, 3072, 0.516F, 0.082F},
+    {GgmlType::Q5_K, 512, 0.972F, 0.234F},
+    {GgmlType::Q5_K, 768, 0.840F, 0.194F},
+    {GgmlType::Q5_K, 1280, 0.629F, 0.139F},
+    {GgmlType::Q5_K, 2048, 0.654F, 0.113F},
+    {GgmlType::Q5_K, 2816, 0.590F, 0.086F},
+    {GgmlType::Q5_K, 3072, 0.559F, 0.091F},
+    {GgmlType::Q6_K, 512, 0.977F, 0.204F},
+    {GgmlType::Q6_K, 768, 0.856F, 0.173F},
+    {GgmlType::Q6_K, 1280, 0.687F, 0.118F},
+    {GgmlType::Q6_K, 2048, 0.645F, 0.151F},
+    {GgmlType::Q6_K, 2816, 0.633F, 0.091F},
+    {GgmlType::Q6_K, 3072, 0.614F, 0.074F},
+    {GgmlType::Q8_0, 512, 0.596F, 0.119F},
+    {GgmlType::Q8_0, 704, 0.485F, 0.101F},
+    {GgmlType::Q8_0, 1152, 0.392F, 0.060F},
+    {GgmlType::Q8_0, 2048, 0.441F, 0.072F},
+    {GgmlType::Q8_0, 2816, 0.422F, 0.030F},
+    {GgmlType::Q8_0, 3072, 0.416F, 0.051F},
+};
+
+} // namespace
+
+double moe_vector_matrix_ratio(GgmlType type, int k, std::int64_t pairs, std::int64_t experts) {
+    if (!has_matrix_kernel(type) && type != GgmlType::IQ1_M) { return 0.0; }
+    const MoeRouteFit* below = nullptr;
+    const MoeRouteFit* above = nullptr;
+    for (const MoeRouteFit& fit : kMoeRouteFits) {
+        if (fit.type != type) { continue; }
+        if (fit.k <= k) {
+            below = &fit;
+        } else if (above == nullptr) {
+            above = &fit;
+        }
+    }
+    if (below == nullptr && above == nullptr) { return std::numeric_limits<double>::infinity(); }
+    const double rows = static_cast<double>(pairs) / static_cast<double>(std::max<std::int64_t>(experts, 1));
+    const auto at     = [&](const MoeRouteFit& fit) {
+        return static_cast<double>(fit.intercept) + static_cast<double>(fit.slope) * rows;
+    };
+    if (below == nullptr) { return at(*above); }
+    if (above == nullptr) { return at(*below); }
+    const double w = static_cast<double>(k - below->k) / static_cast<double>(above->k - below->k);
+    return (1.0 - w) * at(*below) + w * at(*above);
+}
+
+bool moe_vector_call_pays(GgmlType gate_up, GgmlType down, int hidden, int width,
+                          std::int64_t pairs, std::int64_t experts) {
+    const BlockShape g = block_shape(gate_up);
+    const BlockShape d = block_shape(down);
+    // The matrix kernel's time follows the products' weights: [gate; up] has 2 x width rows over
+    // hidden, down hidden rows over width.
+    const double gate_up_bytes =
+        2.0 * width * hidden * static_cast<double>(g.bytes) / static_cast<double>(g.elements);
+    const double down_bytes =
+        static_cast<double>(hidden) * width * static_cast<double>(d.bytes) / static_cast<double>(d.elements);
+    return gate_up_bytes * moe_vector_matrix_ratio(gate_up, hidden, pairs, experts) +
+               down_bytes * moe_vector_matrix_ratio(down, width, pairs, experts) <=
+           gate_up_bytes + down_bytes;
+}
+
 
 void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
                         int max_active, int pairs, bool tail, const void* activation, float* out,

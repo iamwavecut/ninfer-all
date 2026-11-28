@@ -289,9 +289,11 @@ cache and its rounds):
 
 ## The CPU share
 
-A decode or verification call of up to eight tokens leaves part of its missing experts to CPU
-threads, which compute them from the stored blocks while the GPU copies and runs the rest; the GPU
-then adds the CPU's sums to its own:
+A decode or verification call of up to eight tokens, or one of 9 to 64 tokens whose
+experts take the vector kernels ([GGUF products](gguf.md#products)) and that routes to fewer than
+half the block's experts, leaves part of its missing experts to CPU threads, which compute them from
+the stored blocks while the GPU copies and runs the rest; the GPU then adds the CPU's sums to its
+own:
 
 - **The split.** `--expert-dma-share auto` (the default) gives each call the split whose copies and
   CPU products end soonest by the copy and CPU times of earlier calls; a fixed `F` copies that
@@ -311,30 +313,29 @@ then adds the CPU's sums to its own:
   ([measurements](#the-cpu-share-on-one-rtx-4090)), so `auto` copies every miss of disk experts; a
   share below `1` still gives the CPU its part.
 
-Flash-Next's CPU share also covers the missing experts with at most eight pairs in calls of 9 to 64
-tokens ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); DeepSeek-V4.1 does not have that
-route yet: its expert kernels take one route per call, and the shared expert delivery serves only
-narrow calls.
+A call routing to half the block's experts or more, a call on the matrix kernel and every prompt
+chunk copy every miss.
 
 ## IQ1_M experts in prompt chunks
 
-Calls of more than eight tokens run the routed experts on ggml's integer tensor-core matrix kernel,
-the IQ1_M banks (12 in the IQ1_M build, 44 in the Coder build) once a call routes enough rows to
-each expert: 6 on average for their down products and more than 16 for their gate and up products,
-from 384 and 1,025 tokens with 384 experts a block and from 192 and 513 with the Coder build's 192
-(a 2048-token chunk routes 32 or 64). Below that they run on the vector kernel in groups of eight
-columns: the matrix kernel would leave most of its tile columns empty and gather a row for every
-pair, where the vector kernel reads each token's row once for all of its experts. Up to 16 rows an
-expert its column tiles are 16 wide, and in prompt steps on an RTX 4090 it ran gate and up products
-there at 0.89 to 1.02 times the vector kernel's speed
-([IQ1_M routes per card](#iq1_m-routes-per-card)). Causal scoring (`ninfer-perplexity`) runs
-256-token steps: 8 rows an expert with the Coder build's 192 experts, whose down products take the
-matrix kernel and gate and up products the vector kernel, and 4 with 384 experts, all on the vector
-kernel. llama.cpp multiplies IQ1_M on its vector kernels only; NInfer's tile loader unpacks each
-row of eight grid values g, shifted by ±1/8, into the int8 values 8g ± 1 and each 16 values' scale
-into d (2s + 1) / 8, the integers and scales of its own vector kernel. `--iq1m-experts vector` keeps
-every IQ1_M call on the vector kernel. The two routes keep the activation's scale per 32 values in
-FP32 (matrix) or binary16 (vector) and sum in different orders, so their outputs differ slightly;
+Prompt chunks run the routed experts on ggml's integer tensor-core matrix kernel (decode and
+verification calls of 9 to 64 tokens where the route table has it faster, [GGUF
+products](gguf.md#products)), the IQ1_M banks (12 in the IQ1_M build, 44 in the Coder build) once a
+call routes enough rows to each expert: 6 on average for their down products and more than 16 for
+their gate and up products, from 384 and 1,025 tokens with 384 experts a block and from 192 and 513
+with the Coder build's 192 (a 2048-token chunk routes 32 or 64). Below that they run on the vector
+kernel in groups of eight columns: the matrix kernel would leave most of its tile columns empty and
+gather a row for every pair, where the vector kernel reads each token's row once for all of its
+experts. Up to 16 rows an expert its column tiles are 16 wide, and in prompt steps on an RTX 4090 it
+ran gate and up products there at 0.89 to 1.02 times the vector kernel's speed ([IQ1_M routes per
+card](#iq1_m-routes-per-card)). Causal scoring (`ninfer-perplexity`) runs 256-token steps: 8 rows an
+expert with the Coder build's 192 experts, whose down products take the matrix kernel and gate and
+up products the vector kernel, and 4 with 384 experts, all on the vector kernel. llama.cpp
+multiplies IQ1_M on its vector kernels only; NInfer's tile loader unpacks each row of eight grid
+values g, shifted by ±1/8, into the int8 values 8g ± 1 and each 16 values' scale into d (2s + 1) /
+8, the integers and scales of its own vector kernel. `--iq1m-experts vector` keeps every IQ1_M call
+on the vector kernel. The two routes keep the activation's scale per 32 values in FP32 (matrix) or
+binary16 (vector) and sum in different orders, so their outputs differ slightly;
 `ninfer_linear_gguf_moe_iq1m_test` holds both against FP64 products at the experts' shapes. On the
 Tesla V100 the IQ1_M banks stay on the vector kernel.
 

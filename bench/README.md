@@ -394,6 +394,17 @@ IQ2_XXS (both runs traced by Nsight Systems). Time one format per process:
 ./build/bench/ninfer_benches ninfer_gguf_moe_matrix_bench --formats IQ1_M --tokens 64,512,2048
 ```
 
+The route table of the GGUF MoE families' decode calls of 9 to 64 tokens (`kMoeRouteFits` in
+`src/ops/linear/gguf/ggml_bridge.cu`, read by `gguf::moe_vector_matrix_ratio` and
+`gguf::moe_vector_call_pays`) is fitted from runs of this benchmark at each family's expert shape,
+`--tokens 8,9,12,16,24,32,48,64`, by `tools/bench/gguf_moe_route_table.py`. It takes each run's
+output with the shape it ran (file:hidden:width:top_k:experts) and prints the table's rows:
+
+```bash
+python3 tools/bench/gguf_moe_route_table.py flint.txt:2048:512:6:256 gemma4.txt:2816:704:8:128 \
+    inkling.txt:3072:1152:8:128 ds.txt:5120:2304:6:384
+```
+
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
 allocation:
 

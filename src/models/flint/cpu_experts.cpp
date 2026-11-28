@@ -91,7 +91,7 @@ ExpertCpuProducts::Done CpuExperts::compute(const Work& work) {
     const int pairs  = int(work.ids.size());
     const int tokens = pairs / top_k_;
     if (pairs % top_k_ != 0 || tokens < 1 || tokens > kMaxTokens) {
-        throw std::invalid_argument("Flint CPU experts: a call of 1 to 8 tokens");
+        throw std::invalid_argument("Flint CPU experts: a call of 1 to 64 tokens");
     }
     const auto* base    = reinterpret_cast<const std::uint8_t*>(work.inputs);
     const auto* codes   = reinterpret_cast<const std::int8_t*>(base);
@@ -118,10 +118,10 @@ ExpertCpuProducts::Done CpuExperts::compute(const Work& work) {
         }
         job.gate_up = reinterpret_cast<const std::uint8_t*>(work.blobs[i][0]);
         job.down    = reinterpret_cast<const std::uint8_t*>(work.blobs[i][1]);
-        if (job.input.k() != hidden_) { job.input = ops::GgufCpuActivation(kMaxTokens, hidden_); }
-        if (job.middle.k() != width_) { job.middle = ops::GgufCpuActivation(kMaxTokens, width_); }
-        job.input.load_q8_1(layer.gate_up, codes, ds, job.tokens);
         const std::size_t n = job.pairs.size();
+        job.input.fit(int(n), hidden_);
+        job.middle.fit(int(n), width_);
+        job.input.load_q8_1(layer.gate_up, codes, ds, job.tokens);
         job.middle.reset(layer.down, int(n));
         job.gate.resize(n * width_);
         job.up.resize(n * width_);

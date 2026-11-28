@@ -12,6 +12,7 @@
 #include "core/expert_delivery.h"
 #include "core/qtype.h"
 #include "core/weight.h"
+#include "ninfer/ops/batch_rows.h"
 #include "ops/moe_experts/gguf_expert_cpu.h"
 
 #include <cstddef>
@@ -29,8 +30,9 @@ struct CpuExpertLayer {
 
 class CpuExperts final : public ExpertCpuProducts {
 public:
-    // A call's tokens: the vector kernels' columns.
-    static constexpr int kMaxTokens = 8;
+    // A decode or verification call's tokens: up to 8 on the vector kernels' column groups of one
+    // to eight, a wider decode call's in groups of eight.
+    static constexpr int kMaxTokens = ops::kMaximumDecodeRows;
 
     CpuExperts(std::vector<CpuExpertLayer> layers, int hidden, int width, int top_k, float limit);
 

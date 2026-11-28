@@ -21,8 +21,10 @@ frontend for tokenization, chat templates, output parsing and the serving protoc
   final logit soft cap.
 - **The weights stay the release's blocks.** Every matrix is the GGUF's Q4_0 (the tied token table
   Q6_K), imported row for row without requantization (13.4 GiB) and multiplied by the GGUF kernels:
-  vector kernels for up to eight tokens, integer matrix kernels for prompt chunks, the expert
-  products over the routed experts only. A mixed-format GGUF of the same model (a Q4_K_M
+  vector kernels for up to eight tokens and, for host or disk experts the device cache does not hold
+  entirely, for decode and verification calls of 9 to 64 where they are no slower ([GGUF
+  products](gguf.md#products)), integer matrix kernels for prompt chunks and other wider calls, the
+  expert products over the routed experts only. A mixed-format GGUF of the same model (a Q4_K_M
   quantization with Q6_K values, Q5_0 or Q8_0 expert down projections) converts and runs the same
   way, each matrix in its own format.
 - **The full-attention cache holds values only.** Those blocks' keys are their values times the
@@ -720,19 +722,17 @@ Experts reach the GPU through the shared transport (`core/expert_delivery`):
   and seeds the counts. `0` keeps the banks only.
 - **CPU share.** Of a decode or verification call's misses that neither the cache nor the layer's
   bank holds, CPU threads compute a share from the stored blocks while the GPU copies and runs the
-  rest (`--expert-dma-share`, `auto` by default: the split whose copies and CPU products end
-  soonest by earlier calls' times; `--expert-cpu-threads`, one pinned thread per physical core by
-  default, at most half the process's CPUs). The CPU computes GeGLU over the [gate; up] rows,
-  the BF16 middle quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same
-  2^-32 fixed-point sums ([the CPU share](qwen3-8-flash-next.md#the-cpu-share) describes the
-  arithmetic), so outputs do not depend on the split. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K,
-  IQ4_NL, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other
-  layers copy every miss.
-  An expert the CPU computed takes no slot; the cache's rounds decide whether it enters.
-  Flash-Next's CPU share also covers the missing experts with at most eight pairs in calls of 9 to
-  64 tokens ([the CPU share](qwen3-8-flash-next.md#the-cpu-share)); Gemma 4 does not have that route
-  yet: its expert kernels take one route per call, and the shared expert delivery serves only narrow
-  calls.
+  rest (`--expert-dma-share`, `auto` by default: the split whose copies and CPU products end soonest
+  by earlier calls' times; `--expert-cpu-threads`, one pinned thread per physical core by default,
+  at most half the process's CPUs). The CPU computes GeGLU over the [gate; up] rows, the BF16 middle
+  quantized as q8_1 and the down rows as the GPU's vector kernels do, into the same 2^-32
+  fixed-point sums ([the CPU share](qwen3-8-flash-next.md#the-cpu-share) describes the arithmetic),
+  so outputs do not depend on the split. Q2_0, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ1_S,
+  IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS blocks have CPU products; other layers
+  copy every miss. An expert the CPU computed takes no slot; the cache's rounds decide whether it
+  enters. A decode or verification call of 9 to 64 tokens has a CPU share when its experts take the
+  vector kernels ([GGUF products](gguf.md#products)) and it routes to fewer than half the layer's
+  experts; a call on the matrix kernel or routing to half of them or more copies every miss.
 - **Calls.** Vector decode and verification run the cached pairs, then the block's dense MLP
   while the rest arrive, then the rest; both expert stages add to one fixed-point sum, so outputs
   equal resident execution bit for bit. A prompt chunk runs the dense MLP while its experts
