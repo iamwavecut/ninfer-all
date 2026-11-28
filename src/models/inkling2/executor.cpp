@@ -2814,16 +2814,19 @@ struct Executor::Impl {
     // Whether call c runs layer p's routed experts on the vector kernels into the exact fixed-point
     // sum, the cached experts while the missing ones arrive and the CPU's share beside them: a call
     // with q8_1 rows (up to 8 tokens) always, a wider decode call of GGUF experts that can miss
-    // (experts_can_miss) where the vector kernels are no slower than both products on the matrix
-    // kernel (gguf::moe_vector_call_pays). Resident or wholly cached experts take the matrix kernel
-    // past 8 tokens: on an A40 the vector kernels' rounds of 16 to 64 requests were up to a fifth
-    // slower there end to end, against the route table's op measurements.
+    // (experts_can_miss) when the CPU computes the layer's share (its misses then go to the CPU and
+    // the bus, not as the whole layer), or else where the vector kernels are no slower than both
+    // products on the matrix kernel (gguf::moe_vector_call_pays). Resident or wholly cached experts
+    // take the matrix kernel past 8 tokens: on an A40 the vector kernels' rounds of 16 to 64
+    // requests were up to a fifth slower there end to end, against the route table's op
+    // measurements.
     [[nodiscard]] bool vector_call(const LayerPlan& p, const Call& c) const {
         if (c.q8) { return true; }
         if (c.chunk || bf16_rows || p.bf16 || p.mxfp8 || c.t <= gguf::kMaxVectorColumns ||
             c.t > CpuExperts::kMaxTokens || !experts_can_miss(p)) {
             return false;
         }
+        if (cpu_experts && cpu_experts->supports(std::size_t(p.delivery_layer))) { return true; }
         const std::int64_t pairs   = std::int64_t(c.t) * config.top_k_experts;
         const std::int64_t experts = config.num_experts;
         return gguf::moe_vector_call_pays(p.gate_up_type, p.down_type, hidden,
