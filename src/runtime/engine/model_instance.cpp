@@ -821,7 +821,9 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     // the device cache of host or disk experts, which takes what automatic KV leaves
     // (expert_admission.h). Any other automatic pool stops at --max-context per request. A draft
     // step gathers its token's row over the bus on its round's critical path (MTP with 3 drafts
-    // decoded 0.15% to 0.39% slower), so drafting keeps the table on the device.
+    // decoded 0.15% to 0.39% slower), so drafting keeps the table on the device unless more than
+    // kMaximumSpeculativeRows requests may run: rounds past that run without drafts, and their KV
+    // takes the table's memory.
     if (options.embedding_residency == EmbeddingResidency::Auto) {
         const bool automatic_kv = options.kv_capacity.mode == KvCapacityMode::Automatic;
         const bool kv_fills_memory =
@@ -830,8 +832,9 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
               options.context_cache.mode == ContextCacheMode::Hybrid) ||
              (options.expert_residency != ExpertResidency::Device &&
               options.expert_cache_bytes.value_or(1) != 0));
-        const bool drafts = options.speculative.backend != SpeculativeBackend::None ||
-                            options.speculative.lookup_ngram != 0;
+        const bool drafts = (options.speculative.backend != SpeculativeBackend::None ||
+                             options.speculative.lookup_ngram != 0) &&
+                            options.max_concurrency <= kMaximumSpeculativeRows;
         options.embedding_residency =
             kv_fills_memory && !drafts &&
                     models::qwen3_5::host_embedding_suits(reader, models::load_options(options))
