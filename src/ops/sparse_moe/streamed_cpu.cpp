@@ -4,6 +4,7 @@
 #include "core/expert_split.h"
 #include "core/qtype.h"
 #include "ops/common/silu.h"
+#include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
 #include "ops/sparse_moe/streamed_cpu_detail.h"
 
 #include <algorithm>
@@ -207,7 +208,7 @@ namespace {
 constexpr int kHidden       = 2048;
 constexpr int kIntermediate = 512;
 constexpr int kTopK         = 8;
-constexpr int kMaxTokens    = 46; // kSparseMoeSmallTMax: the widest streamed Small-T call
+constexpr int kMaxTokens    = kSparseMoeStreamSmallTMax; // the widest streamed Small-T call
 // Rows per task are a multiple of 16 (64 bytes of FP32 outputs).
 constexpr int kRowQuantum = 16;
 
@@ -270,7 +271,7 @@ ExpertCpuProducts::Done SparseMoeStreamCpu::compute(const Work& work) {
     const int pairs             = int(work.ids.size());
     const int tokens            = pairs / kTopK;
     if (pairs % kTopK != 0 || tokens < 1 || tokens > kMaxTokens) {
-        throw std::invalid_argument("streamed SparseMoe CPU: a call of 1 to 46 tokens");
+        throw std::invalid_argument("streamed SparseMoe CPU: a call of 1 to 64 tokens");
     }
     const auto* x     = reinterpret_cast<const std::uint16_t*>(work.inputs);
     const auto* alpha = reinterpret_cast<const float*>(work.inputs + std::size_t(tokens) * kHidden * 2);

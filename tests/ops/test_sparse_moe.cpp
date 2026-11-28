@@ -964,13 +964,13 @@ public:
         if (streamed) {
             prepare_streaming(weights, cache_bytes);
             workspace_bytes = ops::detail::sparse_moe_stream_workspace_bytes(
-                tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
+                tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype, small_t_wide);
         }
         WorkspaceArena workspace(workspace_bytes);
         const auto execute = [&](cudaStream_t stream) {
             if (streamed) {
                 ops::detail::sparse_moe_stream(x, weights, destination, *delivery_, 0, workspace,
-                                               stream);
+                                               stream, 0.0F, small_t_wide);
             } else if (forced) {
                 ops::detail::sparse_moe_candidate(x, weights, ops::SparseMoeEpilogue::AddResidual,
                                                   destination, candidate, workspace, stream);
@@ -1298,6 +1298,8 @@ public:
     double stream_cpu_share_ = 0;
     // The share of a narrow streamed call's misses the CPU computes.
     double cpu_share = 0;
+    // A decode or verification call of experts that can miss: Small-T up to 64 columns.
+    bool small_t_wide = false;
 };
 
 int run_profile(const CodecProfile& profile, bool streamed = false) {
@@ -1353,6 +1355,36 @@ int run_profile(const CodecProfile& profile, bool streamed = false) {
                         ++failures;
                     }
                 }
+            }
+            // A decode or verification call of experts that can miss: up to 64 columns run the
+            // Small-T arithmetic, held to the oracle (run()), and every cache and CPU share gives
+            // the same bits; below the prefill frontier that is the call above.
+            if (tokens <= ops::detail::kSparseMoeStreamSmallTMax &&
+                profile.routed_gate_up != QType::NVFP4) {
+                fixture.small_t_wide = true;
+                std::vector<double> wide;
+                for (const double share : {0.0, 0.5}) {
+                    for (const std::uint64_t cache : {0ULL, 16ULL << 20}) {
+                        fixture.cpu_share = share;
+                        failures += fixture.run(tokens, index == 0 ? 1 : 0, false, true, cache);
+                        fixture.cpu_share = 0;
+                        if (wide.empty()) { wide = fixture.last_output_; }
+                        if (fixture.last_output_ != wide) {
+                            std::cerr << profile.name << " T=" << tokens << " cache=" << cache
+                                      << " CPU share " << share
+                                      << ": wide Small-T output differs\n";
+                            ++failures;
+                        }
+                    }
+                }
+                const bool small_t = !ops::detail::sparse_moe_uses_prefill(
+                    tokens, profile.routed_gate_up, profile.routed_down);
+                if (small_t && wide != first) {
+                    std::cerr << profile.name << " T=" << tokens
+                              << ": wide Small-T differs from the streamed call below the frontier\n";
+                    ++failures;
+                }
+                fixture.small_t_wide = false;
             }
         } else {
             failures += fixture.run(tokens, index == 0 ? 1 : 0,
@@ -1484,7 +1516,7 @@ int main(int argc, char** argv) {
 
     // One delivery call covers each call's columns: Small-T through its widest call (T=46 below
     // the Q4 frontier), the Q8 frontier at T=20, and grouped slices beyond.
-    constexpr std::array<std::int32_t, 13> stream_tokens{1, 2, 8, 9, 13, 20, 32, 46, 47, 64, 257, 768, 4097};
+    constexpr std::array<std::int32_t, 15> stream_tokens{1, 2, 8, 9, 13, 20, 32, 46, 47, 50, 63, 64, 257, 768, 4097};
     constexpr std::array<std::int32_t, 5> stream_nvfp4_small_tokens{1, 2, 8, 9, 12};
     if (streamed) {
         for (auto& profile : profiles) {
