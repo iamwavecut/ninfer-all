@@ -66,9 +66,7 @@ struct T2SmallTI8Schedule {
     static_assert(kKWarps == 4 || kKWarps == 8, "T2 small-T i8 splits K over four or eight warps");
     static_assert(kTilesPerWarp == 1 || kTilesPerWarp == 2 || kTilesPerWarp == 4,
                   "T2 small-T i8 gives a warp one, two or four tiles");
-    static_assert(kColumnTiles == 1 || kColumnTiles == 2 || kColumnTiles == 4 ||
-                      kColumnTiles == 8,
-                  "T2 small-T i8 covers one, two, four or eight n8 tiles");
+    static_assert(kColumnTiles >= 1 && kColumnTiles <= 8, "T2 small-T i8 covers one to eight n8 tiles");
     static_assert(kStages >= 1 && kStages <= 4, "T2 small-T i8 pipeline depth must fit cp_wait");
     static_assert(kMinBlocks >= 1, "T2 small-T i8 launch-bounds occupancy must be positive");
     static_assert(kWords == 1 || kWords == 2 || kWords == 4,

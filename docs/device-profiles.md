@@ -111,7 +111,7 @@ survives a second interleaved measurement, and its output matches the compiled r
 | route key | chooses | measured on |
 |---|---|---|
 | `t2_i8_route` | small-T kernel or prefill GEMM per width, ternary (Bonsai) projections | the GDN layer's projections at widths 16 to 192 |
-| `t2_i8_small/<N>x<K>` | row and column tile of the ternary small-T kernel | every ternary projection shape, widths 1 to 32 |
+| `t2_i8_small/<N>x<K>` | row and column tile of the ternary small-T kernel; past 32 columns a single launch of 40, 48, 56 or 64 columns (`r32c40`, `r32c48`, `r32c56`, `r32c64`, `r32c64w1`, `r16c64w1`) instead of the compiled launches of 32 columns and the rest | every ternary projection shape, widths 1 to 32, 40, 48, 56 and 64 |
 | `q4_q5_attn_input/...`, `q4_q5_gdn_input/...`, `q5_linear_add/...`, `q4_linear_swiglu/...` | fused groupwise (Qwen3.6/3.8) projection schedules | the model shapes, widths 1 to 64 |
 | `attn_i8_small/h24/<kv>/w<W>` | warps, CTAs per SM, key block, split QK (`q`) and early fetch (`e`) of the INT8-family small-T attention; for `int8` also `8x2x32p`, the pipelined kernel that keeps V codes INT8 in shared memory and streams the next 32-key tile through two stages | query widths 1 to 8, KV windows 8K, 64K and 262K, for `int8`, `rk8v4`, `rk4v4`, `rk4v4-e8`, `rk2v4-e8` |
 | `attn_pv_f16` | FP16 accumulation of the probability-times-value product per key tile | a 1024-token prompt chunk at 32K and a decode step at 131K |
