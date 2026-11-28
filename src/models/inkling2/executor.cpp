@@ -3059,6 +3059,7 @@ struct Executor::Impl {
             ra.moe_rows    = rows;
             ra.moe_weights = weights;
             ra.top_k       = k;
+            combine_rows(c, rows, ra);
             return;
         }
         void* rows_act = workspace->alloc_bytes(gguf::moe_matrix_activation_bytes(hidden, pairs)).data;
@@ -3076,6 +3077,16 @@ struct Executor::Impl {
         ra.moe_rows    = rows;
         ra.moe_weights = weights;
         ra.top_k       = k;
+        combine_rows(c, rows, ra);
+    }
+
+    // A prompt chunk's residual update reads each row's MoE output at four lags (the conv's taps
+    // lie in the chunk): the rows' weighted pair sums, formed once in place, bit for bit as the
+    // update would form them. A decode call's earlier taps come from the history ring.
+    void combine_rows(const Call& c, float* rows, kernels::ResidualArgs& ra) {
+        if (!c.rows.chunk) { return; }
+        kernels::combine_moe_rows(rows, ra.moe_weights, ra.top_k, hidden, c.t, stream);
+        ra.moe_combined = true;
     }
 
     // The head of `rows` final-normed BF16 rows x into logits_bf16 columns [first, first + rows).
