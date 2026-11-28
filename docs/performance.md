@@ -810,9 +810,13 @@ pair has no peer access ([tensor parallelism](maintainer/pipeline-stages.md#tens
 With MTP 3 the same server decodes 207.7 tok/s for one request and 697.7 for four (92.0 and 335.6
 without drafts, 207.6 and 712.8 with MTP 3 at `--max-concurrency 8`). Past eight requests a round
 runs without drafts plus the MTP layer over each request's token: 46.1 ms at 64 requests against
-45.6 ms without drafts, 1.1% fewer tok/s at 64 and 0.8% at 48. Its startup holds 54,272 tokens of
-KV against 173,760 without drafts: MTP's 0.8 GiB of weights and the CUDA graphs and workspace of its
-rounds of up to eight requests.
+45.6 ms without drafts, 1.1% fewer tok/s at 64 and 0.8% at 48. That start, with the token table on
+the device, held 54,272 tokens of KV against 173,760 without drafts: the table's 1.3 GiB, MTP's
+0.8 GiB of weights and the CUDA graphs and workspace of its rounds of up to eight requests. With MTP
+the server now keeps the table in host memory past eight requests (`--embedding-residency auto`):
+on another RTX 5090 (575 W) such a start held 106,368 tokens against 57,728 with the table on the
+device, and decoded 210.8, 883.9 and 1,369.7 tok/s for 1, 8 and 64 requests against 200.1, 877.9
+and 1,374.2 (November 28, one run each).
 
 Qwen3.8-27B's Q4 gate and up projection runs its small-T kernel up to 64 columns: 186 µs against
 319 µs for the 64-by-128 tile at 64 columns on the RTX 5090, 432 µs against 782 µs on the
