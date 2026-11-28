@@ -804,7 +804,7 @@ pair has no peer access ([tensor parallelism](maintainer/pipeline-stages.md#tens
 | RTX 5090 | Qwen3.8-27B | none | 2,048 | 607.3 | 980.3 | 1,233.5 | 1,276.0 | 1,401.4 |
 | RTX 5090 | Qwen3.8-27B | MTP 3 | 2,048 | 898.5 | 986.7 | 1,229.1 | 1,264.5 | 1,388.6 |
 | RTX 5090 | Ternary Bonsai 2 27B | none | 4,096 | 1,080.3 | 1,646.2 | 1,780.6 | 1,839.9 | 1,982.9 |
-| RTX 3090 | Ternary Bonsai 2 27B | none | 2,048 | 549.0 | 744.8 | 862.7 | 838.6 | 903.0 |
+| RTX 3090 | Ternary Bonsai 2 27B | none | 2,048 | 549.9 | 753.2 | 862.2 | 891.8 | 903.5 |
 | 2x RTX 3090, `--tensor-parallel` | Ternary Bonsai 2 27B | none | 2,048 | 597.3 | 795.4 | 915.1 | 954.4 | 1,055.8 |
 
 With MTP 3 the same server decodes 207.7 tok/s for one request and 697.7 for four (92.0 and 335.6
@@ -817,8 +817,11 @@ rounds of up to eight requests.
 Qwen3.8-27B's Q4 gate and up projection runs its small-T kernel up to 64 columns: 186 µs against
 319 µs for the 64-by-128 tile at 64 columns on the RTX 5090, 432 µs against 782 µs on the
 RTX 3090. The RTX 5090's profile routes 33 to 64 ternary columns to 64-column schedules. On the
-RTX 3090 those schedules lose to two 32-column launches, so Bonsai 2 there still decodes 40 and 48
-requests slower than 32 (777.9 tok/s at 40). At 64 requests a Qwen3.8-27B round on the RTX 5090
+RTX 3090 those lose to two launches of 32 columns and the rest; its profile routes 33 to 56 columns
+to schedules of 40, 48 and 56 columns, which read the weights once for a round of up to that many
+requests and split K as the 32-column schedule does. Bonsai 2 then decodes 878.4 tok/s at 40
+requests, 891.8 at 48 and 923.8 at 56 against 780.4, 840.1 and 849.3 on two launches (November 28,
+one run each; 64 requests keep the two launches, 903.5). At 64 requests a Qwen3.8-27B round on the RTX 5090
 takes 45.7 ms: recurrent state 11.5 ms, gate and up 11.3 ms, down 11.1 ms. `--max-concurrency auto --max-context 4096` admits 29 Qwen3.8-27B requests on the
 RTX 3090 (552.1 tok/s with 29 streams) and 60 on the RTX 5090 (1,111.1 tok/s with 60), 63 Bonsai 2
 requests on the RTX 3090 (891.4 tok/s): each request holds 146.8 MiB of recurrent state and
