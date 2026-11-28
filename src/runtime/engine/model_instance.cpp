@@ -304,7 +304,8 @@ EngineOptions artifact_scoped_disk_tier(const EngineOptions& options,
 }
 
 // Past this many requests a request's Device KV lease is by default a bounded window of its output
-// (ContextCacheOptions::kv_lease_growth).
+// (ContextCacheOptions::kv_lease_growth), and a prefill step beside generating requests is cut to
+// about one decode round (EngineOptions::prefill_stall_round_budget).
 constexpr std::uint32_t kLeaseGrowthDefaultConcurrency = 8;
 
 // The options of `options` at `concurrency` requests: the counts its normalization derived from
@@ -316,6 +317,10 @@ void adopt_concurrency(EngineOptions& options, std::uint32_t concurrency) {
     ContextCacheOptions& cache = options.context_cache;
     if (cache.enabled && !cache.kv_lease_growth) {
         cache.kv_lease_growth = concurrency > kLeaseGrowthDefaultConcurrency;
+    }
+    if (!options.prefill_stall_round_budget) {
+        options.prefill_stall_round_budget =
+            options.prefill_stall_budget_ms == 0 && concurrency > kLeaseGrowthDefaultConcurrency;
     }
     if (!cache.enabled || cache.mode == ContextCacheMode::Hybrid) {
         cache.max_private_continuations = concurrency;
@@ -382,6 +387,10 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     if (cache.enabled && !options.max_concurrency_auto) {
         cache.kv_lease_growth =
             cache.kv_lease_growth.value_or(concurrency > kLeaseGrowthDefaultConcurrency);
+    }
+    if (!options.max_concurrency_auto) {
+        options.prefill_stall_round_budget = options.prefill_stall_round_budget.value_or(
+            options.prefill_stall_budget_ms == 0 && concurrency > kLeaseGrowthDefaultConcurrency);
     }
     // Injected grafts stay resident for the life of the Engine, each in a StateImage and a
     // shared-prefix slot of its own, so the pools grow by that many beyond what requests use.

@@ -251,20 +251,24 @@ struct RequestRecord {
     std::int32_t retained_slot = -1;
     std::string retained_session_digest;
 
-    // Banned words (bad_words). The Program cannot take a sequence back to an earlier state, so a
-    // rewind ends the request's sequence and queues the request again: its prompt is then the
-    // submitted one followed by the generated tokens the rewind keeps, and its first draw is the
-    // rewound position (EngineCore::requeue_bad_words_rewind).
-    struct BadWordsRequeue {
+    // A request whose sequence ends before its answer does and that queues again: a banned-word
+    // rewind (bad_words), which the Program cannot take back to an earlier state, or a park, which
+    // gives the Device KV pool back to the other requests (EngineCore::park_for_device_kv). Its
+    // prompt is then the submitted one followed by the generated tokens kept, the cache resumes it
+    // from the deepest state it holds, and its first draw is the position after them
+    // (EngineCore::requeue_request).
+    struct Requeue {
         // The prompt as submitted, which every requeue continues.
         PreparedPrompt prompt;
         // The submitted output limit and sampling, which a requeue resolves again.
         std::uint32_t requested_output_tokens = 0;
         ResolvedSamplingParameters sampling;
-        // The generated tokens the pending rewind keeps; set from its commit until the request
-        // settles and queues again.
+        // The generated tokens the pending rewind or park keeps; set from its commit until the
+        // request settles and queues again.
         std::optional<std::uint32_t> target;
         std::uint32_t requeues = 0;
+        // The parks among the requeues.
+        std::uint32_t parks = 0;
         // The generated tokens before the switch to post-thinking sampling, once it is applied.
         std::optional<std::uint32_t> post_thinking_at;
         // The first admission's Begin, which the result reports, and what the ended sequences
@@ -273,7 +277,14 @@ struct RequestRecord {
         GenerationTimings timings;
         SpeculativeStats speculative;
     };
-    std::optional<BadWordsRequeue> bad_words;
+    std::optional<Requeue> requeue;
+    // Set while the Device KV pool is short (EngineCore::park_for_device_kv): the request's next
+    // commit ends its sequence after the round's tokens and queues it again.
+    bool park_requested = false;
+    // A parked request waiting in the queue to resume.
+    bool parked = false;
+    // The oldest request sits out decode rounds while a park frees the pages its lease needs.
+    bool lease_hold = false;
 
     std::mutex mutex;
     std::condition_variable cv;

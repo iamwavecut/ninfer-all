@@ -745,6 +745,54 @@ int exercise_full_pool(const char* artifact) {
     return failures;
 }
 
+// Parking (docs/serving.md, "Parking"): two requests whose growing Device KV leases the pool
+// cannot both extend. The younger parks, the older finishes, and the younger resumes from the
+// cache and finishes too: both reach their output limit, nothing ends early, the older request is
+// never parked, and the park shows in the younger one's result and in the runtime stats.
+int exercise_lease_park(const char* artifact) {
+    constexpr std::uint32_t kOutput = 4600;
+    // 140 pages: both admissions (a 100-token prompt and a 4096-token window each, 66 pages)
+    // fit, but not both leases past their windows.
+    ninfer::EngineOptions options =
+        hybrid_options(artifact, ninfer::SpeculativeBackend::None, 140 * kBlock, 1ULL << 30, 4);
+    options.max_context                   = 8192;
+    options.max_concurrency               = 2;
+    options.max_pending_requests          = 2;
+    options.context_cache.kv_lease_growth = true;
+    ninfer::Engine engine(std::move(options));
+    ninfer::GenerationHandle older =
+        engine.submit(engine.prepare_tokens(synthetic_tokens(100, 21)), greedy(kOutput));
+    ninfer::GenerationHandle younger =
+        engine.submit(engine.prepare_tokens(synthetic_tokens(100, 22)), greedy(kOutput));
+    const ninfer::GenerationResult first  = older.wait();
+    const ninfer::GenerationResult second = younger.wait();
+    const ninfer::RuntimeStats stats      = engine.runtime_stats();
+    int failures                          = 0;
+    for (const auto* result : {&first, &second}) {
+        if (result->generated_token_ids.size() != kOutput ||
+            result->finish_reason != ninfer::FinishReason::OutputLimit) {
+            std::cerr << "lease-park: a request ended after " << result->generated_token_ids.size()
+                      << " of " << kOutput << " tokens (finish reason "
+                      << static_cast<int>(result->finish_reason) << ")\n";
+            ++failures;
+        }
+    }
+    if (stats.kv_lease_cut_requests != 0 || stats.kv_lease_parked_requests == 0 ||
+        first.kv_parks != 0 || second.kv_parks == 0 || stats.parked_requests != 0) {
+        std::cerr << "lease-park: cut=" << stats.kv_lease_cut_requests
+                  << " parked=" << stats.kv_lease_parked_requests
+                  << " older_parks=" << first.kv_parks << " younger_parks=" << second.kv_parks
+                  << " still_parked=" << stats.parked_requests << '\n';
+        ++failures;
+    }
+    if (second.kv_parks != 0 && second.reused_prompt_tokens != 0) {
+        std::cerr << "lease-park: the younger request reports " << second.reused_prompt_tokens
+                  << " reused prompt tokens; its first admission reused none\n";
+        ++failures;
+    }
+    return failures;
+}
+
 // Typed decision reads (src/serve/systemone.cpp) without the drafter: one-token reads of one
 // state, Disposable, with explicit boundaries after the system turn and after the state part, on
 // an Engine drafting with `backend`. The drafter never changes what the target computes, so the
@@ -1143,7 +1191,7 @@ int main() {
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 18> kScenarios{"all",
+    constexpr std::array<std::string_view, 19> kScenarios{"all",
                                                           "stop-string",
                                                           "stop-string-mtp",
                                                           "restore-exact",
@@ -1160,7 +1208,8 @@ int main() {
                                                           "turns-protocol",
                                                           "coalesce",
                                                           "interleaved",
-                                                          "full-pool"};
+                                                          "full-pool",
+                                                          "lease-park"};
     if (std::find(kScenarios.begin(), kScenarios.end(), scenario) == kScenarios.end()) {
         std::cerr << "unknown NINFER_HYBRID_REAL_SCENARIO " << scenario << '\n';
         return 1;
@@ -1201,6 +1250,7 @@ int main() {
         if (all || scenario == "persist") { failures += exercise_persist(artifact); }
         if (all || scenario == "interleaved") { failures += exercise_interleaved(artifact); }
         if (all || scenario == "full-pool") { failures += exercise_full_pool(artifact); }
+        if (all || scenario == "lease-park") { failures += exercise_lease_park(artifact); }
         if (all || scenario == "coalesce") {
             failures += exercise_coalesce(artifact, 6 * kPrefillChunk, true);
             failures += exercise_coalesce(artifact, 3000, false);

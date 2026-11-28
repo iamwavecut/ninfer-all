@@ -1003,6 +1003,7 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
              {"bad_words_rewinds", outcome.bad_words.rewinds},
              {"bad_words_dropped_tokens", outcome.bad_words.dropped_tokens},
              {"bad_words_rewind_seconds", outcome.bad_words.rewind_seconds},
+             {"kv_parks", outcome.kv_parks},
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] = Json{

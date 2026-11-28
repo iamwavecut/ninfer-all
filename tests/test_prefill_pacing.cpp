@@ -47,26 +47,26 @@ int main() {
                       "no budget must leave the step planned");
 
     // 60 ms fits 1 + 0.1 t + ~0 ms up to 590 tokens: the largest multiple of 128 is 512.
-    PrefillPacing pacing(60, model);
+    PrefillPacing pacing(60, false, model);
     failures += check(pacing.step_cap(0, 2048) == 512, "a step is cut to the budget in 128s");
     // A planned step that fits, and one no larger than the minimum, stay as planned.
     failures += check(pacing.step_cap(0, 384) == 0, "a short step must not be cut");
-    failures += check(PrefillPacing(1000, model).step_cap(0, 2048) == 0,
+    failures += check(PrefillPacing(1000, false, model).step_cap(0, 2048) == 0,
                       "a step inside the budget must not be cut");
     // Nothing goes below 512 tokens, even when 512 itself overruns the budget.
-    failures += check(PrefillPacing(1, model).step_cap(0, 2048) == 512,
+    failures += check(PrefillPacing(1, false, model).step_cap(0, 2048) == 512,
                       "a step is never cut below the minimum");
 
     // 120 ms: 1152 tokens from token zero; after 100K tokens each token also attends to the
     // prefix (0.2 ms more per token), so the step shrinks to 384 by time, and to the minimum.
-    PrefillPacing deep(120, model);
+    PrefillPacing deep(120, false, model);
     const std::uint32_t shallow = deep.step_cap(0, 4096);
     const std::uint32_t far     = deep.step_cap(100'000, 4096);
     failures += check(shallow == 1152, "the cap is the largest affordable multiple of 128");
     failures += check(far == 512 && far < shallow, "a deeper prefix must be cut harder");
 
     // Steps observed at twice the prediction halve what fits: the correction converges on 2.
-    PrefillPacing observed(120, model);
+    PrefillPacing observed(120, false, model);
     for (int step = 0; step < 32; ++step) {
         observed.step_done(0, 1024, 2 * predicted_prefill_step_ns(model, 0, 1024));
     }
@@ -75,7 +75,7 @@ int main() {
     failures += check(observed.step_cap(0, 4096) == 512,
                       "a slower card must cut the step to what fits at its speed");
     // One outlier moves the correction a quarter of the way in log space, bounded at 64x.
-    PrefillPacing outlier(120, model);
+    PrefillPacing outlier(120, false, model);
     outlier.step_done(0, 1024, 1'000 * predicted_prefill_step_ns(model, 0, 1024));
     failures += check(outlier.correction() > 2.82 && outlier.correction() < 2.83,
                       "one outlier step must move the correction by 64^(1/4)");
@@ -84,6 +84,30 @@ int main() {
     outlier.step_done(0, 1024, 0);
     failures += check(outlier.correction() > 2.82 && outlier.correction() < 2.83,
                       "an empty or unmeasured step must not move the correction");
+
+    // The round budget: off until a decode round has been measured, then the rounds' moving
+    // average, with steps down to 128 tokens. 30 ms fits 1 + 0.1 t ms up to 290 tokens: 256.
+    PrefillPacing rounds(0, true, model);
+    failures += check(rounds.round_budget() && !rounds.enabled() &&
+                          rounds.step_cap(0, 2048) == 0,
+                      "the round budget waits for a measured round");
+    rounds.round_done(30'000'000);
+    failures += check(rounds.enabled() && rounds.step_cap(0, 2048) == 256,
+                      "a step is cut to one decode round in 128s");
+    failures += check(rounds.step_cap(0, 128) == 0, "a step of 128 tokens is never cut");
+    PrefillPacing lone(0, true, model);
+    lone.round_done(1'000'000);
+    failures += check(lone.step_cap(0, 2048) == 128,
+                      "a round budget never cuts a step below 128 tokens");
+    // Rounds of 30 then 60 ms: the average moves a quarter of the way in log space, 35.7 ms, which
+    // fits up to 346 tokens: 256.
+    rounds.round_done(60'000'000);
+    failures += check(rounds.step_cap(0, 2048) == 256, "the round budget follows the rounds");
+    // An explicit budget wins over the round budget, and rounds do not move it.
+    PrefillPacing fixed(60, true, model);
+    fixed.round_done(1'000'000);
+    failures += check(!fixed.round_budget() && fixed.step_cap(0, 2048) == 512,
+                      "an explicit budget must not follow the rounds");
 
     // A cut step charges whole chunks only: three 896-token steps of a 2048-token chunk charge
     // 0, 0 and 1, carrying 640 tokens.

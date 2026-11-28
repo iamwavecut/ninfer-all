@@ -149,7 +149,9 @@ public:
         RoundMembership membership;
         for (std::uint32_t lane = 0; lane < max_concurrency; ++lane) {
             const auto& request = slots[lane];
-            if (request == nullptr || !request->is_decode_ready() || request->capture_pending) {
+            // A lane holding for a park's pages (EngineCore::park_for_device_kv) sits out.
+            if (request == nullptr || !request->is_decode_ready() || request->capture_pending ||
+                request->lease_hold) {
                 continue;
             }
             if (!request->budget) {

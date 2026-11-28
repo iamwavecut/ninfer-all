@@ -47,6 +47,7 @@ struct SchedulerRequest {
     ninfer::runtime::BackfillClass backfill_class = ninfer::runtime::BackfillClass::None;
     State state                                   = State::Decode;
     bool capture_pending                          = false;
+    bool lease_hold                               = false;
     std::optional<Budget> budget;
     std::optional<SequenceHandle> sequence;
     Output output;
@@ -292,6 +293,11 @@ int main() {
     failures += check(model_membership.size == 1 &&
                           model_membership.budgets[0].generated_tokens_remaining == 3,
                       "model-token licensing changed");
+    // A lane holding for the pages a park frees sits out of the round until they arrive.
+    slots[0]->lease_hold = true;
+    failures += check(scheduler.build_round_membership(slots, 1).size == 0,
+                      "a lane holding for a park's pages joined the round");
+    slots[0]->lease_hold = false;
 
     const auto active_set = scheduler.active_admission_set(slots, 1);
     failures += check(active_set.size == 1 && active_set.requests[0].request_id == 21,

@@ -84,6 +84,7 @@ struct GenerationOutcome {
     int reasoning_tokens  = 0;
     ninfer::ThinkingBudgetStats thinking;
     ninfer::BadWordsStats bad_words;
+    std::uint32_t kv_parks = 0;
     ninfer::FinishReason finish_reason = ninfer::FinishReason::OutputLimit;
     std::optional<std::string> matched_stop_string;
     GenerationMetrics metrics;
