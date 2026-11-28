@@ -11,6 +11,7 @@
 #include "ops/sparse_moe/streamed_cpu.h"
 
 #include "ops/common/device_route.h"
+#include "ops/common/device_tier.h"
 #include "ops/op_tester.h"
 #include "ops/sparse_moe/laboratory.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
@@ -1490,14 +1491,11 @@ int main(int argc, char** argv) {
          18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 768, 4097}};
     // NVFP4 walks both frontiers: its Small-T edge and first prefill T, where the activation stops
     // being represented, and then the prefill tile boundary and the internal slice. Its prefill
-    // route is W4A4 on Blackwell tensor cores, so an sm_8x build walks decode and Small-T only.
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
-    constexpr std::array<std::int32_t, 3> kNvfp4Tokens{{1, 2, 12}};
-    constexpr bool kNvfp4Prefill = false;
-#else
+    // route is W4A4 on Blackwell tensor cores, so a card that does not run the 120a code (or a build
+    // without it) walks decode and Small-T only.
+    constexpr std::array<std::int32_t, 3> kNvfp4SmallTokens{{1, 2, 12}};
     constexpr std::array<std::int32_t, 7> kNvfp4Tokens{{1, 2, 12, 13, 64, 768, 4097}};
-    constexpr bool kNvfp4Prefill = true;
-#endif
+    const bool nvfp4_prefill = ops::current_device_blackwell();
     // A copy round verifies up to 64 columns of one request.
     constexpr std::array<std::int32_t, 7> kWideTokens{{32, 33, 46, 47, 48, 63, 64}};
     std::array<CodecProfile, 4> profiles{{
@@ -1508,7 +1506,10 @@ int main(int argc, char** argv) {
         {"sparse_moe q8+q8 a16", QType::Q8_G32_FP16, QType::Q8_G32_FP16, QType::Q8_G32_FP16,
          &kSparseMoeA16Tolerance, nullptr, 0, kQ8Q8Tokens, true},
         {"sparse_moe nvfp4", QType::NVFP4, QType::NVFP4, QType::NVFP4, &kSparseMoeNvfp4Tolerance,
-         &kSparseMoeA4Tolerance, 13, kNvfp4Tokens, true},
+         &kSparseMoeA4Tolerance, 13,
+         nvfp4_prefill ? std::span<const std::int32_t>(kNvfp4Tokens)
+                       : std::span<const std::int32_t>(kNvfp4SmallTokens),
+         true},
     }};
     if (wide_only) {
         for (CodecProfile& profile : profiles) { profile.token_cases = kWideTokens; }
@@ -1522,7 +1523,7 @@ int main(int argc, char** argv) {
         for (auto& profile : profiles) {
             // Expert delivery preserves the compiled arithmetic domain. NVFP4 prefill needs
             // Blackwell; other builds still cover decode, the delivery boundary and Small-T.
-            if (profile.routed_gate_up == QType::NVFP4 && !kNvfp4Prefill) {
+            if (profile.routed_gate_up == QType::NVFP4 && !nvfp4_prefill) {
                 profile.token_cases = stream_nvfp4_small_tokens;
             } else {
                 profile.token_cases = stream_tokens;
@@ -1543,7 +1544,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     for (const CodecProfile& profile : profiles) {
-        if (wide_only && profile.routed_gate_up == QType::NVFP4 && !kNvfp4Prefill) { continue; }
+        if (wide_only && profile.routed_gate_up == QType::NVFP4 && !nvfp4_prefill) { continue; }
         failures += run_profile(profile, streamed);
     }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe correctness\n";
