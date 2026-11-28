@@ -337,6 +337,13 @@ too. Only requests count as use: polling a model's state (`/props`, `/metrics`, 
 keep it awake. A model whose Engine fails Engine-wide is unloaded and loads again on its next request
 (see [Stop the server](#stop-the-server)).
 
+On an RTX 3090 with Ternary Bonsai 2 27B and Qwen3.8-27B in the catalog (`--models-max 1
+--max-concurrency 8`), eight clients sent Bonsai 512-token requests one after another and a ninth
+asked Qwen3.8-27B for 16 tokens 30 s in. Its answer came 54.8 s later: the 30 s switch delay,
+Bonsai's running requests (7.8 s) and Qwen's load (10.9 s). Without draining it waited 224.3 s,
+until the eight clients stopped. Bonsai's longest request took 29.5 s against 16.6 s: the requests
+sent during the switch waited for Qwen's answer and Bonsai's load (8.8 s).
+
 | Method and path | Behavior |
 |---|---|
 | `GET /models` | every catalog model: `status.value` (`unloaded`, `loading`, `loaded`, `sleeping`, `unloading`), `status.args` (its serve arguments), `status.draining` while a loaded model takes no new requests to make way for another, `status.failed` and `status.error` after a failed load, `aliases`, `path`; a loaded or sleeping model adds the fields of [`GET /v1/models`](#models) |
